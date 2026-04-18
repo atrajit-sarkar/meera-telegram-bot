@@ -105,6 +105,214 @@ function readDelay(userMessage: string): number {
   return base + extra;
 }
 
+// ── TIME-OF-DAY AWARENESS ───────────────────────────────────────────
+
+/** Get IST hour (UTC+5:30) */
+function getISTHour(): number {
+  const now = new Date();
+  const istOffset = 5.5 * 60 * 60 * 1000;
+  const ist = new Date(now.getTime() + istOffset + now.getTimezoneOffset() * 60000);
+  return ist.getHours();
+}
+
+/** Extra delay multiplier based on time of day — slower at night, normal during day */
+function timeOfDayMultiplier(): number {
+  const hour = getISTHour();
+  if (hour >= 1 && hour < 6) return 3.0;    // 1-6 AM: very slow (sleeping)
+  if (hour >= 6 && hour < 8) return 1.8;     // 6-8 AM: groggy/waking up
+  if (hour >= 23 || hour < 1) return 2.0;    // 11 PM - 1 AM: sleepy
+  if (hour >= 8 && hour < 10) return 1.2;    // morning routine
+  return 1.0;                                 // normal hours
+}
+
+/** Should the bot ignore/delay-reply based on time? Returns delay in ms, or 0 for normal */
+function lateNightDelay(): number {
+  const hour = getISTHour();
+  if (hour >= 2 && hour < 6) {
+    // 2-6 AM: 50% chance of not replying for 10-30 min (she's sleeping!)
+    if (Math.random() < 0.5) {
+      return (10 + Math.random() * 20) * 60 * 1000;
+    }
+  }
+  return 0;
+}
+
+// ── MESSAGE SPLITTING ───────────────────────────────────────────────
+
+/** Split a reply into multiple chat bubbles like a real person */
+function splitIntoBubbles(text: string): string[] {
+  // Short messages: don't split
+  if (text.length < 40) return [text];
+
+  // Only split ~40% of the time for natural mix
+  if (Math.random() > 0.4) return [text];
+
+  // Try splitting on natural boundaries
+  const parts: string[] = [];
+
+  // Split on sentence boundaries or natural breaks
+  const sentences = text.split(/(?<=[.!?।])\s+|(?<=\n)/);
+  if (sentences.length >= 2) {
+    // Group sentences into 1-3 bubbles
+    const numBubbles = Math.min(sentences.length, Math.random() < 0.5 ? 2 : 3);
+    const perBubble = Math.ceil(sentences.length / numBubbles);
+    for (let i = 0; i < sentences.length; i += perBubble) {
+      const chunk = sentences.slice(i, i + perBubble).join(" ").trim();
+      if (chunk) parts.push(chunk);
+    }
+    return parts.length > 1 ? parts : [text];
+  }
+
+  // If no sentence boundaries, try splitting on commas or "and"/"but"
+  const clauses = text.split(/,\s+|\s+(?:and|but|aur|ar|kintu|lekin)\s+/i);
+  if (clauses.length >= 2) {
+    return clauses.filter((c) => c.trim()).slice(0, 3);
+  }
+
+  return [text];
+}
+
+/** Send split bubbles with natural delays between them */
+async function sendAsBubbles(ctx: Context, text: string) {
+  const bubbles = splitIntoBubbles(text);
+  for (let i = 0; i < bubbles.length; i++) {
+    if (i > 0) {
+      // Small delay between bubbles (0.5-1.5s)
+      const gap = 500 + Math.random() * 1000;
+      await new Promise((r) => setTimeout(r, gap));
+      await ctx.sendChatAction("typing").catch(() => {});
+      // Extra tiny delay for "typing" between bubbles
+      await new Promise((r) => setTimeout(r, 300 + Math.random() * 700));
+    }
+    await sendText(ctx, bubbles[i]);
+  }
+}
+
+// ── EMOJI-ONLY REPLIES ──────────────────────────────────────────────
+
+/** Sometimes reply with just an emoji for low-effort messages */
+function shouldSendEmojiOnly(tier: string, userText: string): string | null {
+  const text = userText.trim().toLowerCase();
+
+  // Only for comfortable+ tiers
+  if (tier === "stranger" || tier === "acquaintance") return null;
+
+  // 15-25% chance for very short/low-effort messages
+  const lowEffort = /^(ok|okay|k|hmm|hm|oh|ah|accha|achha|thik hai|theek|haan|ha|lol|nice|cool|mhm|ohh|acha|oki)$/i;
+  if (lowEffort.test(text) && Math.random() < 0.2) {
+    const emojiPool = ["😂", "💀", "🙄", "😭", "👀", "🤷‍♀️", "😐", "🫠"];
+    return emojiPool[Math.floor(Math.random() * emojiPool.length)];
+  }
+
+  // Funny/laughing messages — sometimes just emoji react
+  if (/^(haha|hehe|lmao|lol|rofl|😂|🤣)+$/i.test(text) && Math.random() < 0.25) {
+    return Math.random() < 0.5 ? "😂" : "💀";
+  }
+
+  return null;
+}
+
+// ── SELF-CORRECTIONS ────────────────────────────────────────────────
+
+/** Sometimes add a follow-up "correction" message to seem more human */
+function maybeSelfCorrect(reply: string): string | null {
+  // Only 8% of the time
+  if (Math.random() > 0.08) return null;
+
+  // Only for longer replies
+  if (reply.length < 30) return null;
+
+  const corrections = [
+    "wait no that's not what i meant",
+    "actually nvm",
+    "*that",
+    "lol typo",
+    "ugh autocorrect",
+    "wait hold on",
+  ];
+  return corrections[Math.floor(Math.random() * corrections.length)];
+}
+
+// ── LEAVE ON READ ───────────────────────────────────────────────────
+
+/** Check if message is low-effort enough to potentially ignore */
+function shouldLeaveOnRead(tier: string, userText: string): boolean {
+  const text = userText.trim().toLowerCase();
+
+  // Only for comfortable+ tiers (strangers/acquaintances always get replies)
+  if (tier === "stranger" || tier === "acquaintance") return false;
+
+  // Low-effort patterns
+  const lowEffort = /^(ok|okay|k|kk|hmm|hm|oh|ah|mm|mhm|acha|accha|thik|theek|haan|ha|ji)$/i;
+  if (!lowEffort.test(text)) return false;
+
+  // 20% chance to leave on read for comfortable, 30% for close
+  const prob = tier === "close" ? 0.30 : 0.20;
+  return Math.random() < prob;
+}
+
+// ── DELAYED REPLY QUEUE ─────────────────────────────────────────────
+
+interface DelayedReply {
+  chatId: number;
+  userId: number;
+  userText: string;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+const delayedReplies = new Map<number, DelayedReply>();
+
+/** Schedule a delayed reply (seen-but-reply-later behavior) */
+function scheduleDelayedReply(
+  ctx: Context & { message: { text: string } },
+  userId: number,
+  delayMs: number
+) {
+  // Cancel any existing delayed reply
+  const existing = delayedReplies.get(userId);
+  if (existing) clearTimeout(existing.timer);
+
+  const chatId = ctx.chat!.id;
+  const userText = ctx.message.text;
+
+  const timer = setTimeout(async () => {
+    delayedReplies.delete(userId);
+    try {
+      const tier = store.getComfortTier(userId);
+      const user = store.getUser(userId);
+      const history = store.getRecentHistory(userId);
+
+      // Add context that she's replying late
+      const lateContext = Math.random() < 0.5
+        ? `(You're replying a bit late — you were busy/sleeping. Don't apologize too much, just reply naturally. Maybe a quick "sorry just saw this" or just answer directly.)`
+        : `(You're replying late. Don't mention it unless it feels natural.)`;
+
+      const messages = buildOllamaMessages(
+        lateContext + "\n\nTheir message: " + userText,
+        history,
+        tier,
+        user
+      );
+      const reply = await callOllamaWithRotation(ollamaConfig, messages, user.ollamaKeys);
+
+      store.addMessage(userId, "user", userText);
+      store.addMessage(userId, "assistant", reply);
+
+      await bot.telegram.sendChatAction(chatId, "typing");
+      const delay = Math.min(typingDelay(reply), 3000);
+      await new Promise((r) => setTimeout(r, delay));
+
+      await bot.telegram.sendMessage(chatId, reply);
+      console.log(`[DelayedReply] Sent to user ${userId} after delay`);
+    } catch (err) {
+      console.error(`[DelayedReply] Failed for user ${userId}:`, err);
+    }
+  }, delayMs);
+
+  delayedReplies.set(userId, { chatId, userId, userText, timer });
+  console.log(`[DelayedReply] Scheduled for user ${userId} in ${Math.round(delayMs / 60000)}min`);
+}
+
 /** Download a Telegram file by file_id and return its Buffer */
 async function downloadFileBuffer(fileId: string): Promise<Buffer> {
   const fileLink = await bot.telegram.getFileLink(fileId);
@@ -570,16 +778,59 @@ async function handleTextMessage(ctx: Context & { message: { text: string } }) {
   });
 
   const tier = store.getComfortTier(userId);
-  const useVoice = shouldSendVoice(tier, text);
+
+  // ── Leave on read? (comfortable+ only, low-effort messages)
+  if (shouldLeaveOnRead(tier, text)) {
+    store.addMessage(userId, "user", text);
+    console.log(`[Bot] Left on read: user ${userId} ("${text.slice(0, 20)}")`);
+    return;
+  }
+
+  // ── Seen but reply later? (late night / random delay)
+  const nightDelay = lateNightDelay();
+  if (nightDelay > 0) {
+    store.addMessage(userId, "user", text);
+    // Show brief typing then stop (she "saw" it)
+    await ctx.sendChatAction("typing").catch(() => {});
+    await new Promise((r) => setTimeout(r, 800 + Math.random() * 1200));
+    scheduleDelayedReply(ctx, userId, nightDelay);
+    return;
+  }
+
+  // ── Random "seen but reply later" (5% chance during day, comfortable+)
+  if ((tier === "comfortable" || tier === "close") && Math.random() < 0.05) {
+    store.addMessage(userId, "user", text);
+    await ctx.sendChatAction("typing").catch(() => {});
+    await new Promise((r) => setTimeout(r, 500 + Math.random() * 1000));
+    const delayMs = (5 + Math.random() * 15) * 60 * 1000; // 5-20 min
+    scheduleDelayedReply(ctx, userId, delayMs);
+    return;
+  }
+
+  // ── Emoji-only reply?
+  const emojiOnly = shouldSendEmojiOnly(tier, text);
+  if (emojiOnly) {
+    store.addMessage(userId, "user", text);
+    store.addMessage(userId, "assistant", emojiOnly);
+    const readTime = readDelay(text);
+    await new Promise((r) => setTimeout(r, readTime));
+    await ctx.reply(emojiOnly);
+    return;
+  }
 
   // React to message (async, don't await)
   maybeReact(ctx, userId, text).catch(() => {});
+
+  // Time-of-day multiplier for delays
+  const todMultiplier = timeOfDayMultiplier();
+
+  const useVoice = shouldSendVoice(tier, text);
 
   if (useVoice) {
     // Voice reply via Gemini Live
     try {
       // Simulate reading the message first (no indicator yet)
-      const readTime = readDelay(text);
+      const readTime = readDelay(text) * todMultiplier;
       await new Promise((r) => setTimeout(r, readTime));
 
       // Now start "recording voice"
@@ -610,7 +861,7 @@ async function handleTextMessage(ctx: Context & { message: { text: string } }) {
     // Text reply via Ollama
     try {
       // Simulate reading the message first (no typing indicator yet)
-      const readTime = readDelay(text);
+      const readTime = readDelay(text) * todMultiplier;
       await new Promise((r) => setTimeout(r, readTime));
 
       // Now start "typing"
@@ -625,14 +876,21 @@ async function handleTextMessage(ctx: Context & { message: { text: string } }) {
       store.addMessage(userId, "user", text);
       store.addMessage(userId, "assistant", reply);
 
-      // Simulate typing delay (on top of however long Ollama took)
-      const delay = typingDelay(reply);
-      await new Promise((r) => setTimeout(r, Math.min(delay, 4000)));
+      // Simulate typing delay (scaled by time of day)
+      const delay = typingDelay(reply) * todMultiplier;
+      await new Promise((r) => setTimeout(r, Math.min(delay, 8000)));
 
       stopTyping();
 
-      // Send reply
-      await sendText(ctx, reply);
+      // Send reply as bubbles (may split into multiple messages)
+      await sendAsBubbles(ctx, reply);
+
+      // Maybe send a self-correction follow-up
+      const correction = maybeSelfCorrect(reply);
+      if (correction) {
+        await new Promise((r) => setTimeout(r, 1500 + Math.random() * 2000));
+        await ctx.reply(correction);
+      }
 
       // Maybe send a sticker after
       maybeSendSticker(ctx, userId, reply).catch(() => {});
@@ -712,9 +970,16 @@ async function handleMediaMessage(
       store.addMessage(userId, "user", "[sent media]");
       store.addMessage(userId, "assistant", reply);
 
-      const delay = typingDelay(reply);
-      await new Promise((r) => setTimeout(r, Math.min(delay, 3000)));
-      await sendText(ctx, reply);
+      const delay = typingDelay(reply) * timeOfDayMultiplier();
+      await new Promise((r) => setTimeout(r, Math.min(delay, 6000)));
+      await sendAsBubbles(ctx, reply);
+
+      // Maybe self-correct
+      const correction = maybeSelfCorrect(reply);
+      if (correction) {
+        await new Promise((r) => setTimeout(r, 1500 + Math.random() * 2000));
+        await ctx.reply(correction);
+      }
 
       // Maybe send a sticker after
       maybeSendSticker(ctx, userId, reply).catch(() => {});
@@ -836,6 +1101,10 @@ async function proactiveLoop() {
     // 30% chance to skip this cycle (makes timing feel less robotic)
     if (Math.random() < 0.3) continue;
 
+    // Don't send proactive pings at weird hours (2-7 AM IST)
+    const hour = getISTHour();
+    if (hour >= 2 && hour < 7) continue;
+
     const prompt = INITIATE_PROMPTS[tier];
     if (!prompt) continue;
 
@@ -844,13 +1113,26 @@ async function proactiveLoop() {
       const messages = buildOllamaMessages(prompt, history, tier, user);
       const reply = await callOllamaWithRotation(ollamaConfig, messages, user.ollamaKeys);
 
-      // Simulate typing delay before sending (real girls don't instant-reply)
+      // Simulate typing delay before sending
       await bot.telegram.sendChatAction(user.chatId, "typing");
       const delay = Math.min(typingDelay(reply), 3000);
       await new Promise((r) => setTimeout(r, delay));
 
       await bot.telegram.sendMessage(user.chatId, reply);
       store.addMessage(userId, "assistant", reply);
+
+      // Double-text: 25% chance for comfortable+, send a follow-up
+      if ((tier === "comfortable" || tier === "close") && Math.random() < 0.25) {
+        const followUps = tier === "close"
+          ? ["hellooo", "😤", "🙄", "answer me", "oye", "uff", "👀", "rude"]
+          : ["?", "👀", "helloo", "😶"];
+        const followUp = followUps[Math.floor(Math.random() * followUps.length)];
+        const gap = 3000 + Math.random() * 8000; // 3-11s later
+        await new Promise((r) => setTimeout(r, gap));
+        await bot.telegram.sendMessage(user.chatId, followUp);
+        store.addMessage(userId, "assistant", followUp);
+      }
+
       store.updateUser(userId, { proactiveSent: true });
       console.log(`[Proactive] Sent to user ${userId} (${tier})`);
     } catch (err) {
