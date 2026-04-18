@@ -51,7 +51,8 @@ const ollamaConfig: OllamaConfig = {
 
 // ── BOT & SESSIONS ─────────────────────────────────────────────────
 const bot = new Telegraf(BOT_TOKEN);
-const store = new UserStore(20);
+const FIREBASE_DB_ID = process.env.FIREBASE_DATABASE_ID || "(default)";
+const store = new UserStore(50, FIREBASE_DB_ID);
 
 // Gemini Live sessions — for image/audio/video (uses per-user persona)
 const sessions = new SessionManager((userId: number) => {
@@ -64,6 +65,14 @@ const sessions = new SessionManager((userId: number) => {
     tools: toolDeclarations,
     onToolCall: executeToolCall,
   };
+});
+
+// Middleware: load user data from Firestore before any handler
+bot.use(async (ctx, next) => {
+  if (ctx.from?.id) {
+    await store.ensureLoaded(ctx.from.id);
+  }
+  return next();
 });
 
 // ── HELPERS ─────────────────────────────────────────────────────────
@@ -815,11 +824,13 @@ bot.launch().then(() => {
   process.exit(1);
 });
 
-process.once("SIGINT", () => {
+process.once("SIGINT", async () => {
   bot.stop("SIGINT");
   sessions.destroy();
+  await store.destroy();
 });
-process.once("SIGTERM", () => {
+process.once("SIGTERM", async () => {
   bot.stop("SIGTERM");
   sessions.destroy();
+  await store.destroy();
 });
