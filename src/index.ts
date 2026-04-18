@@ -692,7 +692,9 @@ async function maybeReact(ctx: Context, userId: number, userMessage: string) {
 
   const tier = store.getComfortTier(userId);
   const history = store.getRecentHistory(userId);
-  const emoji = await pickReactionEmoji(ollamaConfig, userMessage, history, tier);
+  const user = store.getUser(userId);
+  const personaHint = user.customPersona ? user.customPersona.slice(0, 500) : undefined;
+  const emoji = await pickReactionEmoji(ollamaConfig, userMessage, history, tier, personaHint);
   if (!emoji) return;
   try {
     await (ctx as any).telegram.setMessageReaction(
@@ -727,7 +729,8 @@ async function maybeSendSticker(
   if (!shouldSend) return;
 
   const history = store.getRecentHistory(userId);
-  const emoji = await pickStickerEmoji(ollamaConfig, aiResponse, history);
+  const personaHint = user.customPersona ? user.customPersona.slice(0, 500) : undefined;
+  const emoji = await pickStickerEmoji(ollamaConfig, aiResponse, history, personaHint);
   if (!emoji) return;
 
   // Try to find a sticker matching the emoji in user's packs
@@ -1343,7 +1346,8 @@ async function maybeStickerOnlyReply(
 
   // Pick a sticker emoji based on the message
   const history = store.getRecentHistory(userId);
-  const emoji = await pickStickerEmoji(ollamaConfig, userText, history);
+  const personaHint = user.customPersona ? user.customPersona.slice(0, 500) : undefined;
+  const emoji = await pickStickerEmoji(ollamaConfig, userText, history, personaHint);
   if (!emoji) return false;
 
   // Find matching sticker

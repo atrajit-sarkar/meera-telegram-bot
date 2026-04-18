@@ -114,13 +114,17 @@ function getReactionEmojisForTier(tier: string): string[] {
   return TELEGRAM_REACTION_EMOJIS;
 }
 
-function buildReactionPrompt(tier: string): string {
+function buildReactionPrompt(tier: string, personaHint?: string): string {
   const emojis = getReactionEmojisForTier(tier);
   let prompt =
     "You pick reaction emojis for Telegram messages. " +
     "Given a message and conversation context, reply with EXACTLY ONE emoji from this list — nothing else:\n" +
     emojis.join(" ") +
     "\n\nPick the emoji that fits the vibe of the message best. Just the emoji, no text.";
+
+  if (personaHint) {
+    prompt += `\n\nYou are reacting AS this character: ${personaHint}\nPick emojis that match this character's personality and vibe.`;
+  }
 
   if (tier === "stranger") {
     prompt += "\n\nYou barely know this person. Keep reactions neutral and casual — nothing romantic or intimate.";
@@ -134,12 +138,13 @@ export async function pickReactionEmoji(
   config: OllamaConfig,
   userMessage: string,
   chatHistory: OllamaMessage[],
-  tier: string = "stranger"
+  tier: string = "stranger",
+  personaHint?: string
 ): Promise<string | null> {
   try {
     const allowedEmojis = getReactionEmojisForTier(tier);
     const messages: OllamaMessage[] = [
-      { role: "system", content: buildReactionPrompt(tier) },
+      { role: "system", content: buildReactionPrompt(tier, personaHint) },
       ...chatHistory.slice(-4).filter((m) => m.role !== "system"),
       { role: "user", content: userMessage },
     ];
@@ -163,11 +168,16 @@ const STICKER_PICK_PROMPT =
 export async function pickStickerEmoji(
   config: OllamaConfig,
   aiResponse: string,
-  chatHistory: OllamaMessage[]
+  chatHistory: OllamaMessage[],
+  personaHint?: string
 ): Promise<string | null> {
   try {
+    let stickerPrompt = STICKER_PICK_PROMPT;
+    if (personaHint) {
+      stickerPrompt += `\n\nYou are this character: ${personaHint}\nPick sticker emojis that match this character's personality.`;
+    }
     const messages: OllamaMessage[] = [
-      { role: "system", content: STICKER_PICK_PROMPT },
+      { role: "system", content: stickerPrompt },
       ...chatHistory.slice(-4).filter((m) => m.role !== "system"),
       { role: "assistant", content: aiResponse },
       { role: "user", content: "Pick a sticker emoji for what I just said." },
