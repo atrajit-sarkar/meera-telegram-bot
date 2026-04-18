@@ -203,6 +203,86 @@ Reply with ONLY the JSON. No other text.`;
   }
 }
 
+// ── AI Content Request Detection ─────────────────────────────────
+
+export type ContentDecision =
+  | { wantsContent: false }
+  | { wantsContent: true; searchQuery: string; contentType: "meme" | "video" | "reel" | "any" };
+
+/**
+ * Ask the AI to determine if the user is requesting content (memes, reels, videos, YouTube shorts)
+ * and what search query would best match their request.
+ * Works across ALL languages — Hindi, Bengali, English, Hinglish, etc.
+ */
+export async function detectContentRequest(
+  config: OllamaConfig,
+  userMessage: string,
+  chatHistory: OllamaMessage[],
+  opts?: { personaHint?: string }
+): Promise<ContentDecision> {
+  const systemPrompt = `You are a classifier that determines if a Telegram user is asking for memes, funny videos, reels, YouTube shorts, or any entertaining content to be shared with them.
+
+You must understand requests in ANY language — English, Hindi, Bengali, Hinglish, Bangla, etc.
+
+Examples of content requests (in various languages):
+- "send me a funny reel" / "show me something funny"
+- "ek meme bhej" / "kuch funny bhejo" / "video bhej na"
+- "ekta pathao" / "ar ekta" / "hasi video pathao"
+- "bore ho raha hu kuch dikha" / "entertain me"
+- "more" / "another one" / "next" / "aur ek" / "ar ekta pathao"
+- "memes dikha" / "reel pathao" / "funny video send kar"
+
+Also detect FOLLOW-UP requests: if recent messages show content was shared (messages containing "[shared:") and user says things like "more", "another", "next", "aur", "ar ekta", laughing + asking, etc.
+
+Respond with ONLY a JSON object, no markdown, no explanation:
+
+If the user IS requesting content:
+{"wantsContent":true,"searchQuery":"<YouTube search query in English, 2-5 words, optimized for finding relevant shorts>","contentType":"<meme|video|reel|any>"}
+
+If the user is NOT requesting content:
+{"wantsContent":false}
+
+GUIDELINES:
+- "searchQuery" should be an English YouTube search query that matches what they're asking for. Be specific based on context.
+  - "send me something funny" → "funny viral shorts"
+  - "ar ekta hasi video pathao" → "funny comedy shorts"
+  - "scary reel bhej" → "scary short videos"
+  - "cute animals dikha" → "cute animals shorts"
+  - "send me dank memes" → "dank memes shorts"
+  - If they just say "another" or "more" after a share → "funny trending shorts"
+- "contentType": "reel" for YouTube shorts/reels, "meme" for images, "video" for longer clips, "any" if unclear
+- Most normal conversation messages are NOT content requests. Don't over-classify.
+- Questions, emotional messages, opinions, greetings = NOT content requests.
+
+Reply with ONLY the JSON.`;
+
+  try {
+    // Include last 6 history messages so AI can see if content was recently shared
+    const messages: OllamaMessage[] = [
+      { role: "system", content: systemPrompt },
+      ...chatHistory.slice(-6).filter((m) => m.role !== "system"),
+      { role: "user", content: userMessage },
+    ];
+    const raw = await callOllama(config, messages);
+
+    const jsonMatch = raw.match(/\{[^}]+\}/);
+    if (!jsonMatch) return { wantsContent: false };
+
+    const parsed = JSON.parse(jsonMatch[0]);
+    if (!parsed.wantsContent) return { wantsContent: false };
+
+    const searchQuery = String(parsed.searchQuery || "funny trending shorts").slice(0, 100);
+    const validTypes = ["meme", "video", "reel", "any"] as const;
+    const contentType = validTypes.includes(parsed.contentType) ? parsed.contentType : "any";
+
+    console.log(`[AI-Content] Detected content request: query="${searchQuery}", type="${contentType}"`);
+    return { wantsContent: true, searchQuery, contentType };
+  } catch (err) {
+    console.error("[AI-Content] Detection failed:", err);
+    return { wantsContent: false };
+  }
+}
+
 // ── Telegram Reaction Emojis (existing) ──────────────────────────
 
 export const TELEGRAM_REACTION_EMOJIS = [

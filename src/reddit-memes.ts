@@ -318,6 +318,42 @@ export async function getRandomContentAny(userId: number): Promise<ContentPost |
   }
 }
 
+/**
+ * Fetch content using an AI-generated search query and preferred content type.
+ * The AI determines the best query based on the user's request (in any language).
+ */
+export async function getContentByAIQuery(
+  userId: number,
+  searchQuery: string,
+  contentType: "meme" | "video" | "reel" | "any"
+): Promise<ContentPost | null> {
+  // For reels/video/any with YouTube API → use the AI's search query directly
+  if ((contentType === "reel" || contentType === "video" || contentType === "any") && YT_API_KEY) {
+    // Fetch using the AI-generated query
+    const posts = await fetchYouTubeShorts(searchQuery);
+    if (posts.length > 0) {
+      const sent = sentPosts.get(userId) ?? new Set();
+      const unseen = posts.filter((p) => !sent.has(p.url));
+      const pool = unseen.length > 0 ? unseen : posts;
+      const pick = pool[Math.floor(Math.random() * pool.length)];
+      markSent(userId, pick.url);
+      console.log(`[Content] AI-query "${searchQuery}" → picked: ${pick.title.slice(0, 50)}`);
+      return pick;
+    }
+    // Fallback: try with a generic query
+    const fallback = await getRandomYouTubeShort(userId);
+    if (fallback) return fallback;
+  }
+
+  // For memes → try Reddit image memes
+  if (contentType === "meme") {
+    return getRandomMeme(userId);
+  }
+
+  // Fallback to any content
+  return getRandomContentAny(userId);
+}
+
 // ── MID-CHAT CONTENT SHARING ────────────────────────────────────────
 
 // Keywords/patterns that might trigger Meera to share a meme mid-conversation

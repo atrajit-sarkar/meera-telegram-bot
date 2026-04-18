@@ -20,11 +20,12 @@ import {
   pickReactionEmoji,
   pickStickerEmoji,
   decideResponseBehavior,
+  detectContentRequest,
   type OllamaConfig,
   type OllamaMessage,
 } from "./ollama-service.js";
 import { UserStore } from "./user-store.js";
-import { getRandomContentAny, shouldShareContentMidChat, type ContentPost } from "./reddit-memes.js";
+import { getRandomContentAny, getContentByAIQuery, shouldShareContentMidChat, type ContentPost } from "./reddit-memes.js";
 import type { Context } from "telegraf";
 import type { GeminiResponse } from "./gemini-session.js";
 
@@ -1921,27 +1922,51 @@ async function handleTextMessage(
     }
   }
 
-  // ── Mid-chat content sharing: maybe share a meme/video alongside the reply
-  const { shouldShare, reason } = shouldShareContentMidChat(tier, text, mood, history);
-  if (shouldShare) {
-    // Small delay — she replies first, then "finds" the meme
+  // ── Mid-chat content sharing: AI decides if user wants content + generates search query
+  // Run AI detection and regex fallback in parallel with the reply
+  const contentDetectionPromise = (tier === "comfortable" || tier === "close")
+    ? detectContentRequest(ollamaConfig, text, history, {
+        personaHint: store.getUser(userId).customPersona?.slice(0, 500),
+      }).catch(() => ({ wantsContent: false as const }))
+    : Promise.resolve(null);
+
+  // Also keep regex as a fast fallback for obvious patterns
+  const regexResult = shouldShareContentMidChat(tier, text, mood, history);
+
+  contentDetectionPromise.then(async (aiResult) => {
+    const aiWants = aiResult && aiResult.wantsContent;
+    const regexWants = regexResult.shouldShare;
+
+    if (!aiWants && !regexWants) return;
+
+    const reason: "asked" | "vibe" | "random" = aiWants ? "asked" : regexResult.reason;
+
+    // Small delay — she replies first, then "finds" the content
     const shareDelay = reason === "asked"
       ? 1500 + Math.random() * 2000      // Quick when asked
       : 3000 + Math.random() * 5000;     // Natural delay when spontaneous
-    setTimeout(async () => {
-      try {
-        const post = await getRandomContentAny(userId);
-        if (post) {
-          // Show typing while "finding" the content
-          await ctx.sendChatAction("typing").catch(() => {});
-          await new Promise((r) => setTimeout(r, 800 + Math.random() * 1200));
-          await sendContentToChat(ctx, userId, post, reason);
-        }
-      } catch (err) {
-        console.error(`[Content] Mid-chat share failed for ${userId}:`, err);
+
+    await new Promise((r) => setTimeout(r, shareDelay));
+
+    try {
+      let post: ContentPost | null = null;
+
+      // Use AI-generated search query for better relevance
+      if (aiWants && aiResult.wantsContent) {
+        post = await getContentByAIQuery(userId, aiResult.searchQuery, aiResult.contentType);
+      } else {
+        post = await getRandomContentAny(userId);
       }
-    }, shareDelay);
-  }
+
+      if (post) {
+        await ctx.sendChatAction("typing").catch(() => {});
+        await new Promise((r) => setTimeout(r, 800 + Math.random() * 1200));
+        await sendContentToChat(ctx, userId, post, reason);
+      }
+    } catch (err) {
+      console.error(`[Content] Mid-chat share failed for ${userId}:`, err);
+    }
+  });
 }
 
 /** Decide if Meera voice-replies to media — slightly higher chance since media is more expressive */
