@@ -16,6 +16,7 @@ export interface UserData {
   stickerPacks: string[];
   proactiveSent: boolean;
   totalMessages: number;
+  ollamaKeys: string[];
 }
 
 export function defaultUserData(): UserData {
@@ -28,6 +29,7 @@ export function defaultUserData(): UserData {
     stickerPacks: [],
     proactiveSent: false,
     totalMessages: 0,
+    ollamaKeys: [],
   };
 }
 

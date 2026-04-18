@@ -14,6 +14,36 @@ export interface OllamaConfig {
   apiKey: string;
 }
 
+/**
+ * Call Ollama with key rotation. Tries keys in order; on quota/rate errors, moves to next key.
+ */
+export async function callOllamaWithRotation(
+  config: OllamaConfig,
+  messages: OllamaMessage[],
+  extraKeys: string[] = []
+): Promise<string> {
+  const keys = [config.apiKey, ...extraKeys].filter(Boolean);
+  let lastError: Error | null = null;
+
+  for (const key of keys) {
+    try {
+      return await callOllama({ ...config, apiKey: key }, messages);
+    } catch (err: any) {
+      lastError = err;
+      if (err.message === "quota_exceeded") {
+        console.log("[Ollama] Key quota exceeded, trying next key...");
+        continue;
+      }
+      if (err.message === "invalid_key") {
+        console.log("[Ollama] Invalid key, trying next key...");
+        continue;
+      }
+      throw err; // Non-key error, don't rotate
+    }
+  }
+  throw lastError ?? new Error("All Ollama API keys exhausted");
+}
+
 export async function callOllama(
   config: OllamaConfig,
   messages: OllamaMessage[]

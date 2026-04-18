@@ -14,6 +14,7 @@ import {
 } from "./config.js";
 import {
   callOllama,
+  callOllamaWithRotation,
   pickReactionEmoji,
   pickStickerEmoji,
   type OllamaConfig,
@@ -255,6 +256,9 @@ bot.start((ctx) =>
       "/stickers — List sticker packs\n" +
       "/removestickers — Remove a sticker pack\n" +
       "/clear — Reset conversation\n" +
+      "/addkey — Add your Ollama API key\n" +
+      "/keys — List your API keys\n" +
+      "/removekey — Remove an API key\n" +
       "/help — Show this message"
   )
 );
@@ -271,7 +275,8 @@ bot.help((ctx) =>
       "/replies_short /replies_medium /replies_long\n" +
       "/talk — Toggle voice-only replies\n" +
       "/addstickers /stickers /removestickers\n" +
-      "/clear — Reset conversation"
+      "/clear — Reset conversation\n" +
+      "/addkey /keys /removekey — Manage API keys"
   )
 );
 
@@ -373,9 +378,41 @@ bot.command("reset", async (ctx) => {
   await ctx.reply("🔄 Conversation reset!");
 });
 
+// ── API KEY COMMANDS ────────────────────────────────────────────────
+
+bot.command("addkey", async (ctx) => {
+  store.setFsmState(ctx.from.id, "waiting_for_ollama_key");
+  await ctx.reply("Send me your Ollama API key. It will be stored securely and used as a backup when the default key hits its limit.\n\n⚠️ Delete your message after sending to keep it private!");
+});
+
+bot.command("keys", async (ctx) => {
+  const user = store.getUser(ctx.from.id);
+  if (!user.ollamaKeys.length) {
+    await ctx.reply("No extra API keys added. Use /addkey to add one!");
+    return;
+  }
+  const masked = user.ollamaKeys.map((k, i) =>
+    `${i + 1}. ${k.slice(0, 6)}...${k.slice(-4)}`
+  );
+  await ctx.reply("Your API keys:\n" + masked.join("\n") + "\n\nUse /removekey to remove one.");
+});
+
+bot.command("removekey", async (ctx) => {
+  const user = store.getUser(ctx.from.id);
+  if (!user.ollamaKeys.length) {
+    await ctx.reply("No API keys to remove.");
+    return;
+  }
+  const masked = user.ollamaKeys.map((k, i) =>
+    `${i + 1}. ${k.slice(0, 6)}...${k.slice(-4)}`
+  );
+  store.setFsmState(ctx.from.id, "waiting_for_remove_key");
+  await ctx.reply("Which key to remove?\n" + masked.join("\n") + "\n\nSend the number.");
+});
+
 // ── FSM STATE HANDLER ───────────────────────────────────────────────
 
-function handleFsmState(
+async function handleFsmState(
   ctx: Context & { message: { text: string } },
   userId: number,
   state: string,
@@ -420,6 +457,35 @@ function handleFsmState(
           const packs = user.stickerPacks.filter((_, i) => i !== idx);
           store.updateUser(userId, { stickerPacks: packs });
           return ctx.reply(`Removed: ${removed}`).then(() => true);
+        }
+        return ctx.reply("Invalid number.").then(() => true);
+      }
+
+    case "waiting_for_ollama_key":
+      store.clearFsmState(userId);
+      {
+        const key = text.trim();
+        if (key.length < 10) {
+          return ctx.reply("That doesn't look like a valid API key. Try again with /addkey").then(() => true);
+        }
+        const user = store.getUser(userId);
+        const keys = [...user.ollamaKeys, key];
+        store.updateUser(userId, { ollamaKeys: keys });
+        // Try to delete the user's message containing the key
+        try { await ctx.deleteMessage(); } catch {}
+        return ctx.reply(`✅ API key added (${key.slice(0, 6)}...${key.slice(-4)}). I'll use it as backup when the default key hits its limit.`).then(() => true);
+      }
+
+    case "waiting_for_remove_key":
+      store.clearFsmState(userId);
+      {
+        const idx = parseInt(text) - 1;
+        const user = store.getUser(userId);
+        if (idx >= 0 && idx < user.ollamaKeys.length) {
+          const removed = user.ollamaKeys[idx];
+          const keys = user.ollamaKeys.filter((_, i) => i !== idx);
+          store.updateUser(userId, { ollamaKeys: keys });
+          return ctx.reply(`Removed key: ${removed.slice(0, 6)}...${removed.slice(-4)}`).then(() => true);
         }
         return ctx.reply("Invalid number.").then(() => true);
       }
@@ -522,7 +588,7 @@ async function handleTextMessage(ctx: Context & { message: { text: string } }) {
       const history = store.getRecentHistory(userId);
       const messages = buildOllamaMessages(text, history, tier, user);
 
-      const reply = await callOllama(ollamaConfig, messages);
+      const reply = await callOllamaWithRotation(ollamaConfig, messages, user.ollamaKeys);
 
       // Save to history
       store.addMessage(userId, "user", text);
@@ -724,7 +790,7 @@ async function proactiveLoop() {
     try {
       const history = store.getRecentHistory(userId);
       const messages = buildOllamaMessages(prompt, history, tier, user);
-      const reply = await callOllama(ollamaConfig, messages);
+      const reply = await callOllamaWithRotation(ollamaConfig, messages, user.ollamaKeys);
 
       await bot.telegram.sendMessage(user.chatId, reply);
       store.addMessage(userId, "assistant", reply);
