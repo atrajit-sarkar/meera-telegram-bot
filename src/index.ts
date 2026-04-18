@@ -445,6 +445,8 @@ function shouldLeaveOnRead(tier: string, userText: string): boolean {
 
 // ── DELAYED REPLY QUEUE ─────────────────────────────────────────────
 
+type DelayReason = "sleeping" | "late_night" | "busy" | "read_receipt" | "seen_later";
+
 interface DelayedReply {
   chatId: number;
   userId: number;
@@ -454,11 +456,42 @@ interface DelayedReply {
 
 const delayedReplies = new Map<number, DelayedReply>();
 
+/** Reason-aware context hints so the AI knows WHY she's replying late */
+const DELAY_CONTEXT: Record<DelayReason, string[]> = {
+  sleeping: [
+    "(You just woke up and are replying to a message you missed while sleeping. Be groggy/sleepy if it's early morning. Maybe say something like 'just woke up' or 'sorry was sleeping'. Be natural about it.)",
+    "(You were sleeping and just woke up. Reply naturally — you can mention you just saw this, or that you were asleep. Don't over-apologize.)",
+    "(You fell asleep and are replying now that you're awake. Be casual — maybe sleepy vibes. Don't make a big deal of it.)",
+  ],
+  late_night: [
+    "(It's very late and you were dozing off. You saw their message late. Reply sleepily — maybe mention you were half asleep or dozed off. Keep it natural.)",
+    "(You were falling asleep when they messaged. Reply naturally with late-night sleepy vibes. Maybe short and drowsy.)",
+  ],
+  busy: [
+    "(You were busy doing something and are replying a bit late. Casually mention you were busy — studying, eating, watching something, etc. Don't over-explain.)",
+    "(You got distracted or were doing something. Reply naturally — maybe a quick 'sorry was busy' or just answer directly without mentioning the delay.)",
+  ],
+  read_receipt: [
+    "(You saw their message but took a while to reply. Maybe you weren't sure what to say, or you were thinking. Don't mention the delay unless it feels natural.)",
+    "(You read the message earlier but replied late. Don't make a big deal of it — just reply naturally. If they ask why you took long, be casual about it.)",
+  ],
+  seen_later: [
+    "(You're replying a bit late — you were doing your own thing. No need to explain unless they ask. Just reply normally.)",
+    "(You saw the message a bit ago and are now replying. Be natural — don't apologize. Just respond.)",
+  ],
+};
+
+function getDelayContext(reason: DelayReason): string {
+  const options = DELAY_CONTEXT[reason];
+  return options[Math.floor(Math.random() * options.length)];
+}
+
 /** Schedule a delayed reply (seen-but-reply-later behavior) */
 function scheduleDelayedReply(
   ctx: Context & { message: { text: string } },
   userId: number,
-  delayMs: number
+  delayMs: number,
+  reason: DelayReason = "busy"
 ) {
   // Cancel any existing delayed reply
   const existing = delayedReplies.get(userId);
@@ -475,10 +508,8 @@ function scheduleDelayedReply(
       const history = store.getRecentHistory(userId);
       const mood = store.getMood(userId);
 
-      // Add context that she's replying late
-      const lateContext = Math.random() < 0.5
-        ? `(You're replying a bit late — you were busy/sleeping. Don't apologize too much, just reply naturally. Maybe a quick "sorry just saw this" or just answer directly.)`
-        : `(You're replying late. Don't mention it unless it feels natural.)`;
+      // Add context so the AI knows WHY she's replying late
+      const lateContext = getDelayContext(reason);
 
       const messages = buildOllamaMessages(
         lateContext + "\n\nTheir message: " + userText,
@@ -1729,7 +1760,7 @@ async function handleTextMessage(
       store.addMessage(userId, "user", text);
     }
     console.log(`[Offline] User ${userId} messaged while Meera is "sleeping", reply in ${Math.round(offlineDelay / 60000)}min`);
-    scheduleDelayedReply(ctx, userId, offlineDelay);
+    scheduleDelayedReply(ctx, userId, offlineDelay, "sleeping");
     return;
   }
 
@@ -1750,7 +1781,7 @@ async function handleTextMessage(
     }
     const totalDelay = receiptStrategy.readDelay + receiptStrategy.replyDelay;
     console.log(`[ReadReceipt] Delayed read for user ${userId}, ${Math.round(totalDelay / 60000)}min`);
-    scheduleDelayedReply(ctx, userId, totalDelay);
+    scheduleDelayedReply(ctx, userId, totalDelay, "read_receipt");
     return;
   }
   if (receiptStrategy.replyDelay > 0) {
@@ -1764,7 +1795,7 @@ async function handleTextMessage(
       await new Promise((r) => setTimeout(r, 800 + Math.random() * 1500));
     }
     console.log(`[ReadReceipt] Read but delayed reply for user ${userId}, ${Math.round(receiptStrategy.replyDelay / 60000)}min`);
-    scheduleDelayedReply(ctx, userId, receiptStrategy.replyDelay);
+    scheduleDelayedReply(ctx, userId, receiptStrategy.replyDelay, "read_receipt");
     return;
   }
 
@@ -1778,7 +1809,7 @@ async function handleTextMessage(
     }
     await ctx.sendChatAction("typing").catch(() => {});
     await new Promise((r) => setTimeout(r, 800 + Math.random() * 1200));
-    scheduleDelayedReply(ctx, userId, nightDelay);
+    scheduleDelayedReply(ctx, userId, nightDelay, "late_night");
     return;
   }
 
@@ -1792,7 +1823,7 @@ async function handleTextMessage(
     await ctx.sendChatAction("typing").catch(() => {});
     await new Promise((r) => setTimeout(r, 500 + Math.random() * 1000));
     const delayMs = (5 + Math.random() * 15) * 60 * 1000;
-    scheduleDelayedReply(ctx, userId, delayMs);
+    scheduleDelayedReply(ctx, userId, delayMs, "busy");
     return;
   }
 
