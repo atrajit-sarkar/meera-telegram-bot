@@ -532,6 +532,55 @@ function convertToPcm16(inputBuf: Buffer): Promise<string> {
   });
 }
 
+/** Extract a single frame from a video as JPEG, returned as base64 */
+function extractVideoFrame(videoBuf: Buffer): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const proc = execFile(
+      ffmpegPath as unknown as string,
+      [
+        "-i", "pipe:0",
+        "-vframes", "1",         // Just 1 frame
+        "-ss", "0.5",            // Half second in (skip black intro frames)
+        "-f", "image2pipe",
+        "-vcodec", "mjpeg",
+        "-q:v", "3",             // Good quality JPEG
+        "pipe:1",
+      ],
+      { encoding: "buffer" as const, maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err) return reject(err);
+        resolve(Buffer.from(stdout).toString("base64"));
+      }
+    );
+    proc.stdin!.write(videoBuf);
+    proc.stdin!.end();
+  });
+}
+
+/** Extract audio from a video as PCM16 16kHz mono, returned as base64. Returns null if no audio stream. */
+function extractVideoAudio(videoBuf: Buffer): Promise<string | null> {
+  return new Promise((resolve) => {
+    const proc = execFile(
+      ffmpegPath as unknown as string,
+      [
+        "-i", "pipe:0",
+        "-vn",                   // No video
+        "-f", "s16le",
+        "-ar", "16000",
+        "-ac", "1",
+        "pipe:1",
+      ],
+      { encoding: "buffer" as const, maxBuffer: 20 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err || !stdout || stdout.length === 0) return resolve(null);
+        resolve(Buffer.from(stdout).toString("base64"));
+      }
+    );
+    proc.stdin!.write(videoBuf);
+    proc.stdin!.end();
+  });
+}
+
 /** Convert raw PCM16 24kHz mono to a WAV buffer */
 function pcmToWav(pcmChunks: Buffer[]): Buffer {
   const pcm = Buffer.concat(pcmChunks);
@@ -1908,31 +1957,74 @@ bot.on(message("audio"), async (ctx) => {
   await handleMediaMessage(ctx, [{ inlineData: { data: pcmBase64, mimeType: "audio/pcm" } }]);
 });
 
-// Videos
+// Videos — extract frame + audio since Gemini Live can't handle raw video inline
 bot.on(message("video"), async (ctx) => {
   const fileSize = ctx.message.video.file_size ?? 0;
   if (fileSize > 15 * 1024 * 1024) {
     await ctx.reply("⚠️ Video is too large (max 15 MB). Send a shorter clip.");
     return;
   }
-  const base64 = await downloadFile(ctx.message.video.file_id);
+  const raw = await downloadFileBuffer(ctx.message.video.file_id);
   const parts: Record<string, unknown>[] = [];
   if (ctx.message.caption) parts.push({ text: ctx.message.caption });
-  parts.push({ inlineData: { data: base64, mimeType: "video/mp4" } });
+
+  // Extract a frame as JPEG for visual context
+  try {
+    const frameBase64 = await extractVideoFrame(raw);
+    parts.push({ inlineData: { data: frameBase64, mimeType: "image/jpeg" } });
+  } catch (err) {
+    console.error("[Bot] Failed to extract video frame:", err);
+  }
+
+  // Extract audio for audio context
+  try {
+    const audioBase64 = await extractVideoAudio(raw);
+    if (audioBase64) {
+      parts.push({ inlineData: { data: audioBase64, mimeType: "audio/pcm;rate=16000" } });
+    }
+  } catch (err) {
+    console.error("[Bot] Failed to extract video audio:", err);
+  }
+
+  // Add a hint that this is a video
+  if (!ctx.message.caption) {
+    parts.push({ text: "(The user sent you a video. You're seeing a frame from it and hearing its audio.)" });
+  }
+
   await handleMediaMessage(ctx, parts);
 });
 
-// Video notes (circle videos)
+// Video notes (circle videos) — extract frame + audio
 bot.on(message("video_note"), async (ctx) => {
   const fileSize = ctx.message.video_note.file_size ?? 0;
   if (fileSize > 15 * 1024 * 1024) {
     await ctx.reply("⚠️ Video note is too large.");
     return;
   }
-  const base64 = await downloadFile(ctx.message.video_note.file_id);
-  await handleMediaMessage(ctx, [
-    { inlineData: { data: base64, mimeType: "video/mp4" } },
-  ]);
+  const raw = await downloadFileBuffer(ctx.message.video_note.file_id);
+  const parts: Record<string, unknown>[] = [];
+
+  // Extract a frame as JPEG
+  try {
+    const frameBase64 = await extractVideoFrame(raw);
+    parts.push({ inlineData: { data: frameBase64, mimeType: "image/jpeg" } });
+  } catch (err) {
+    console.error("[Bot] Failed to extract video_note frame:", err);
+  }
+
+  // Extract audio
+  try {
+    const audioBase64 = await extractVideoAudio(raw);
+    if (audioBase64) {
+      parts.push({ inlineData: { data: audioBase64, mimeType: "audio/pcm;rate=16000" } });
+    }
+  } catch (err) {
+    console.error("[Bot] Failed to extract video_note audio:", err);
+  }
+
+  parts.push({ text: "(The user sent you a circle video / video note of themselves. React to what you see and hear.)" });
+
+  await handleMediaMessage(ctx, parts);
 });
 
 // Documents (images / videos sent as files)
@@ -1947,11 +2039,38 @@ bot.on(message("document"), async (ctx) => {
     await ctx.reply("⚠️ File is too large (max 15 MB).");
     return;
   }
-  const base64 = await downloadFile(ctx.message.document.file_id);
-  const parts: Record<string, unknown>[] = [];
-  if (ctx.message.caption) parts.push({ text: ctx.message.caption });
-  parts.push({ inlineData: { data: base64, mimeType: mime } });
-  await handleMediaMessage(ctx, parts);
+
+  if (mime.startsWith("video/")) {
+    // Video document — extract frame + audio like regular videos
+    const raw = await downloadFileBuffer(ctx.message.document.file_id);
+    const parts: Record<string, unknown>[] = [];
+    if (ctx.message.caption) parts.push({ text: ctx.message.caption });
+    try {
+      const frameBase64 = await extractVideoFrame(raw);
+      parts.push({ inlineData: { data: frameBase64, mimeType: "image/jpeg" } });
+    } catch (err) {
+      console.error("[Bot] Failed to extract doc video frame:", err);
+    }
+    try {
+      const audioBase64 = await extractVideoAudio(raw);
+      if (audioBase64) {
+        parts.push({ inlineData: { data: audioBase64, mimeType: "audio/pcm;rate=16000" } });
+      }
+    } catch (err) {
+      console.error("[Bot] Failed to extract doc video audio:", err);
+    }
+    if (!ctx.message.caption) {
+      parts.push({ text: "(The user sent you a video file. You're seeing a frame from it and hearing its audio.)" });
+    }
+    await handleMediaMessage(ctx, parts);
+  } else {
+    // Image document — send directly
+    const base64 = await downloadFile(ctx.message.document.file_id);
+    const parts: Record<string, unknown>[] = [];
+    if (ctx.message.caption) parts.push({ text: ctx.message.caption });
+    parts.push({ inlineData: { data: base64, mimeType: mime } });
+    await handleMediaMessage(ctx, parts);
+  }
 });
 
 // ── PROACTIVE MESSAGING ─────────────────────────────────────────────
