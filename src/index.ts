@@ -1748,11 +1748,12 @@ async function handleTextMessage(
 
   if (useVoice) {
     // Voice reply via Gemini Live
+    let stopTyping = () => {};
     try {
       const readTime = readDelay(text) * todMultiplier * paceMult;
       await new Promise((r) => setTimeout(r, readTime));
 
-      const stopTyping = typingIndicator(ctx, "record_voice");
+      stopTyping = typingIndicator(ctx, "record_voice");
       sessions.resetSession(userId);
       const session = await sessions.getSession(userId);
       const response = await session.send([{
@@ -1766,8 +1767,8 @@ async function handleTextMessage(
         console.log(`[Bot] Gemini blocked voice for user ${userId}, falling back to Ollama text`);
         sessions.resetSession(userId);
 
-        // Fall back to Ollama text — naturally dodge the topic
-        const stopTyping2 = typingIndicator(ctx, "typing");
+        // Fall back to Ollama text
+        stopTyping = typingIndicator(ctx, "typing");
         const user = store.getUser(userId);
         const userMsg = replyContext
           + (gapContext ? gapContext + "\n\n" : "")
@@ -1786,7 +1787,7 @@ async function handleTextMessage(
 
         const delay = typingDelay(reply) * timeOfDayMultiplier();
         await new Promise((r) => setTimeout(r, Math.min(delay, 6000)));
-        stopTyping2();
+        stopTyping();
         await sendAsBubbles(ctx, reply, quoteReplyId);
         maybeSendSticker(ctx, userId, reply).catch(() => {});
         return;
@@ -1809,16 +1810,18 @@ async function handleTextMessage(
       }
     } catch (err) {
       console.error("[Bot] Gemini voice error:", err);
+      stopTyping();
       sessions.resetSession(userId);
       await ctx.reply("wait something messed up lol try again");
     }
   } else {
     // Text reply via Ollama
+    let stopTyping = () => {};
     try {
       const readTime = readDelay(text) * todMultiplier * paceMult;
       await new Promise((r) => setTimeout(r, readTime));
 
-      const stopTyping = typingIndicator(ctx, "typing");
+      stopTyping = typingIndicator(ctx, "typing");
       const user = store.getUser(userId);
 
       // Build message with all context hints
@@ -1869,6 +1872,7 @@ async function handleTextMessage(
       maybeSendSticker(ctx, userId, reply).catch(() => {});
     } catch (err) {
       console.error("[Bot] Ollama error:", err);
+      stopTyping();
       await ctx.reply("omg my brain just glitched 😭 say that again?");
     }
   }

@@ -76,7 +76,7 @@ export async function callOllama(
       if (lower.includes("unauthorized") || lower.includes("invalid")) {
         throw new Error("invalid_key");
       }
-      if (lower.includes("rate") || lower.includes("quota")) {
+      if (res.status === 429 || lower.includes("rate") || lower.includes("quota") || lower.includes("limit")) {
         throw new Error("quota_exceeded");
       }
       throw new Error(`ollama_error: ${res.status} ${text.slice(0, 200)}`);
