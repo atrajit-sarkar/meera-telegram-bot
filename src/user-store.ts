@@ -21,6 +21,7 @@ export interface UserData {
   ollamaKeys: string[];
   mood: string;
   lastMoodChange: number;
+  customPersona?: string;
 }
 
 export const MOODS = ["happy", "bored", "clingy", "sassy", "tired", "excited", "chill", "annoyed"] as const;

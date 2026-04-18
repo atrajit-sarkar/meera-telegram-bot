@@ -86,7 +86,30 @@ export function getComfortTier(msgCount: number): string {
 // NOTE: Prefer store.getComfortTier(userId) which uses totalMessages counter
 
 export function buildSystemPrompt(tier: string, user: UserData, mood?: string): string {
-  let prompt = getBaseSystemPrompt();
+  // If user has a custom persona, use it as the base instead of default Meera
+  let prompt: string;
+  if (user.customPersona) {
+    prompt = user.customPersona;
+
+    // Still add mood modifier on top of custom persona
+    if (mood && MOOD_MODIFIERS[mood]) {
+      prompt += `\n\nYOUR CURRENT MOOD:\n${MOOD_MODIFIERS[mood]}`;
+    }
+
+    // Still add user context
+    const ctx: string[] = [];
+    if (user.profileName) ctx.push(`The user's name is ${user.profileName}.`);
+    if (user.profileBio) ctx.push(`About the user: ${user.profileBio}`);
+    if (user.replyLength === "short")
+      ctx.push("They prefer short replies — keep it brief.");
+    if (user.replyLength === "long")
+      ctx.push("They like longer, more detailed replies.");
+    if (ctx.length) prompt += "\n\n" + ctx.join(" ");
+    return prompt;
+  }
+
+  // Default Meera persona
+  prompt = getBaseSystemPrompt();
   prompt += "\n\n" + (COMFORT_TIERS[tier] ?? "");
 
   // Add mood modifier
@@ -142,17 +165,20 @@ export function buildGeminiSystemInstruction(tier: string, user: UserData, mood?
   let prompt = buildSystemPrompt(tier, user, mood);
   prompt += `\n\nYou can see images, hear audio, and watch videos.
 When they send media, respond naturally about what you see or hear.
-Keep it conversational and genuine. No formal analysis — just react like a person would.
+Keep it conversational and genuine. No formal analysis — just react like a person would.`;
 
-## VOICE DIRECTION
+  // Only add default Meera voice direction if no custom persona
+  if (!user.customPersona) {
+    prompt += `\n\n## VOICE DIRECTION
 You are Meera — a sweet, warm 20-year-old Indian girl.
 Accent: Natural Indian accent, like a young girl from Kolkata who speaks Bengali and Hindi fluently. Light, soft, and sweet.
 Style: Warm, expressive, youthful. You giggle, you gasp, you get excited. Your voice has a natural sweetness to it.
 Pacing: Casual and relaxed, like chatting with a friend. Sometimes fast when excited, sometimes slow and soft when being sweet.
 Language: Speak in whatever language the user uses — Hindi, Bengali, English, or a natural mix (Hinglish/Benglish). Switch naturally like a real bilingual girl would.
-Tone: Never robotic, never formal, never like an AI assistant. Sound like a real girl talking to her friend.
+Tone: Never robotic, never formal, never like an AI assistant. Sound like a real girl talking to her friend.`;
+  }
 
-IMPORTANT — if you can't or don't want to comment on something (body, nudity, anything sensitive):
+  prompt += `\n\nIMPORTANT — if you can't or don't want to comment on something (body, nudity, anything sensitive):
 - NEVER say "I can't describe" or "I'm not able to" or "as an AI" — that breaks character instantly.
 - Instead, dodge it like a real girl would: tease them, change the subject, act flustered, or just laugh it off.
 - Examples: "omg what are you sending me", "bro chill hahaha", "nice room tho", "someone's showing off huh", "arey pagal hai kya"

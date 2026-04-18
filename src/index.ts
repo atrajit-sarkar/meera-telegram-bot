@@ -768,6 +768,9 @@ bot.start((ctx) =>
       "/addkey — Add your Ollama API key\n" +
       "/keys — List your API keys\n" +
       "/removekey — Remove an API key\n" +
+      "/persona — Customize AI personality\n" +
+      "/viewpersona — View your custom persona\n" +
+      "/resetpersona — Reset to default\n" +
       "/help — Show this message"
   )
 );
@@ -785,7 +788,9 @@ bot.help((ctx) =>
       "/talk — Toggle voice-only replies\n" +
       "/addstickers /stickers /removestickers\n" +
       "/clear — Reset conversation\n" +
-      "/addkey /keys /removekey — Manage API keys"
+      "/addkey /keys /removekey — Manage API keys\n" +
+      "/persona — Customize AI personality\n" +
+      "/viewpersona /resetpersona — Manage persona"
   )
 );
 
@@ -919,6 +924,61 @@ bot.command("removekey", async (ctx) => {
   await ctx.reply("Which key to remove?\n" + masked.join("\n") + "\n\nSend the number.");
 });
 
+// ── CUSTOM PERSONA COMMANDS ─────────────────────────────────────────
+
+const PERSONA_TEMPLATE = `🎭 *Custom Persona Template*
+
+Copy the template below, fill it in, and send it back to me\\. This will *completely replace* the default personality\\.
+
+\`\`\`
+NAME: [AI's name, e.g. "Riya", "Zara", "Sakura"]
+AGE: [e.g. "21"]
+GENDER: [e.g. "girl", "boy", "non-binary"]
+PERSONALITY: [Core personality traits, e.g. "Shy, nerdy, loves anime, secretly sarcastic"]
+SPEAKING STYLE: [How they talk, e.g. "Uses lots of kaomoji, types in lowercase, says 'uwu' unironically"]
+LANGUAGE: [What languages they speak, e.g. "English and Japanese mix, sometimes drops random Japanese words"]
+VIBE: [Overall energy, e.g. "Soft and gentle but can roast you when comfortable"]
+BACKGROUND: [Brief backstory, e.g. "College student studying CS, lives in Tokyo, has a cat named Mochi"]
+INTERESTS: [What they like, e.g. "Anime, coding, lo-fi music, midnight snacks, cat videos"]
+RULES: [Any specific behaviors, e.g. "Never uses caps lock, always sends a cat emoji at the end of conversations"]
+EXTRA: [Anything else, e.g. "Gets flustered easily, has a crush on the user but won't admit it"]
+\`\`\`
+
+💡 *Tips:*
+• Be as detailed as you want — the more detail, the better the AI becomes that character
+• You can write it in any format, the template is just a guide
+• Use /viewpersona to see your current persona
+• Use /resetpersona to go back to default ${botName}`;
+
+bot.command("persona", async (ctx) => {
+  store.setFsmState(ctx.from.id, "waiting_for_persona");
+  await ctx.reply(PERSONA_TEMPLATE, { parse_mode: "MarkdownV2" });
+});
+
+bot.command("viewpersona", async (ctx) => {
+  const user = store.getUser(ctx.from.id);
+  if (!user.customPersona) {
+    await ctx.reply(`You're using the default ${botName} personality. Use /persona to customize it!`);
+    return;
+  }
+  // Truncate if too long for a Telegram message
+  const display = user.customPersona.length > 3500
+    ? user.customPersona.slice(0, 3500) + "\n\n... (truncated)"
+    : user.customPersona;
+  await ctx.reply(`🎭 *Your Custom Persona:*\n\n${display}\n\n_Use /resetpersona to go back to default._`, { parse_mode: "Markdown" });
+});
+
+bot.command("resetpersona", async (ctx) => {
+  const user = store.getUser(ctx.from.id);
+  if (!user.customPersona) {
+    await ctx.reply(`You're already using the default ${botName} personality.`);
+    return;
+  }
+  store.updateUser(ctx.from.id, { customPersona: "" });
+  sessions.resetSession(ctx.from.id);
+  await ctx.reply(`✅ Persona reset! I'm back to being ${botName}. 😊`);
+});
+
 // ── FSM STATE HANDLER ───────────────────────────────────────────────
 
 async function handleFsmState(
@@ -997,6 +1057,33 @@ async function handleFsmState(
           return ctx.reply(`Removed key: ${removed.slice(0, 6)}...${removed.slice(-4)}`).then(() => true);
         }
         return ctx.reply("Invalid number.").then(() => true);
+      }
+
+    case "waiting_for_persona":
+      store.clearFsmState(userId);
+      {
+        const personaText = text.trim();
+        if (personaText.length < 20) {
+          return ctx.reply("That's too short for a persona! Use /persona to try again with more detail.").then(() => true);
+        }
+        // Build the custom system prompt from what the user provided
+        const customPrompt = `You are a character in a Telegram chat. Here is your persona — stay in character at all times.
+
+${personaText}
+
+CRITICAL RULES:
+- NEVER write labels like "Voice message:", "(Voice message)", "*Voice message*", "Text:", "Reply:" etc.
+- NEVER describe what you're doing like "*sends voice*" or "*typing*" or "*laughs*"
+- NEVER split your reply into "text part" and "voice part" — just write ONE natural reply
+- NEVER use roleplay asterisks like *action* or parenthetical narration like (laughs)
+- NEVER say "As an AI" or mention being artificial in any way
+- Just write the actual words you want to say. Nothing else. No meta-commentary.
+- ALWAYS reply in the same language the user is speaking. Match their language naturally.
+- Keep it natural. This is chat, not email.`;
+
+        store.updateUser(userId, { customPersona: customPrompt });
+        sessions.resetSession(userId);
+        return ctx.reply("✅ Custom persona set! I'll be this character from now on.\n\nUse /viewpersona to review it or /resetpersona to go back to default.").then(() => true);
       }
 
     default:
