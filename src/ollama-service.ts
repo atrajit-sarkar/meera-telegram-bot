@@ -103,6 +103,108 @@ export async function callOllama(
 
 // ── Telegram Reaction Emojis ─────────────────────────────────────
 
+// ── AI Behavior Decision ─────────────────────────────────────────
+
+export type ResponseAction =
+  | { action: "reply_normal" }
+  | { action: "delay_reply"; delayMinutes: number; reason: string }
+  | { action: "leave_on_read" }
+  | { action: "emoji_only"; emoji: string }
+  | { action: "sticker_only" };
+
+/**
+ * Ask the AI to decide how to respond to a message — like a real person would.
+ * Should she reply immediately? Delay? Leave on read? Just react with an emoji?
+ * This replaces hardcoded probability checks with contextual AI decisions.
+ */
+export async function decideResponseBehavior(
+  config: OllamaConfig,
+  userMessage: string,
+  chatHistory: OllamaMessage[],
+  opts: {
+    tier: string;
+    mood: string;
+    timeOfDay: string;
+    personaHint?: string;
+  }
+): Promise<ResponseAction> {
+  const personaLine = opts.personaHint
+    ? `Your character/persona: ${opts.personaHint}`
+    : "You are a young Indian girl chatting on Telegram.";
+
+  const systemPrompt = `You are deciding how a real person would respond to an incoming Telegram message. You're not writing the reply — just deciding the BEHAVIOR.
+
+${personaLine}
+
+Context:
+- Relationship tier: ${opts.tier} (stranger → acquaintance → comfortable → close)
+- Current mood: ${opts.mood}
+- Time of day (IST): ${opts.timeOfDay}
+
+You must respond with ONLY a JSON object (no markdown, no explanation). Choose one:
+
+1. Reply normally:
+{"action":"reply_normal"}
+
+2. Delay the reply (you're busy, distracted, want them to wait, not in mood, sleepy, etc.):
+{"action":"delay_reply","delayMinutes":<3-30>,"reason":"<brief reason like: busy studying, dozed off, not in mood, making them wait>"}
+
+3. Leave on read (not worth replying, conversation is dying, boring message):
+{"action":"leave_on_read"}
+
+4. Just send an emoji (message doesn't need a real reply):
+{"action":"emoji_only","emoji":"<single emoji>"}
+
+5. Just send a sticker (playful/reactive response):
+{"action":"sticker_only"}
+
+GUIDELINES:
+- Strangers and acquaintances: ALWAYS reply_normal. Never leave on read or delay.
+- Comfortable/close friends: you can delay, leave on read, or emoji-only sometimes.
+- Late night (11 PM - 6 AM): higher chance of delays (sleepy) or leaving on read.
+- If the message is emotional, important, or a question: ALWAYS reply_normal.
+- Low-effort messages like "ok", "hmm", "k": consider leave_on_read or emoji_only.
+- Don't overdo delays/ignoring — most messages (70%+) should be reply_normal.
+- If mood is "clingy" or "excited": almost always reply_normal.
+- If mood is "annoyed" or "bored": more likely to delay or leave on read.
+- emoji_only: pick from 😂💀🙄😭👀🤷‍♀️😐🫠👍❤🔥
+- sticker_only: only if you have a playful/funny reaction, rare (< 5%).
+
+Reply with ONLY the JSON. No other text.`;
+
+  try {
+    const messages: OllamaMessage[] = [
+      { role: "system", content: systemPrompt },
+      ...chatHistory.slice(-6).filter((m) => m.role !== "system"),
+      { role: "user", content: userMessage },
+    ];
+    const raw = await callOllama(config, messages);
+
+    // Parse the JSON from the response
+    const jsonMatch = raw.match(/\{[^}]+\}/);
+    if (!jsonMatch) return { action: "reply_normal" };
+
+    const parsed = JSON.parse(jsonMatch[0]);
+    const action = parsed.action;
+
+    if (action === "reply_normal") return { action: "reply_normal" };
+    if (action === "delay_reply") {
+      const mins = Math.max(3, Math.min(30, Number(parsed.delayMinutes) || 5));
+      return { action: "delay_reply", delayMinutes: mins, reason: String(parsed.reason || "busy") };
+    }
+    if (action === "leave_on_read") return { action: "leave_on_read" };
+    if (action === "emoji_only" && parsed.emoji) return { action: "emoji_only", emoji: String(parsed.emoji) };
+    if (action === "sticker_only") return { action: "sticker_only" };
+
+    return { action: "reply_normal" };
+  } catch {
+    // If the behavior call fails, just reply normally
+    return { action: "reply_normal" };
+  }
+}
+
+// ── Telegram Reaction Emojis (existing) ──────────────────────────
+
 export const TELEGRAM_REACTION_EMOJIS = [
   "👍","👎","❤","🔥","🥰","👏","😁","🤔","🤯","😱",
   "🤬","😢","🎉","🤩","🤮","💩","🙏","👌","🕊","🤡",

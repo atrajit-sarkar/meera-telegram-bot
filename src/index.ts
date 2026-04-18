@@ -19,6 +19,7 @@ import {
   callOllamaWithRotation,
   pickReactionEmoji,
   pickStickerEmoji,
+  decideResponseBehavior,
   type OllamaConfig,
   type OllamaMessage,
 } from "./ollama-service.js";
@@ -133,18 +134,6 @@ function timeOfDayMultiplier(): number {
   if (hour >= 23 || hour < 1) return 2.0;    // 11 PM - 1 AM: sleepy
   if (hour >= 8 && hour < 10) return 1.2;    // morning routine
   return 1.0;                                 // normal hours
-}
-
-/** Should the bot ignore/delay-reply based on time? Returns delay in ms, or 0 for normal */
-function lateNightDelay(): number {
-  const hour = getISTHour();
-  if (hour >= 2 && hour < 6) {
-    // 2-6 AM: 50% chance of not replying for 10-30 min (she's sleeping!)
-    if (Math.random() < 0.5) {
-      return (10 + Math.random() * 20) * 60 * 1000;
-    }
-  }
-  return 0;
 }
 
 // ── MESSAGE SPLITTING ───────────────────────────────────────────────
@@ -380,67 +369,6 @@ function offlineScheduleDelay(): number {
   }
 
   return 0;
-}
-
-// ── READ RECEIPT GAMING (advanced) ──────────────────────────────────
-
-/**
- * More sophisticated read-receipt behavior.
- * Sometimes: read instantly but reply late. Sometimes: don't even "read" for a while.
- * Returns: { readDelay: ms, replyDelay: ms, showTypingFirst: boolean }
- */
-function readReceiptStrategy(tier: string, mood: string): { readDelay: number; replyDelay: number; showTypingFirst: boolean } {
-  // Strangers/acquaintances: mostly normal behavior
-  if (tier === "stranger" || tier === "acquaintance") {
-    return { readDelay: 0, replyDelay: 0, showTypingFirst: false };
-  }
-
-  const strategies = Math.random();
-
-  if (mood === "annoyed" || mood === "sassy") {
-    // More likely to leave them hanging
-    if (strategies < 0.20) {
-      // Read instantly, reply after 3-8 min (making them wait on purpose)
-      return { readDelay: 0, replyDelay: (3 + Math.random() * 5) * 60 * 1000, showTypingFirst: true };
-    }
-  }
-
-  if (mood === "clingy") {
-    // Reply fast when clingy
-    return { readDelay: 0, replyDelay: 0, showTypingFirst: false };
-  }
-
-  if (mood === "bored") {
-    // 15% chance: read but take a while to reply
-    if (strategies < 0.15) {
-      return { readDelay: 0, replyDelay: (2 + Math.random() * 4) * 60 * 1000, showTypingFirst: false };
-    }
-  }
-
-  // General: 8% chance of "didn't see it for a few minutes"
-  if (strategies < 0.08) {
-    return { readDelay: (1 + Math.random() * 3) * 60 * 1000, replyDelay: 0, showTypingFirst: false };
-  }
-
-  return { readDelay: 0, replyDelay: 0, showTypingFirst: false };
-}
-
-// ── LEAVE ON READ ───────────────────────────────────────────────────
-
-/** Check if message is low-effort enough to potentially ignore */
-function shouldLeaveOnRead(tier: string, userText: string): boolean {
-  const text = userText.trim().toLowerCase();
-
-  // Only for comfortable+ tiers (strangers/acquaintances always get replies)
-  if (tier === "stranger" || tier === "acquaintance") return false;
-
-  // Low-effort patterns
-  const lowEffort = /^(ok|okay|k|kk|hmm|hm|oh|ah|mm|mhm|acha|accha|thik|theek|haan|ha|ji)$/i;
-  if (!lowEffort.test(text)) return false;
-
-  // 20% chance to leave on read for comfortable, 30% for close
-  const prob = tier === "close" ? 0.30 : 0.20;
-  return Math.random() < prob;
 }
 
 // ── DELAYED REPLY QUEUE ─────────────────────────────────────────────
@@ -1765,83 +1693,66 @@ async function handleTextMessage(
   }
 
   // ── Leave on read? (comfortable+ only, low-effort messages) — only for single messages
-  if (!isBatched && shouldLeaveOnRead(tier, text)) {
-    store.addMessage(userId, "user", text);
-    console.log(`[Bot] Left on read: user ${userId} ("${text.slice(0, 20)}")`);
-    return;
-  }
+  // ── Read receipt gaming, late night, random delay, emoji-only, sticker-only
+  // ALL replaced by AI behavior decision below ──
 
-  // ── Read receipt gaming — advanced seen/not-seen behavior
-  const receiptStrategy = readReceiptStrategy(tier, mood);
-  if (receiptStrategy.readDelay > 0) {
-    if (isBatched) {
-      for (const t of batchedTexts!) store.addMessage(userId, "user", t);
-    } else {
-      store.addMessage(userId, "user", text);
-    }
-    const totalDelay = receiptStrategy.readDelay + receiptStrategy.replyDelay;
-    console.log(`[ReadReceipt] Delayed read for user ${userId}, ${Math.round(totalDelay / 60000)}min`);
-    scheduleDelayedReply(ctx, userId, totalDelay, "read_receipt");
-    return;
-  }
-  if (receiptStrategy.replyDelay > 0) {
-    if (isBatched) {
-      for (const t of batchedTexts!) store.addMessage(userId, "user", t);
-    } else {
-      store.addMessage(userId, "user", text);
-    }
-    if (receiptStrategy.showTypingFirst) {
-      await ctx.sendChatAction("typing").catch(() => {});
-      await new Promise((r) => setTimeout(r, 800 + Math.random() * 1500));
-    }
-    console.log(`[ReadReceipt] Read but delayed reply for user ${userId}, ${Math.round(receiptStrategy.replyDelay / 60000)}min`);
-    scheduleDelayedReply(ctx, userId, receiptStrategy.replyDelay, "read_receipt");
-    return;
-  }
+  // Ask the AI how to respond (only for comfortable+ to save API calls)
+  if (!isBatched && (tier === "comfortable" || tier === "close")) {
+    const hour = getISTHour();
+    const timeLabel =
+      hour >= 0 && hour < 6 ? `${hour} AM (late night/early morning)` :
+      hour < 12 ? `${hour} AM` :
+      hour === 12 ? `12 PM (noon)` :
+      hour < 17 ? `${hour - 12} PM (afternoon)` :
+      hour < 21 ? `${hour - 12} PM (evening)` :
+      `${hour - 12} PM (night)`;
 
-  // ── Seen but reply later? (late night / random delay)
-  const nightDelay = lateNightDelay();
-  if (nightDelay > 0) {
-    if (isBatched) {
-      for (const t of batchedTexts!) store.addMessage(userId, "user", t);
-    } else {
+    const history = store.getRecentHistory(userId);
+    const user = store.getUser(userId);
+    const behavior = await decideResponseBehavior(ollamaConfig, text, history, {
+      tier,
+      mood,
+      timeOfDay: timeLabel,
+      personaHint: user.customPersona?.slice(0, 500),
+    });
+
+    if (behavior.action === "leave_on_read") {
       store.addMessage(userId, "user", text);
+      console.log(`[AI-Behavior] Left on read: user ${userId} ("${text.slice(0, 30)}")`);
+      return;
     }
-    await ctx.sendChatAction("typing").catch(() => {});
-    await new Promise((r) => setTimeout(r, 800 + Math.random() * 1200));
-    scheduleDelayedReply(ctx, userId, nightDelay, "late_night");
-    return;
-  }
 
-  // ── Random "seen but reply later" (5% chance during day, comfortable+)
-  if ((tier === "comfortable" || tier === "close") && Math.random() < 0.05) {
-    if (isBatched) {
-      for (const t of batchedTexts!) store.addMessage(userId, "user", t);
-    } else {
+    if (behavior.action === "delay_reply") {
       store.addMessage(userId, "user", text);
+      const delayMs = behavior.delayMinutes * 60 * 1000;
+      // Map the AI's reason to a DelayReason category
+      const reasonLower = behavior.reason.toLowerCase();
+      const delayReason: DelayReason =
+        reasonLower.includes("sleep") || reasonLower.includes("doz") || reasonLower.includes("nap") ? "sleeping" :
+        reasonLower.includes("night") || reasonLower.includes("late") ? "late_night" :
+        reasonLower.includes("wait") || reasonLower.includes("making") || reasonLower.includes("seen") ? "read_receipt" :
+        "busy";
+      console.log(`[AI-Behavior] Delay ${behavior.delayMinutes}min (${behavior.reason}): user ${userId}`);
+      scheduleDelayedReply(ctx, userId, delayMs, delayReason);
+      return;
     }
-    await ctx.sendChatAction("typing").catch(() => {});
-    await new Promise((r) => setTimeout(r, 500 + Math.random() * 1000));
-    const delayMs = (5 + Math.random() * 15) * 60 * 1000;
-    scheduleDelayedReply(ctx, userId, delayMs, "busy");
-    return;
-  }
 
-  // ── Sticker-only reply? (comfortable+ only, for short/reactive messages)
-  if (!isBatched && await maybeStickerOnlyReply(ctx, userId, text)) {
-    return;
-  }
-
-  // ── Emoji-only reply? (only for single non-batched messages)
-  if (!isBatched) {
-    const emojiOnly = shouldSendEmojiOnly(tier, text);
-    if (emojiOnly) {
+    if (behavior.action === "emoji_only") {
       store.addMessage(userId, "user", text);
-      store.addMessage(userId, "assistant", emojiOnly);
+      store.addMessage(userId, "assistant", behavior.emoji);
       const readTime = readDelay(text) * paceMult;
       await new Promise((r) => setTimeout(r, readTime));
-      await ctx.reply(emojiOnly);
+      await ctx.reply(behavior.emoji);
+      console.log(`[AI-Behavior] Emoji-only (${behavior.emoji}): user ${userId}`);
       return;
+    }
+
+    if (behavior.action === "sticker_only") {
+      if (await maybeStickerOnlyReply(ctx, userId, text)) {
+        console.log(`[AI-Behavior] Sticker-only: user ${userId}`);
+        return;
+      }
+      // Fall through to normal reply if no sticker pack matched
     }
   }
 
