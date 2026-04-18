@@ -15,14 +15,19 @@ export interface OllamaConfig {
 }
 
 /**
- * Call Ollama with key rotation. Tries keys in order; on quota/rate errors, moves to next key.
+ * Call Ollama with key rotation.
+ * If user has personal keys, tries those FIRST to preserve the shared default key.
+ * Falls back to the shared default key only if personal keys fail or aren't set.
  */
 export async function callOllamaWithRotation(
   config: OllamaConfig,
   messages: OllamaMessage[],
   extraKeys: string[] = []
 ): Promise<string> {
-  const keys = [config.apiKey, ...extraKeys].filter(Boolean);
+  // User's personal keys first, shared default key last (preserves shared quota)
+  const keys = extraKeys.length > 0
+    ? [...extraKeys, config.apiKey].filter(Boolean)
+    : [config.apiKey].filter(Boolean);
   let lastError: Error | null = null;
 
   for (const key of keys) {
