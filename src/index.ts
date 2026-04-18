@@ -20,6 +20,7 @@ import {
   pickReactionEmoji,
   pickStickerEmoji,
   type OllamaConfig,
+  type OllamaMessage,
 } from "./ollama-service.js";
 import { UserStore } from "./user-store.js";
 import { getRandomContentAny, shouldShareContentMidChat, type ContentPost } from "./reddit-memes.js";
@@ -51,6 +52,11 @@ const ollamaConfig: OllamaConfig = {
   model: OLLAMA_MODEL,
   apiKey: OLLAMA_API_KEY,
 };
+
+/** Helper: call Ollama with personal + community + default key rotation */
+async function ollamaChat(messages: OllamaMessage[], userKeys: string[] = []) {
+  return callOllamaWithRotation(ollamaConfig, messages, userKeys, store.getCommunityKeyStrings());
+}
 
 // ── BOT & SESSIONS ─────────────────────────────────────────────────
 const bot = new Telegraf(BOT_TOKEN);
@@ -481,7 +487,7 @@ function scheduleDelayedReply(
         user,
         mood
       );
-      let reply = await callOllamaWithRotation(ollamaConfig, messages, user.ollamaKeys);
+      let reply = await ollamaChat(messages, user.ollamaKeys);
       reply = addDeliberateTypos(reply, mood);
 
       store.addMessage(userId, "user", userText);
@@ -801,6 +807,9 @@ bot.start((ctx) =>
       "/addkey — Add your Ollama API key\n" +
       "/keys — List your API keys\n" +
       "/removekey — Remove an API key\n" +
+      "/contribute — Donate an API key for everyone\n" +
+      "/communitykeys — View community key pool\n" +
+      "/removecontribution — Remove your donated key\n" +
       "/persona — Customize AI personality\n" +
       "/viewpersona — View your custom persona\n" +
       "/resetpersona — Reset to default\n" +
@@ -822,6 +831,7 @@ bot.help((ctx) =>
       "/addstickers /stickers /removestickers\n" +
       "/clear — Reset conversation\n" +
       "/addkey /keys /removekey — Manage API keys\n" +
+      "/contribute /communitykeys — Community key pool\n" +
       "/persona — Customize AI personality\n" +
       "/viewpersona /resetpersona — Manage persona"
   )
@@ -957,6 +967,45 @@ bot.command("removekey", async (ctx) => {
   await ctx.reply("Which key to remove?\n" + masked.join("\n") + "\n\nSend the number.");
 });
 
+// ── COMMUNITY KEY POOL COMMANDS ─────────────────────────────────────
+
+bot.command("contribute", async (ctx) => {
+  store.setFsmState(ctx.from.id, "waiting_for_community_key");
+  await ctx.reply(
+    "🤝 *Community Key Pool*\n\n" +
+    "Contribute your Ollama API key to help everyone\\! " +
+    "Your key will be shared with ALL users so they can chat even when the default key hits its limit\\.\n\n" +
+    "Send me your Ollama API key now\\.\n\n" +
+    "⚠️ Delete your message after sending to keep it private\\!",
+    { parse_mode: "MarkdownV2" }
+  );
+});
+
+bot.command("communitykeys", async (ctx) => {
+  await store.loadCommunityKeys();
+  const count = store.getCommunityKeyCount();
+  if (count === 0) {
+    await ctx.reply("No community keys yet. Be the first to /contribute one! 🤝");
+    return;
+  }
+  const info = store.getCommunityKeysInfo();
+  const lines = info.map((k, i) => `${i + 1}. ${k.maskedKey}`);
+  await ctx.reply(`🤝 Community Key Pool: ${count} key${count > 1 ? "s" : ""}\n\n${lines.join("\n")}\n\nThese keys are shared with all users. Use /contribute to add yours!`);
+});
+
+bot.command("removecontribution", async (ctx) => {
+  await store.loadCommunityKeys();
+  const count = store.getCommunityKeyCount();
+  if (count === 0) {
+    await ctx.reply("No community keys to remove.");
+    return;
+  }
+  const info = store.getCommunityKeysInfo();
+  const lines = info.map((k, i) => `${i + 1}. ${k.maskedKey}`);
+  store.setFsmState(ctx.from.id, "waiting_for_remove_community_key");
+  await ctx.reply("Which community key to remove? (You can only remove keys you contributed)\n\n" + lines.join("\n") + "\n\nSend the number.");
+});
+
 // ── CUSTOM PERSONA COMMANDS ─────────────────────────────────────────
 
 const PERSONA_TEMPLATE = `🎭 *Custom Persona Template*
@@ -1090,6 +1139,36 @@ async function handleFsmState(
           const keys = user.ollamaKeys.filter((_, i) => i !== idx);
           store.updateUser(userId, { ollamaKeys: keys });
           return ctx.reply(`Removed key: ${removed.slice(0, 6)}...${removed.slice(-4)}`).then(() => true);
+        }
+        return ctx.reply("Invalid number.").then(() => true);
+      }
+
+    case "waiting_for_community_key":
+      store.clearFsmState(userId);
+      {
+        const key = text.trim();
+        if (key.length < 10) {
+          return ctx.reply("That doesn't look like a valid API key. Try again with /contribute").then(() => true);
+        }
+        // Try to delete the user's message containing the key
+        try { await ctx.deleteMessage(); } catch {}
+        const added = await store.addCommunityKey(key, userId);
+        if (!added) {
+          return ctx.reply("This key is already in the community pool!").then(() => true);
+        }
+        return ctx.reply(`🤝 Thank you! Your key (${key.slice(0, 6)}...${key.slice(-4)}) has been added to the community pool. All users will benefit from it!`).then(() => true);
+      }
+
+    case "waiting_for_remove_community_key":
+      store.clearFsmState(userId);
+      {
+        const idx = parseInt(text) - 1;
+        const result = await store.removeCommunityKey(idx, userId);
+        if (result.notOwner) {
+          return ctx.reply("You can only remove keys you contributed.").then(() => true);
+        }
+        if (result.removed && result.key) {
+          return ctx.reply(`Removed community key: ${result.key.slice(0, 6)}...${result.key.slice(-4)}`).then(() => true);
         }
         return ctx.reply("Invalid number.").then(() => true);
       }
@@ -1549,7 +1628,7 @@ async function sendContentToChat(
   const messages = buildOllamaMessages(captionPrompt, history, tier, user, mood);
   let caption: string;
   try {
-    caption = await callOllamaWithRotation(ollamaConfig, messages, user.ollamaKeys);
+    caption = await ollamaChat(messages, user.ollamaKeys);
   } catch {
     caption = ["lol look at this", "😂😂", "bro", "dekh ye 💀"][Math.floor(Math.random() * 4)];
   }
@@ -1775,7 +1854,7 @@ async function handleTextMessage(
           + batchHint + lengthHint + styleHints + emojiHint
           + "\n\n" + text;
         const messages = buildOllamaMessages(userMsg, history, tier, user, mood);
-        let reply = await callOllamaWithRotation(ollamaConfig, messages, user.ollamaKeys);
+        let reply = await ollamaChat(messages, user.ollamaKeys);
         reply = addDeliberateTypos(reply, mood);
 
         if (isBatched) {
@@ -1834,7 +1913,7 @@ async function handleTextMessage(
         + "\n\n" + text;
       const messages = buildOllamaMessages(userMsg, history, tier, user, mood);
 
-      let reply = await callOllamaWithRotation(ollamaConfig, messages, user.ollamaKeys);
+      let reply = await ollamaChat(messages, user.ollamaKeys);
 
       // Add deliberate typos
       const cleanReply = reply; // Save pre-typo version
@@ -1957,7 +2036,7 @@ async function handleMediaMessage(
           "(You just woke up and saw they sent you a photo/video/audio while you were sleeping. React naturally — maybe 'omg what did i miss' or 'wait let me see what you sent' or just address it casually.)",
           history, tier, user, mood
         );
-        const reply = await callOllamaWithRotation(ollamaConfig, messages, user.ollamaKeys);
+        const reply = await ollamaChat(messages, user.ollamaKeys);
         store.addMessage(userId, "assistant", reply);
         await bot.telegram.sendMessage(ctx.chat!.id, reply);
       } catch (err) {
@@ -2025,7 +2104,7 @@ async function handleMediaMessage(
         emojiHint + styleHints;
 
       const messages = buildOllamaMessages(rephrasePrompt, history, tier, user, mood);
-      let reply = await callOllamaWithRotation(ollamaConfig, messages, user.ollamaKeys);
+      let reply = await ollamaChat(messages, user.ollamaKeys);
 
       // Add deliberate typos
       reply = addDeliberateTypos(reply, mood);
@@ -2313,7 +2392,7 @@ async function proactiveLoop() {
 
       const history = store.getRecentHistory(userId);
       const messages = buildOllamaMessages(prompt, history, tier, user, mood);
-      const reply = await callOllamaWithRotation(ollamaConfig, messages, user.ollamaKeys);
+      const reply = await ollamaChat(messages, user.ollamaKeys);
 
       // Simulate typing delay before sending
       await bot.telegram.sendChatAction(user.chatId, "typing");
@@ -2370,8 +2449,14 @@ bot.launch().then(async () => {
     { command: "persona", description: "Customize AI personality" },
     { command: "viewpersona", description: "View your custom persona" },
     { command: "resetpersona", description: "Reset to default persona" },
+    { command: "contribute", description: "Donate an API key for everyone" },
+    { command: "communitykeys", description: "View community key pool" },
+    { command: "removecontribution", description: "Remove your donated key" },
     { command: "help", description: "Show all commands" },
   ]).catch((e) => console.warn("Failed to set bot commands:", e));
+
+  // Pre-load community keys
+  await store.loadCommunityKeys();
 
   // Check for proactive messages every 5 minutes
   setInterval(() => proactiveLoop().catch(console.error), 5 * 60 * 1000);

@@ -16,21 +16,26 @@ export interface OllamaConfig {
 
 /**
  * Call Ollama with key rotation.
- * If user has personal keys, tries those FIRST to preserve the shared default key.
- * Falls back to the shared default key only if personal keys fail or aren't set.
+ * Priority: user's personal keys → community pool keys → default env key.
  */
 export async function callOllamaWithRotation(
   config: OllamaConfig,
   messages: OllamaMessage[],
-  extraKeys: string[] = []
+  extraKeys: string[] = [],
+  communityKeys: string[] = []
 ): Promise<string> {
-  // User's personal keys first, shared default key last (preserves shared quota)
-  const keys = extraKeys.length > 0
-    ? [...extraKeys, config.apiKey].filter(Boolean)
-    : [config.apiKey].filter(Boolean);
+  // Personal keys first, then community pool (shuffled), then default key last
+  const keys = [...extraKeys, ...communityKeys, config.apiKey].filter(Boolean);
+  // Deduplicate while preserving order
+  const seen = new Set<string>();
+  const uniqueKeys = keys.filter((k) => {
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
   let lastError: Error | null = null;
 
-  for (const key of keys) {
+  for (const key of uniqueKeys) {
     try {
       return await callOllama({ ...config, apiKey: key }, messages);
     } catch (err: any) {

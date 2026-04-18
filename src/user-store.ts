@@ -57,6 +57,10 @@ export class UserStore {
   private saveQueue = new Set<number>();
   private saveTimer: ReturnType<typeof setInterval> | null = null;
 
+  // Community key pool — shared across all users
+  private communityKeys: Array<{ key: string; contributedBy: number; addedAt: number }> = [];
+  private communityKeysLoaded = false;
+
   constructor(maxHistory = 50, databaseId?: string) {
     this.maxHistory = maxHistory;
 
@@ -285,5 +289,87 @@ export class UserStore {
     if (this.saveTimer) clearInterval(this.saveTimer);
     await this.flushAll();
     console.log("[UserStore] Flushed all data to Firestore");
+  }
+
+  // ── COMMUNITY KEY POOL ──────────────────────────────────────────
+
+  /** Load community keys from Firestore (once) */
+  async loadCommunityKeys(): Promise<void> {
+    if (this.communityKeysLoaded) return;
+    this.communityKeysLoaded = true;
+    try {
+      const snap = await this.db.collection("community_keys").get();
+      this.communityKeys = snap.docs.map((d) => ({
+        key: d.data().key as string,
+        contributedBy: d.data().contributedBy as number,
+        addedAt: d.data().addedAt as number,
+      }));
+      console.log(`[UserStore] Loaded ${this.communityKeys.length} community keys`);
+    } catch (err) {
+      console.error("[UserStore] Failed to load community keys:", err);
+    }
+  }
+
+  /** Add a key to the community pool */
+  async addCommunityKey(key: string, contributedBy: number): Promise<boolean> {
+    await this.loadCommunityKeys();
+    // Check for duplicates
+    if (this.communityKeys.some((k) => k.key === key)) return false;
+    const entry = { key, contributedBy, addedAt: Date.now() };
+    this.communityKeys.push(entry);
+    try {
+      await this.db.collection("community_keys").add(entry);
+    } catch (err) {
+      console.error("[UserStore] Failed to save community key:", err);
+    }
+    return true;
+  }
+
+  /** Remove a community key by index */
+  async removeCommunityKey(index: number, requestedBy: number): Promise<{ removed: boolean; key?: string; notOwner?: boolean }> {
+    await this.loadCommunityKeys();
+    if (index < 0 || index >= this.communityKeys.length) return { removed: false };
+    const entry = this.communityKeys[index];
+    // Only the contributor or bot admin can remove
+    const adminId = process.env.ADMIN_USER_ID ? parseInt(process.env.ADMIN_USER_ID) : 0;
+    if (entry.contributedBy !== requestedBy && requestedBy !== adminId) {
+      return { removed: false, notOwner: true };
+    }
+    this.communityKeys.splice(index, 1);
+    // Delete from Firestore
+    try {
+      const snap = await this.db.collection("community_keys")
+        .where("key", "==", entry.key)
+        .limit(1)
+        .get();
+      if (!snap.empty) await snap.docs[0].ref.delete();
+    } catch (err) {
+      console.error("[UserStore] Failed to delete community key:", err);
+    }
+    return { removed: true, key: entry.key };
+  }
+
+  /** Get all community keys (just the key strings, shuffled for load distribution) */
+  getCommunityKeyStrings(): string[] {
+    // Shuffle to distribute load across keys
+    const keys = this.communityKeys.map((k) => k.key);
+    for (let i = keys.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [keys[i], keys[j]] = [keys[j], keys[i]];
+    }
+    return keys;
+  }
+
+  /** Get community keys info for display */
+  getCommunityKeysInfo(): Array<{ maskedKey: string; contributedBy: number }> {
+    return this.communityKeys.map((k) => ({
+      maskedKey: `${k.key.slice(0, 6)}...${k.key.slice(-4)}`,
+      contributedBy: k.contributedBy,
+    }));
+  }
+
+  /** Get count of community keys */
+  getCommunityKeyCount(): number {
+    return this.communityKeys.length;
   }
 }
