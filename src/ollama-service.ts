@@ -104,27 +104,49 @@ export const TELEGRAM_REACTION_EMOJIS = [
   "🤷","🤷‍♀","😡",
 ];
 
-const REACTION_PICK_PROMPT =
-  "You pick reaction emojis for Telegram messages. " +
-  "Given a message and conversation context, reply with EXACTLY ONE emoji from this list — nothing else:\n" +
-  TELEGRAM_REACTION_EMOJIS.join(" ") +
-  "\n\nPick the emoji that fits the vibe of the message best. Just the emoji, no text.";
+// Intimate/flirty emojis only allowed for comfortable+ tiers
+const INTIMATE_EMOJIS = new Set(["💋", "😘", "💘", "🥰", "😍", "❤‍🔥", "❤", "😈", "🍑", "🍓", "🍾"]);
+
+function getReactionEmojisForTier(tier: string): string[] {
+  if (tier === "stranger" || tier === "acquaintance") {
+    return TELEGRAM_REACTION_EMOJIS.filter((e) => !INTIMATE_EMOJIS.has(e));
+  }
+  return TELEGRAM_REACTION_EMOJIS;
+}
+
+function buildReactionPrompt(tier: string): string {
+  const emojis = getReactionEmojisForTier(tier);
+  let prompt =
+    "You pick reaction emojis for Telegram messages. " +
+    "Given a message and conversation context, reply with EXACTLY ONE emoji from this list — nothing else:\n" +
+    emojis.join(" ") +
+    "\n\nPick the emoji that fits the vibe of the message best. Just the emoji, no text.";
+
+  if (tier === "stranger") {
+    prompt += "\n\nYou barely know this person. Keep reactions neutral and casual — nothing romantic or intimate.";
+  } else if (tier === "acquaintance") {
+    prompt += "\n\nYou're getting to know this person. Keep reactions friendly but not flirty or intimate.";
+  }
+  return prompt;
+}
 
 export async function pickReactionEmoji(
   config: OllamaConfig,
   userMessage: string,
-  chatHistory: OllamaMessage[]
+  chatHistory: OllamaMessage[],
+  tier: string = "stranger"
 ): Promise<string | null> {
   try {
+    const allowedEmojis = getReactionEmojisForTier(tier);
     const messages: OllamaMessage[] = [
-      { role: "system", content: REACTION_PICK_PROMPT },
+      { role: "system", content: buildReactionPrompt(tier) },
       ...chatHistory.slice(-4).filter((m) => m.role !== "system"),
       { role: "user", content: userMessage },
     ];
     const raw = await callOllama(config, messages);
     const emoji = raw.trim();
-    if (TELEGRAM_REACTION_EMOJIS.includes(emoji)) return emoji;
-    return TELEGRAM_REACTION_EMOJIS.find((e) => raw.includes(e)) ?? null;
+    if (allowedEmojis.includes(emoji)) return emoji;
+    return allowedEmojis.find((e) => raw.includes(e)) ?? null;
   } catch {
     return null;
   }

@@ -191,8 +191,9 @@ async function maybeReact(ctx: Context, userId: number, userMessage: string) {
     msgCount < 5 ? 0.1 : msgCount < 15 ? 0.3 : msgCount < 30 ? 0.5 : 0.7;
   if (Math.random() > prob) return;
 
+  const tier = store.getComfortTier(userId);
   const history = store.getRecentHistory(userId);
-  const emoji = await pickReactionEmoji(ollamaConfig, userMessage, history);
+  const emoji = await pickReactionEmoji(ollamaConfig, userMessage, history, tier);
   if (!emoji) return;
   try {
     await (ctx as any).telegram.setMessageReaction(
@@ -810,6 +811,10 @@ async function proactiveLoop() {
     const elapsed = now - user.lastInteraction;
     if (elapsed < threshold) continue;
 
+    // Add some randomness — don't always ping exactly at threshold
+    // 30% chance to skip this cycle (makes timing feel less robotic)
+    if (Math.random() < 0.3) continue;
+
     const prompt = INITIATE_PROMPTS[tier];
     if (!prompt) continue;
 
@@ -817,6 +822,11 @@ async function proactiveLoop() {
       const history = store.getRecentHistory(userId);
       const messages = buildOllamaMessages(prompt, history, tier, user);
       const reply = await callOllamaWithRotation(ollamaConfig, messages, user.ollamaKeys);
+
+      // Simulate typing delay before sending (real girls don't instant-reply)
+      await bot.telegram.sendChatAction(user.chatId, "typing");
+      const delay = Math.min(typingDelay(reply), 3000);
+      await new Promise((r) => setTimeout(r, delay));
 
       await bot.telegram.sendMessage(user.chatId, reply);
       store.addMessage(userId, "assistant", reply);
