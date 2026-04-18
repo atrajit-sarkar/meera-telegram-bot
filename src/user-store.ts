@@ -1,6 +1,6 @@
 import type { OllamaMessage } from "./ollama-service.js";
 import { initializeApp, cert, type ServiceAccount } from "firebase-admin/app";
-import { getFirestore, type Firestore } from "firebase-admin/firestore";
+import { getFirestore, FieldValue, type Firestore } from "firebase-admin/firestore";
 
 /**
  * Per-user data stored in memory + persisted to Firestore.
@@ -223,10 +223,15 @@ export class UserStore {
     try {
       const user = this.users.get(userId);
       if (user) {
+        const data = { ...user } as Record<string, unknown>;
+        // If customPersona is empty/unset, delete the field from Firestore entirely
+        if (!user.customPersona) {
+          data.customPersona = FieldValue.delete();
+        }
         await this.db
           .collection("users")
           .doc(String(userId))
-          .set(user as unknown as Record<string, unknown>, { merge: true });
+          .set(data, { merge: true });
       }
 
       const hist = this.history.get(userId);

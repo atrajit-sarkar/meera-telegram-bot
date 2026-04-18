@@ -978,6 +978,8 @@ bot.command("resetpersona", async (ctx) => {
     return;
   }
   store.updateUser(ctx.from.id, { customPersona: "" });
+  // Also delete from in-memory to be clean
+  delete (store.getUser(ctx.from.id) as any).customPersona;
   sessions.resetSession(ctx.from.id);
   await ctx.reply(`✅ Persona reset! I'm back to being ${botName}. 😊`);
 });
