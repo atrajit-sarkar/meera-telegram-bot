@@ -11,6 +11,8 @@ import {
   buildGeminiSystemInstruction,
   INITIATE_PROMPTS,
   INACTIVITY_THRESHOLDS,
+  CONTENT_SHARE_PROMPTS,
+  buildGapAwareContext,
 } from "./config.js";
 import {
   callOllama,
@@ -58,10 +60,11 @@ const store = new UserStore(50, FIREBASE_DB_ID);
 const sessions = new SessionManager((userId: number) => {
   const tier = store.getComfortTier(userId);
   const user = store.getUser(userId);
+  const mood = store.getMood(userId);
   return {
     apiKey: GEMINI_API_KEY!,
     model: MODEL,
-    systemInstruction: buildGeminiSystemInstruction(tier, user),
+    systemInstruction: buildGeminiSystemInstruction(tier, user, mood),
     tools: toolDeclarations,
     onToolCall: executeToolCall,
   };
@@ -172,9 +175,10 @@ function splitIntoBubbles(text: string): string[] {
   return [text];
 }
 
-/** Send split bubbles with natural delays between them */
-async function sendAsBubbles(ctx: Context, text: string) {
+/** Send split bubbles with natural delays between them, optionally quoting on first bubble */
+async function sendAsBubbles(ctx: Context, text: string, replyToMsgId?: number): Promise<number | undefined> {
   const bubbles = splitIntoBubbles(text);
+  let lastMsgId: number | undefined;
   for (let i = 0; i < bubbles.length; i++) {
     if (i > 0) {
       // Small delay between bubbles (0.5-1.5s)
@@ -184,8 +188,13 @@ async function sendAsBubbles(ctx: Context, text: string) {
       // Extra tiny delay for "typing" between bubbles
       await new Promise((r) => setTimeout(r, 300 + Math.random() * 700));
     }
-    await sendText(ctx, bubbles[i]);
+    // Only quote-reply on the first bubble
+    const sent = await sendText(ctx, bubbles[i], i === 0 ? replyToMsgId : undefined);
+    if (sent && typeof (sent as any).message_id === "number") {
+      lastMsgId = (sent as any).message_id;
+    }
   }
+  return lastMsgId;
 }
 
 // ── EMOJI-ONLY REPLIES ──────────────────────────────────────────────
@@ -231,6 +240,182 @@ function maybeSelfCorrect(reply: string): string | null {
     "wait hold on",
   ];
   return corrections[Math.floor(Math.random() * corrections.length)];
+}
+
+// ── DELIBERATE TYPOS ────────────────────────────────────────────────
+
+/** Add natural typos to a reply — real people mistype on phone */
+function addDeliberateTypos(text: string, mood: string): string {
+  // Base 12% chance, higher when tired (25%), lower when excited (8%)
+  let prob = 0.12;
+  if (mood === "tired") prob = 0.25;
+  if (mood === "excited") prob = 0.08;
+
+  if (Math.random() > prob) return text;
+
+  const words = text.split(" ");
+  if (words.length < 3) return text;
+
+  // Pick 1-2 random words to mess up
+  const numTypos = Math.random() < 0.7 ? 1 : 2;
+  const indices = new Set<number>();
+  while (indices.size < numTypos && indices.size < words.length) {
+    const idx = Math.floor(Math.random() * words.length);
+    // Skip very short words, emojis, and punctuation-only
+    if (words[idx].length > 3 && !/[\u{1F600}-\u{10FFFF}]/u.test(words[idx])) {
+      indices.add(idx);
+    } else {
+      break; // Don't infinite loop
+    }
+  }
+
+  for (const idx of indices) {
+    const word = words[idx];
+    const typoType = Math.random();
+
+    if (typoType < 0.3) {
+      // Swap two adjacent characters
+      const pos = Math.floor(Math.random() * (word.length - 1));
+      words[idx] = word.slice(0, pos) + word[pos + 1] + word[pos] + word.slice(pos + 2);
+    } else if (typoType < 0.5) {
+      // Double a character
+      const pos = Math.floor(Math.random() * word.length);
+      words[idx] = word.slice(0, pos) + word[pos] + word[pos] + word.slice(pos + 1);
+    } else if (typoType < 0.7) {
+      // Skip a character
+      const pos = 1 + Math.floor(Math.random() * (word.length - 2));
+      words[idx] = word.slice(0, pos) + word.slice(pos + 1);
+    } else {
+      // Common phone typos — adjacent key replacements
+      const adjacentKeys: Record<string, string> = {
+        a: "s", s: "a", d: "f", f: "d", g: "h", h: "g",
+        j: "k", k: "j", l: "k", q: "w", w: "e", e: "r",
+        r: "t", t: "y", y: "u", u: "i", i: "o", o: "p",
+        z: "x", x: "c", c: "v", v: "b", b: "n", n: "m", m: "n",
+      };
+      const pos = Math.floor(Math.random() * word.length);
+      const ch = word[pos].toLowerCase();
+      if (adjacentKeys[ch]) {
+        words[idx] = word.slice(0, pos) + adjacentKeys[ch] + word.slice(pos + 1);
+      }
+    }
+  }
+
+  return words.join(" ");
+}
+
+// ── TYPING FAKE-OUTS ───────────────────────────────────────────────
+
+/** Sometimes start typing, stop, then resume — like she started a reply and deleted it */
+async function maybeTypingFakeout(ctx: Context, tier: string): Promise<void> {
+  // Only for comfortable+ and 10% of the time
+  if (tier === "stranger" || tier === "acquaintance") return;
+  if (Math.random() > 0.10) return;
+
+  // Start typing
+  await ctx.sendChatAction("typing").catch(() => {});
+  // Type for 1-3 seconds
+  await new Promise((r) => setTimeout(r, 1000 + Math.random() * 2000));
+  // Stop (just don't send any more typing actions)
+  // Pause for 2-5 seconds (she deleted what she was typing)
+  await new Promise((r) => setTimeout(r, 2000 + Math.random() * 3000));
+  // Resume typing (handled by caller after this returns)
+}
+
+// ── VOICE NOTE TEASE ────────────────────────────────────────────────
+
+/** Sometimes briefly show "recording voice" then switch to text — like she changed her mind */
+async function maybeVoiceNoteTease(ctx: Context, tier: string): Promise<boolean> {
+  // Only for comfortable+ and 6% of the time
+  if (tier === "stranger" || tier === "acquaintance") return false;
+  if (Math.random() > 0.06) return false;
+
+  // Show "recording voice" for 2-4 seconds
+  await ctx.sendChatAction("record_voice").catch(() => {});
+  await new Promise((r) => setTimeout(r, 2000 + Math.random() * 2000));
+  // Then switch to typing (she decided to type instead)
+  await ctx.sendChatAction("typing").catch(() => {});
+  return true; // Signal that we did a tease
+}
+
+// ── OFFLINE SCHEDULE ────────────────────────────────────────────────
+
+/**
+ * Check if Meera is "sleeping" or "offline". During offline hours, messages either
+ * get delayed responses or a "just woke up" style reply.
+ * Returns delay in ms, or 0 for "she's online".
+ */
+function offlineScheduleDelay(): number {
+  const hour = getISTHour();
+
+  // Core sleep: 1-6 AM — very high chance of being "asleep"
+  if (hour >= 1 && hour < 6) {
+    // 80% chance of being asleep
+    if (Math.random() < 0.80) {
+      // Wake up between 6-8 AM IST — calculate remaining time roughly
+      const wakeHour = 6 + Math.random() * 2;
+      const hoursUntilWake = wakeHour - hour + (hour < 1 ? 24 : 0);
+      return hoursUntilWake * 3600 * 1000;
+    }
+  }
+
+  // Light sleep: 12-1 AM — 40% chance sleeping
+  if (hour >= 0 && hour < 1) {
+    if (Math.random() < 0.40) {
+      const wakeHour = 6 + Math.random() * 2;
+      return (wakeHour + 24 - hour) * 3600 * 1000 % (24 * 3600 * 1000);
+    }
+  }
+
+  // Random "busy" periods during the day — 5% chance of 15-45 min delay
+  if (hour >= 9 && hour < 22 && Math.random() < 0.05) {
+    return (15 + Math.random() * 30) * 60 * 1000;
+  }
+
+  return 0;
+}
+
+// ── READ RECEIPT GAMING (advanced) ──────────────────────────────────
+
+/**
+ * More sophisticated read-receipt behavior.
+ * Sometimes: read instantly but reply late. Sometimes: don't even "read" for a while.
+ * Returns: { readDelay: ms, replyDelay: ms, showTypingFirst: boolean }
+ */
+function readReceiptStrategy(tier: string, mood: string): { readDelay: number; replyDelay: number; showTypingFirst: boolean } {
+  // Strangers/acquaintances: mostly normal behavior
+  if (tier === "stranger" || tier === "acquaintance") {
+    return { readDelay: 0, replyDelay: 0, showTypingFirst: false };
+  }
+
+  const strategies = Math.random();
+
+  if (mood === "annoyed" || mood === "sassy") {
+    // More likely to leave them hanging
+    if (strategies < 0.20) {
+      // Read instantly, reply after 3-8 min (making them wait on purpose)
+      return { readDelay: 0, replyDelay: (3 + Math.random() * 5) * 60 * 1000, showTypingFirst: true };
+    }
+  }
+
+  if (mood === "clingy") {
+    // Reply fast when clingy
+    return { readDelay: 0, replyDelay: 0, showTypingFirst: false };
+  }
+
+  if (mood === "bored") {
+    // 15% chance: read but take a while to reply
+    if (strategies < 0.15) {
+      return { readDelay: 0, replyDelay: (2 + Math.random() * 4) * 60 * 1000, showTypingFirst: false };
+    }
+  }
+
+  // General: 8% chance of "didn't see it for a few minutes"
+  if (strategies < 0.08) {
+    return { readDelay: (1 + Math.random() * 3) * 60 * 1000, replyDelay: 0, showTypingFirst: false };
+  }
+
+  return { readDelay: 0, replyDelay: 0, showTypingFirst: false };
 }
 
 // ── LEAVE ON READ ───────────────────────────────────────────────────
@@ -281,6 +466,7 @@ function scheduleDelayedReply(
       const tier = store.getComfortTier(userId);
       const user = store.getUser(userId);
       const history = store.getRecentHistory(userId);
+      const mood = store.getMood(userId);
 
       // Add context that she's replying late
       const lateContext = Math.random() < 0.5
@@ -291,9 +477,11 @@ function scheduleDelayedReply(
         lateContext + "\n\nTheir message: " + userText,
         history,
         tier,
-        user
+        user,
+        mood
       );
-      const reply = await callOllamaWithRotation(ollamaConfig, messages, user.ollamaKeys);
+      let reply = await callOllamaWithRotation(ollamaConfig, messages, user.ollamaKeys);
+      reply = addDeliberateTypos(reply, mood);
 
       store.addMessage(userId, "user", userText);
       store.addMessage(userId, "assistant", reply);
@@ -371,35 +559,77 @@ function pcmToWav(pcmChunks: Buffer[]): Buffer {
   return Buffer.concat([header, pcm]);
 }
 
+// ── QUOTE-REPLY BEHAVIOR ────────────────────────────────────────────
+
+/**
+ * Should Meera quote-reply (swipe-reply) the user's message?
+ * Real girls do this sometimes — more often with close friends, rarely with strangers.
+ * Returns true if she should quote the message.
+ */
+function shouldQuoteReply(tier: string, userText: string): boolean {
+  // Strangers: never quote-reply
+  if (tier === "stranger") return false;
+
+  // Acquaintance: very rare (5%)
+  if (tier === "acquaintance") return Math.random() < 0.05;
+
+  const text = userText.toLowerCase();
+
+  // Questions → higher chance of quoting (answering a specific question)
+  const isQuestion = /\?|kya|kab|kaise|kyun|why|what|how|when|where|ki\b/.test(text);
+
+  // Long messages → higher chance (referencing something specific they said)
+  const isLong = text.length > 80;
+
+  // Comfortable: 15% base, 30% for questions, 25% for long msgs
+  if (tier === "comfortable") {
+    if (isQuestion) return Math.random() < 0.30;
+    if (isLong) return Math.random() < 0.25;
+    return Math.random() < 0.15;
+  }
+
+  // Close: 25% base, 40% for questions, 35% for long msgs
+  if (isQuestion) return Math.random() < 0.40;
+  if (isLong) return Math.random() < 0.35;
+  return Math.random() < 0.25;
+}
+
 /** Send Gemini's audio-only response */
-async function sendGeminiResponse(ctx: Context, response: GeminiResponse) {
+async function sendGeminiResponse(ctx: Context, response: GeminiResponse, replyToMsgId?: number) {
   const { audioChunks } = response;
   if (audioChunks.length > 0) {
     const wav = pcmToWav(audioChunks);
-    await ctx.replyWithVoice({ source: wav, filename: "response.wav" });
+    const opts: Record<string, unknown> = {};
+    if (replyToMsgId) opts.reply_parameters = { message_id: replyToMsgId };
+    await ctx.replyWithVoice({ source: wav, filename: "response.wav" }, opts as any);
     return;
   }
   // Fallback if no audio (shouldn't happen)
   if (response.text.trim()) {
-    await sendText(ctx, response.text);
+    await sendText(ctx, response.text, replyToMsgId);
   }
 }
 
-/** Send text with Markdown fallback */
-async function sendText(ctx: Context, text: string) {
+/** Send text with Markdown fallback, optionally quoting a message */
+async function sendText(ctx: Context, text: string, replyToMsgId?: number): Promise<any> {
   const chunks: string[] = [];
   let remaining = text;
   while (remaining.length > 0) {
     chunks.push(remaining.slice(0, 4000));
     remaining = remaining.slice(4000);
   }
-  for (const chunk of chunks) {
+  let lastSent: any;
+  for (let i = 0; i < chunks.length; i++) {
+    // Only quote-reply on the first chunk
+    const opts: Record<string, unknown> = {};
+    if (i === 0 && replyToMsgId) opts.reply_parameters = { message_id: replyToMsgId };
     try {
-      await ctx.reply(chunk, { parse_mode: "Markdown" });
+      lastSent = await ctx.reply(chunks[i], { parse_mode: "Markdown", ...opts } as any);
     } catch {
-      await ctx.reply(chunk);
+      lastSent = await ctx.reply(chunks[i], opts as any);
     }
   }
+  return lastSent;
 }
 
 /** Try to set a reaction emoji on the user's message */
@@ -731,12 +961,12 @@ async function handleFsmState(
  * Decide whether Meera sends a voice note — like a real girl would.
  * Factors: comfort tier, message length/emotion, randomness, whether user sent voice.
  */
-function shouldSendVoice(tier: string, userText: string): boolean {
+function shouldSendVoice(tier: string, userText: string, timeModifier: number = 1.0): boolean {
   // Strangers: never voice
   if (tier === "stranger") return false;
 
   // Acquaintance: very rare voice (5%)
-  if (tier === "acquaintance") return Math.random() < 0.05;
+  if (tier === "acquaintance") return Math.random() < 0.05 * timeModifier;
 
   // Comfortable/close: natural mix
   const text = userText.toLowerCase();
@@ -760,15 +990,383 @@ function shouldSendVoice(tier: string, userText: string): boolean {
     voiceProb = isShort ? 0.08 : isEmotional ? 0.35 : isLong ? 0.30 : 0.20;
   }
 
-  return Math.random() < voiceProb;
+  // Apply voice timing modifier (late night boost, morning reduce)
+  voiceProb *= timeModifier;
+
+  return Math.random() < Math.min(voiceProb, 0.85); // Cap at 85%
 }
 
-/** Handle text messages — Meera decides naturally when to voice vs text */
-async function handleTextMessage(ctx: Context & { message: { text: string } }) {
+// ── REPLY CONTEXT ───────────────────────────────────────────────────
+
+/** Extract the text/caption of the message being replied to, if any */
+function getReplyContext(ctx: Context): string {
+  const replyMsg = (ctx.message as any)?.reply_to_message;
+  if (!replyMsg) return "";
+
+  // Get text from the replied-to message
+  const replyText = replyMsg.text || replyMsg.caption || "";
+  if (!replyText) return "";
+
+  // Figure out who sent the replied-to message
+  const botId = (ctx as any).botInfo?.id;
+  const isFromBot = replyMsg.from?.id === botId;
+  const sender = isFromBot ? "you (Meera)" : "the user";
+
+  return `(The user is replying to a specific message that ${sender} sent earlier: "${replyText.slice(0, 300)}")\n\n`;
+}
+
+// ── RAPID-FIRE MESSAGE BATCHING ─────────────────────────────────────
+// When user sends multiple messages quickly, batch them into one reply.
+
+interface PendingBatch {
+  messages: Array<{ text: string; msgId: number; ctx: Context & { message: { text: string } } }>;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+const pendingBatches = new Map<number, PendingBatch>();
+
+/** How long to wait for more messages before processing the batch (ms) */
+function getBatchWindow(tier: string): number {
+  // Close friends type faster in bursts, give them more time
+  if (tier === "close") return 2500 + Math.random() * 1000;  // 2.5-3.5s
+  if (tier === "comfortable") return 2000 + Math.random() * 1000; // 2-3s
+  return 1500 + Math.random() * 500; // 1.5-2s for strangers/acquaintance
+}
+
+/** Add a message to the batch for a user, reset the timer */
+function addToBatch(
+  userId: number,
+  text: string,
+  msgId: number,
+  ctx: Context & { message: { text: string } },
+  onFlush: (batch: PendingBatch["messages"]) => void
+) {
+  const existing = pendingBatches.get(userId);
+  const tier = store.getComfortTier(userId);
+
+  if (existing) {
+    clearTimeout(existing.timer);
+    existing.messages.push({ text, msgId, ctx });
+  } else {
+    const batch: PendingBatch = {
+      messages: [{ text, msgId, ctx }],
+      timer: null as any,
+    };
+    pendingBatches.set(userId, batch);
+  }
+
+  const batch = pendingBatches.get(userId)!;
+  batch.timer = setTimeout(() => {
+    pendingBatches.delete(userId);
+    onFlush(batch.messages);
+  }, getBatchWindow(tier));
+}
+
+// ── CONVERSATION PACE DETECTION ─────────────────────────────────────
+// Track recent message timestamps per user to detect rapid-fire conversation
+
+const recentMessageTimes = new Map<number, number[]>();
+
+/** Record a message timestamp and return the conversation pace */
+function recordMessagePace(userId: number): { isRapidFire: boolean; avgGapMs: number } {
+  const now = Date.now();
+  let times = recentMessageTimes.get(userId);
+  if (!times) {
+    times = [];
+    recentMessageTimes.set(userId, times);
+  }
+  times.push(now);
+
+  // Keep only last 6 messages (within 5 min window)
+  const cutoff = now - 5 * 60 * 1000;
+  while (times.length > 0 && times[0] < cutoff) times.shift();
+  if (times.length > 6) times.splice(0, times.length - 6);
+
+  // Need at least 3 messages to detect pace
+  if (times.length < 3) return { isRapidFire: false, avgGapMs: 10000 };
+
+  // Calculate average gap between messages
+  let totalGap = 0;
+  for (let i = 1; i < times.length; i++) {
+    totalGap += times[i] - times[i - 1];
+  }
+  const avgGapMs = totalGap / (times.length - 1);
+
+  // Rapid-fire: average gap < 30 seconds (both sides sending fast)
+  return { isRapidFire: avgGapMs < 30000, avgGapMs };
+}
+
+/** Get a pace-adjusted delay multiplier — faster conversation = shorter delays */
+function paceMultiplier(userId: number): number {
+  const { isRapidFire, avgGapMs } = recordMessagePace(userId);
+  if (isRapidFire) {
+    // In rapid conversation, reduce delays significantly
+    if (avgGapMs < 5000) return 0.3;   // Very fast back-and-forth
+    if (avgGapMs < 15000) return 0.5;  // Quick conversation
+    return 0.7;                         // Moderate pace
+  }
+  return 1.0; // Normal pace
+}
+
+// ── REPLY LENGTH MIRRORING ──────────────────────────────────────────
+
+/** Build a length hint for the system prompt based on user's message length */
+function getLengthMirrorHint(userText: string): string {
+  const len = userText.trim().length;
+  if (len <= 5) return "\n\n(REPLY LENGTH: The user sent a very short message. Keep your reply equally short — 1-5 words max. Don't write a paragraph for 'ok'.)";
+  if (len <= 15) return "\n\n(REPLY LENGTH: The user sent a brief message. Keep your reply short too — one line max.)";
+  if (len <= 50) return "\n\n(REPLY LENGTH: Normal message. Reply naturally, 1-2 lines.)";
+  if (len <= 150) return "\n\n(REPLY LENGTH: They wrote a decent amount. You can match — 2-3 lines is fine.)";
+  return "\n\n(REPLY LENGTH: They wrote a lot. You can write more too — but don't overdo it. 3-5 lines max.)";
+}
+
+// ── MESSAGE EDITING FOR CORRECTIONS ─────────────────────────────────
+
+/** Track last sent message ID per user so we can edit it */
+const lastSentMessageIds = new Map<number, number>();
+
+/**
+ * Instead of sending "*that" correction, sometimes edit the previous message.
+ * Returns true if it edited, false if caller should send a new correction message.
+ */
+async function maybeEditCorrection(
+  ctx: Context,
+  userId: number,
+  originalReply: string
+): Promise<boolean> {
+  // 60% of corrections → edit the message instead of "*that" follow-up
+  if (Math.random() > 0.60) return false;
+
+  const lastMsgId = lastSentMessageIds.get(userId);
+  if (!lastMsgId) return false;
+
+  // Simulate a small word swap to make the edit look natural
+  const words = originalReply.split(" ");
+  if (words.length < 3) return false;
+
+  // Pick a random word to "fix" — swap two chars or capitalize
+  const idx = 1 + Math.floor(Math.random() * (words.length - 2));
+  const word = words[idx];
+  if (word.length < 3) return false;
+
+  // The "edited" version is actually the original (the typo was the sent version)
+  // Since addDeliberateTypos already messed it up, the "edit" restores a cleaner version
+  try {
+    await (ctx as any).telegram.editMessageText(
+      ctx.chat!.id,
+      lastMsgId,
+      undefined,
+      originalReply
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ── VOICE TIMING AWARENESS ─────────────────────────────────────────
+
+/** Adjust voice note probability based on time of day */
+function voiceTimeModifier(): number {
+  const hour = getISTHour();
+  // Late night (11PM-2AM): voice feels intimate and natural → boost
+  if (hour >= 23 || hour < 2) return 1.4;
+  // Early morning (6-8AM): voice is weird, she just woke up → reduce
+  if (hour >= 6 && hour < 8) return 0.4;
+  // Morning (8-10AM): still not prime voice time → slight reduce
+  if (hour >= 8 && hour < 10) return 0.7;
+  // Afternoon/evening: normal
+  return 1.0;
+}
+
+// ── STICKER-ONLY REPLIES ────────────────────────────────────────────
+
+/**
+ * Sometimes reply with JUST a sticker — no text at all.
+ * Returns true if a sticker-only reply was sent.
+ */
+async function maybeStickerOnlyReply(
+  ctx: Context,
+  userId: number,
+  userText: string
+): Promise<boolean> {
+  const tier = store.getComfortTier(userId);
+  const user = store.getUser(userId);
+
+  // Need sticker packs and comfortable+ tier
+  if (!user.stickerPacks.length) return false;
+  if (tier === "stranger" || tier === "acquaintance") return false;
+
+  const text = userText.trim().toLowerCase();
+
+  // Higher chance for reaction-worthy messages
+  const isReactionable = /^(haha|hehe|lol|lmao|😂|🤣|ok|okay|nice|cool|wow|omg|bruh|💀|😭)+$/i.test(text);
+  const prob = isReactionable ? 0.15 : 0.05;
+  if (Math.random() > prob) return false;
+
+  // Pick a sticker emoji based on the message
+  const history = store.getRecentHistory(userId);
+  const emoji = await pickStickerEmoji(ollamaConfig, userText, history);
+  if (!emoji) return false;
+
+  // Find matching sticker
+  for (const packName of user.stickerPacks) {
+    try {
+      const stickerSet = await (ctx as any).telegram.getStickerSet(packName);
+      const match = stickerSet.stickers.find(
+        (s: any) => s.emoji && s.emoji.includes(emoji)
+      );
+      if (match) {
+        // Simulate a read delay first
+        const rDelay = readDelay(userText);
+        await new Promise((r) => setTimeout(r, rDelay));
+        await ctx.replyWithSticker(match.file_id);
+        store.addMessage(userId, "user", userText);
+        store.addMessage(userId, "assistant", `[sticker: ${emoji}]`);
+        return true;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return false;
+}
+
+// ── TEXTING STYLE MIRRORING ─────────────────────────────────────────
+
+/** Analyze user's texting style from their message and recent history */
+function getStyleHints(userText: string, history: { role: string; content: string }[]): string {
+  const recentUserMsgs = history
+    .filter((m) => m.role === "user")
+    .slice(-10)
+    .map((m) => m.content);
+  const allUserText = [...recentUserMsgs, userText].join(" ");
+
+  const hints: string[] = [];
+
+  // Emoji usage
+  const emojiCount = (allUserText.match(/[\u{1F600}-\u{10FFFF}]/gu) || []).length;
+  const msgCount = recentUserMsgs.length + 1;
+  const emojiRate = emojiCount / msgCount;
+  if (emojiRate < 0.3) hints.push("This person rarely uses emojis — tone yours down too. Max 1 emoji per reply, sometimes none.");
+  if (emojiRate > 2) hints.push("This person uses lots of emojis — you can match that energy and use more emojis too.");
+
+  // Lol/haha style
+  const usesHaha = /haha|hehe/i.test(allUserText);
+  const usesLol = /\blol\b/i.test(allUserText);
+  const usesLmao = /lmao|lmfao/i.test(allUserText);
+  if (usesLmao) hints.push("They use 'lmao' — mirror that instead of 'haha' when laughing.");
+  else if (usesLol) hints.push("They use 'lol' — mirror that style when laughing.");
+  else if (usesHaha) hints.push("They use 'haha'/'hehe' — mirror that when laughing.");
+
+  // Capitalization
+  const allLower = recentUserMsgs.filter((m) => m === m.toLowerCase()).length;
+  if (allLower > msgCount * 0.7) hints.push("They type in all lowercase — match that, don't capitalize.");
+
+  // Punctuation style
+  const noPeriods = recentUserMsgs.filter((m) => !m.includes(".") || m.endsWith("...")).length;
+  if (noPeriods > msgCount * 0.7) hints.push("They don't use periods — don't end your sentences with periods either.");
+
+  if (!hints.length) return "";
+  return "\n\nTEXTING STYLE MATCH:\n" + hints.map((h) => `- ${h}`).join("\n");
+}
+
+// ── PHOTO REACTION DIFFERENTIATION ──────────────────────────────────
+
+/** Classify what type of media the user sent for better reactions */
+function classifyMedia(ctx: Context): string {
+  const msg = ctx.message as any;
+  const caption = msg?.caption?.toLowerCase() || "";
+
+  // Sticker
+  if (msg?.sticker) return "sticker";
+
+  // Video note (circle video) — likely a selfie video
+  if (msg?.video_note) return "selfie_video";
+
+  // Photo with specific caption hints
+  if (msg?.photo) {
+    if (/selfie|me|i look|how do i|aaj ka look|ootd|fitcheck|fit check/i.test(caption)) return "selfie";
+    if (/meme|funny|lol|lmao|😂|🤣|joke/i.test(caption)) return "meme";
+    if (/screenshot|ss|screen shot/i.test(caption)) return "screenshot";
+    if (/food|khana|biryani|pizza|eating/i.test(caption)) return "food";
+    // No caption on photo — could be selfie or random
+    if (!caption) return "photo_unknown";
+    return "photo_general";
+  }
+
+  // Video
+  if (msg?.video) {
+    if (/reel|tiktok|funny|meme/i.test(caption)) return "meme_video";
+    return "video_general";
+  }
+
+  return "media_unknown";
+}
+
+/** Build media-specific reaction context for the prompt */
+function getMediaReactionHint(mediaType: string, tier: string): string {
+  switch (mediaType) {
+    case "selfie":
+    case "selfie_video":
+      if (tier === "close") return "(They sent a selfie/video of themselves. React like a bestie would — compliment them, tease them, hype them up. 'CUTEEE', 'okayy looking good 👀', 'someone's glowing today huh')";
+      if (tier === "comfortable") return "(They sent a selfie. React naturally — a compliment or a light tease. 'nice pic!', 'looking good!')";
+      return "(They sent a selfie. Keep it casual and appropriate — 'nice!', 'cool')";
+
+    case "meme":
+    case "meme_video":
+      return "(They sent a meme/funny content. React to the humor — laugh, comment on it, maybe send a related thought. Don't analyze it.)";
+
+    case "screenshot":
+      return "(They sent a screenshot — probably showing you something. Comment on what you see in it, maybe gossip about it.)";
+
+    case "food":
+      return "(They sent food pics. React like a real person — 'omg that looks SO good', 'where is this', 'i'm hungry now thanks', share if you like that food)";
+
+    case "photo_unknown":
+      return "(They sent a photo without caption. Look at it and react naturally based on what you see.)";
+
+    default:
+      return "";
+  }
+}
+
+// ── EMOJI EVOLUTION BY TIER ─────────────────────────────────────────
+
+/** Get tier-appropriate emoji guidance for the system prompt */
+function getEmojiEvolutionHint(tier: string): string {
+  switch (tier) {
+    case "stranger":
+      return "\n\nEMOJI USAGE: You barely know them. Use emojis very sparingly — 👍 😊 🙂 at most. No hearts, no crying-laughing, no intimate emojis. Maybe 1 emoji every 3-4 messages.";
+    case "acquaintance":
+      return "\n\nEMOJI USAGE: You're warming up. Can use 😂 😅 🤔 👀 😭 occasionally. Still no hearts or lovey emojis. Maybe 1 emoji every 2 messages.";
+    case "comfortable":
+      return "\n\nEMOJI USAGE: You're friends now. Natural emoji use — 😂 😭 💀 🙄 😩 🥺 👀 🤦‍♀️ are all fair game. Can occasionally use ❤ or 😘 casually. Emojis in most messages is fine.";
+    case "close":
+      return "\n\nEMOJI USAGE: Full bestie emoji mode. Use whatever feels right — ❤ 😭 💀 😂 🥺 😤 🙄 💅 🫠 😈 freely. Multiple emojis in one message is totally natural. Hearts are casual, not romantic.";
+    default:
+      return "";
+  }
+}
+
+/** Handle text messages — Meera decides naturally when to voice vs text
+ *  When batching is active, `batchedTexts` contains all messages in the batch.
+ *  `ctx` is from the LAST message in the batch (most recent).
+ */
+async function handleTextMessage(
+  ctx: Context & { message: { text: string } },
+  batchedTexts?: string[],
+  batchQuoteId?: number
+) {
   const userId = ctx.from!.id;
-  const text = ctx.message.text;
+  const rawText = batchedTexts && batchedTexts.length > 1
+    ? batchedTexts.join("\n")           // Combine all batched messages
+    : ctx.message.text;
+  const text = rawText;
+  const isBatched = batchedTexts && batchedTexts.length > 1;
 
   // Update user data
+  const prevLastInteraction = store.getUser(userId).lastInteraction;
   store.updateUser(userId, {
     lastInteraction: Date.now(),
     chatId: ctx.chat!.id,
@@ -778,19 +1376,74 @@ async function handleTextMessage(ctx: Context & { message: { text: string } }) {
   });
 
   const tier = store.getComfortTier(userId);
+  const mood = store.getMood(userId);
 
-  // ── Leave on read? (comfortable+ only, low-effort messages)
-  if (shouldLeaveOnRead(tier, text)) {
+  // ── Conversation pace detection
+  const paceMult = paceMultiplier(userId);
+
+  // ── Reply context: what message is the user replying to?
+  const replyContext = getReplyContext(ctx);
+
+  // ── Status-aware: detect gap since last interaction
+  const gapMs = Date.now() - prevLastInteraction;
+  const gapContext = buildGapAwareContext(gapMs, tier);
+
+  // ── Offline schedule — she might be "sleeping"
+  const offlineDelay = offlineScheduleDelay();
+  if (offlineDelay > 0) {
+    if (isBatched) {
+      for (const t of batchedTexts!) store.addMessage(userId, "user", t);
+    } else {
+      store.addMessage(userId, "user", text);
+    }
+    console.log(`[Offline] User ${userId} messaged while Meera is "sleeping", reply in ${Math.round(offlineDelay / 60000)}min`);
+    scheduleDelayedReply(ctx, userId, offlineDelay);
+    return;
+  }
+
+  // ── Leave on read? (comfortable+ only, low-effort messages) — only for single messages
+  if (!isBatched && shouldLeaveOnRead(tier, text)) {
     store.addMessage(userId, "user", text);
     console.log(`[Bot] Left on read: user ${userId} ("${text.slice(0, 20)}")`);
+    return;
+  }
+
+  // ── Read receipt gaming — advanced seen/not-seen behavior
+  const receiptStrategy = readReceiptStrategy(tier, mood);
+  if (receiptStrategy.readDelay > 0) {
+    if (isBatched) {
+      for (const t of batchedTexts!) store.addMessage(userId, "user", t);
+    } else {
+      store.addMessage(userId, "user", text);
+    }
+    const totalDelay = receiptStrategy.readDelay + receiptStrategy.replyDelay;
+    console.log(`[ReadReceipt] Delayed read for user ${userId}, ${Math.round(totalDelay / 60000)}min`);
+    scheduleDelayedReply(ctx, userId, totalDelay);
+    return;
+  }
+  if (receiptStrategy.replyDelay > 0) {
+    if (isBatched) {
+      for (const t of batchedTexts!) store.addMessage(userId, "user", t);
+    } else {
+      store.addMessage(userId, "user", text);
+    }
+    if (receiptStrategy.showTypingFirst) {
+      await ctx.sendChatAction("typing").catch(() => {});
+      await new Promise((r) => setTimeout(r, 800 + Math.random() * 1500));
+    }
+    console.log(`[ReadReceipt] Read but delayed reply for user ${userId}, ${Math.round(receiptStrategy.replyDelay / 60000)}min`);
+    scheduleDelayedReply(ctx, userId, receiptStrategy.replyDelay);
     return;
   }
 
   // ── Seen but reply later? (late night / random delay)
   const nightDelay = lateNightDelay();
   if (nightDelay > 0) {
-    store.addMessage(userId, "user", text);
-    // Show brief typing then stop (she "saw" it)
+    if (isBatched) {
+      for (const t of batchedTexts!) store.addMessage(userId, "user", t);
+    } else {
+      store.addMessage(userId, "user", text);
+    }
     await ctx.sendChatAction("typing").catch(() => {});
     await new Promise((r) => setTimeout(r, 800 + Math.random() * 1200));
     scheduleDelayedReply(ctx, userId, nightDelay);
@@ -799,23 +1452,34 @@ async function handleTextMessage(ctx: Context & { message: { text: string } }) {
 
   // ── Random "seen but reply later" (5% chance during day, comfortable+)
   if ((tier === "comfortable" || tier === "close") && Math.random() < 0.05) {
-    store.addMessage(userId, "user", text);
+    if (isBatched) {
+      for (const t of batchedTexts!) store.addMessage(userId, "user", t);
+    } else {
+      store.addMessage(userId, "user", text);
+    }
     await ctx.sendChatAction("typing").catch(() => {});
     await new Promise((r) => setTimeout(r, 500 + Math.random() * 1000));
-    const delayMs = (5 + Math.random() * 15) * 60 * 1000; // 5-20 min
+    const delayMs = (5 + Math.random() * 15) * 60 * 1000;
     scheduleDelayedReply(ctx, userId, delayMs);
     return;
   }
 
-  // ── Emoji-only reply?
-  const emojiOnly = shouldSendEmojiOnly(tier, text);
-  if (emojiOnly) {
-    store.addMessage(userId, "user", text);
-    store.addMessage(userId, "assistant", emojiOnly);
-    const readTime = readDelay(text);
-    await new Promise((r) => setTimeout(r, readTime));
-    await ctx.reply(emojiOnly);
+  // ── Sticker-only reply? (comfortable+ only, for short/reactive messages)
+  if (!isBatched && await maybeStickerOnlyReply(ctx, userId, text)) {
     return;
+  }
+
+  // ── Emoji-only reply? (only for single non-batched messages)
+  if (!isBatched) {
+    const emojiOnly = shouldSendEmojiOnly(tier, text);
+    if (emojiOnly) {
+      store.addMessage(userId, "user", text);
+      store.addMessage(userId, "assistant", emojiOnly);
+      const readTime = readDelay(text) * paceMult;
+      await new Promise((r) => setTimeout(r, readTime));
+      await ctx.reply(emojiOnly);
+      return;
+    }
   }
 
   // React to message (async, don't await)
@@ -824,31 +1488,60 @@ async function handleTextMessage(ctx: Context & { message: { text: string } }) {
   // Time-of-day multiplier for delays
   const todMultiplier = timeOfDayMultiplier();
 
-  const useVoice = shouldSendVoice(tier, text);
+  // ── Typing fake-out? (start typing, stop, resume) — skip in rapid-fire
+  if (paceMult >= 0.7) {
+    await maybeTypingFakeout(ctx, tier);
+  }
+
+  // ── Voice note tease? (show record_voice then switch to text) — skip in rapid-fire
+  let didVoiceTease = false;
+  if (paceMult >= 0.7) {
+    didVoiceTease = await maybeVoiceNoteTease(ctx, tier);
+  }
+
+  // ── Voice timing awareness: factor time of day into voice probability
+  const voiceTimeMod = voiceTimeModifier();
+  const useVoice = !didVoiceTease && !isBatched && shouldSendVoice(tier, text, voiceTimeMod);
+
+  // ── Should Meera quote-reply this message?
+  const quoteReplyId = batchQuoteId
+    ?? (shouldQuoteReply(tier, text) ? (ctx.message as any).message_id : undefined);
+
+  // ── Build enriched context for LLM prompts
+  const history = store.getRecentHistory(userId);
+  const lengthHint = getLengthMirrorHint(text);
+  const styleHints = getStyleHints(text, history);
+  const emojiHint = getEmojiEvolutionHint(tier);
+  const batchHint = isBatched
+    ? `\n\n(The user sent ${batchedTexts!.length} messages in quick succession. Address ALL of them naturally in one reply — don't ignore any. Their messages were:\n${batchedTexts!.map((t, i) => `${i + 1}. "${t}"`).join("\n")}\n)`
+    : "";
 
   if (useVoice) {
     // Voice reply via Gemini Live
     try {
-      // Simulate reading the message first (no indicator yet)
-      const readTime = readDelay(text) * todMultiplier;
+      const readTime = readDelay(text) * todMultiplier * paceMult;
       await new Promise((r) => setTimeout(r, readTime));
 
-      // Now start "recording voice"
       const stopTyping = typingIndicator(ctx, "record_voice");
       sessions.resetSession(userId);
       const session = await sessions.getSession(userId);
-      const response = await session.send([{ text }]);
+      const response = await session.send([{
+        text: replyContext + (gapContext ? gapContext + "\n\n" : "") + batchHint + lengthHint + text
+      }]);
 
       stopTyping();
-      await sendGeminiResponse(ctx, response);
+      await sendGeminiResponse(ctx, response, quoteReplyId);
 
-      // Save to Ollama history
-      store.addMessage(userId, "user", text);
+      // Save to history
+      if (isBatched) {
+        for (const t of batchedTexts!) store.addMessage(userId, "user", t);
+      } else {
+        store.addMessage(userId, "user", text);
+      }
       if (response.text.trim()) {
         store.addMessage(userId, "assistant", response.text);
       }
 
-      // Maybe send a sticker after
       if (response.text.trim()) {
         maybeSendSticker(ctx, userId, response.text).catch(() => {});
       }
@@ -860,36 +1553,54 @@ async function handleTextMessage(ctx: Context & { message: { text: string } }) {
   } else {
     // Text reply via Ollama
     try {
-      // Simulate reading the message first (no typing indicator yet)
-      const readTime = readDelay(text) * todMultiplier;
+      const readTime = readDelay(text) * todMultiplier * paceMult;
       await new Promise((r) => setTimeout(r, readTime));
 
-      // Now start "typing"
       const stopTyping = typingIndicator(ctx, "typing");
       const user = store.getUser(userId);
-      const history = store.getRecentHistory(userId);
-      const messages = buildOllamaMessages(text, history, tier, user);
 
-      const reply = await callOllamaWithRotation(ollamaConfig, messages, user.ollamaKeys);
+      // Build message with all context hints
+      const userMsg = replyContext
+        + (gapContext ? gapContext + "\n\n" : "")
+        + batchHint
+        + lengthHint
+        + styleHints
+        + emojiHint
+        + "\n\n" + text;
+      const messages = buildOllamaMessages(userMsg, history, tier, user, mood);
+
+      let reply = await callOllamaWithRotation(ollamaConfig, messages, user.ollamaKeys);
+
+      // Add deliberate typos
+      const cleanReply = reply; // Save pre-typo version
+      reply = addDeliberateTypos(reply, mood);
 
       // Save to history
-      store.addMessage(userId, "user", text);
-      store.addMessage(userId, "assistant", reply);
+      if (isBatched) {
+        for (const t of batchedTexts!) store.addMessage(userId, "user", t);
+      } else {
+        store.addMessage(userId, "user", text);
+      }
+      store.addMessage(userId, "assistant", cleanReply);
 
-      // Simulate typing delay (scaled by time of day)
-      const delay = typingDelay(reply) * todMultiplier;
+      // Simulate typing delay (scaled by time of day and conversation pace)
+      const delay = typingDelay(reply) * todMultiplier * paceMult;
       await new Promise((r) => setTimeout(r, Math.min(delay, 8000)));
 
       stopTyping();
 
       // Send reply as bubbles (may split into multiple messages)
-      await sendAsBubbles(ctx, reply);
+      const sentMsgId = await sendAsBubbles(ctx, reply, quoteReplyId);
+      if (sentMsgId) lastSentMessageIds.set(userId, sentMsgId);
 
-      // Maybe send a self-correction follow-up
-      const correction = maybeSelfCorrect(reply);
+      // Maybe self-correct — try editing the message first, fall back to "*that" follow-up
+      const correction = maybeSelfCorrect(cleanReply);
       if (correction) {
         await new Promise((r) => setTimeout(r, 1500 + Math.random() * 2000));
-        await ctx.reply(correction);
+        const edited = await maybeEditCorrection(ctx, userId, cleanReply);
+        if (!edited) {
+          await ctx.reply(correction);
+        }
       }
 
       // Maybe send a sticker after
@@ -903,10 +1614,11 @@ async function handleTextMessage(ctx: Context & { message: { text: string } }) {
 
 /** Decide if Meera voice-replies to media — slightly higher chance since media is more expressive */
 function shouldSendVoiceForMedia(tier: string): boolean {
+  const timeMod = voiceTimeModifier();
   if (tier === "stranger") return false;
-  if (tier === "acquaintance") return Math.random() < 0.10;
-  if (tier === "comfortable") return Math.random() < 0.40;
-  return Math.random() < 0.55; // close
+  if (tier === "acquaintance") return Math.random() < 0.10 * timeMod;
+  if (tier === "comfortable") return Math.random() < 0.40 * timeMod;
+  return Math.random() < Math.min(0.55 * timeMod, 0.85); // close
 }
 
 /** Handle media messages — Gemini Live processes, Meera decides voice vs text naturally */
@@ -924,21 +1636,68 @@ async function handleMediaMessage(
   });
 
   const tier = store.getComfortTier(userId);
+  const mood = store.getMood(userId);
   const useAudio = shouldSendVoiceForMedia(tier);
+
+  // ── Photo reaction differentiation: classify what type of media this is
+  const mediaType = classifyMedia(ctx);
+  const mediaHint = getMediaReactionHint(mediaType, tier);
+
+  // ── Reply context: what message is the user replying to with this media?
+  const replyContext = getReplyContext(ctx);
+  if (replyContext) {
+    // Prepend the reply context as a text part so Gemini/Ollama sees it
+    parts.unshift({ text: replyContext });
+  }
+
+  // ── Add media reaction hint as a text part
+  if (mediaHint) {
+    parts.unshift({ text: mediaHint });
+  }
+
+  // ── Offline schedule — she might be "sleeping"
+  const offlineDelay = offlineScheduleDelay();
+  if (offlineDelay > 0) {
+    store.addMessage(userId, "user", "[sent media]");
+    console.log(`[Offline] User ${userId} sent media while Meera is "sleeping"`);
+    // Can't schedule delayed media processing easily, so just delay a text acknowledgment
+    setTimeout(async () => {
+      try {
+        const user = store.getUser(userId);
+        const history = store.getRecentHistory(userId);
+        const messages = buildOllamaMessages(
+          "(You just woke up and saw they sent you a photo/video/audio while you were sleeping. React naturally — maybe 'omg what did i miss' or 'wait let me see what you sent' or just address it casually.)",
+          history, tier, user, mood
+        );
+        const reply = await callOllamaWithRotation(ollamaConfig, messages, user.ollamaKeys);
+        store.addMessage(userId, "assistant", reply);
+        await bot.telegram.sendMessage(ctx.chat!.id, reply);
+      } catch (err) {
+        console.error(`[Offline] Delayed media reply failed for ${userId}:`, err);
+      }
+    }, offlineDelay);
+    return;
+  }
 
   // React to media message (async, don't block)
   maybeReact(ctx, userId, "[sent media]").catch(() => {});
 
+  // Typing fake-out before processing
+  await maybeTypingFakeout(ctx, tier);
+
+  // ── Should Meera quote-reply this media message?
+  const quoteReplyId = shouldQuoteReply(tier, "[sent media]") ? (ctx.message as any).message_id : undefined;
+
   const stopTyping = typingIndicator(ctx, useAudio ? "record_voice" : "typing");
   try {
-    // Reset session so it picks up latest tier/persona
+    // Reset session so it picks up latest tier/persona/mood
     sessions.resetSession(userId);
     const session = await sessions.getSession(userId);
     const response = await session.send(parts as any);
 
     if (useAudio) {
       // Comfortable+ → send audio response directly from Gemini Live
-      await sendGeminiResponse(ctx, response);
+      await sendGeminiResponse(ctx, response, quoteReplyId);
 
       // Save to history
       store.addMessage(userId, "user", "[sent media]");
@@ -957,14 +1716,21 @@ async function handleMediaMessage(
       const history = store.getRecentHistory(userId);
 
       // Build Ollama messages with Gemini's observation as context
+      const emojiHint = getEmojiEvolutionHint(tier);
+      const styleHints = getStyleHints("[sent media]", history);
       const rephrasePrompt =
         `The user sent you a photo/video/audio. Here's what you observed about it: "${geminiRaw}"\n\n` +
+        (mediaHint ? mediaHint + "\n\n" : "") +
         `Now respond to the user naturally as yourself (Meera) about what they sent. ` +
         `Don't say "I observed" or quote the observation — just react naturally like a real girl would. ` +
-        `If the observation says you can't describe something, just dodge it naturally or tease them — never sound like an AI refusing.`;
+        `If the observation says you can't describe something, just dodge it naturally or tease them — never sound like an AI refusing.` +
+        emojiHint + styleHints;
 
-      const messages = buildOllamaMessages(rephrasePrompt, history, tier, user);
-      const reply = await callOllamaWithRotation(ollamaConfig, messages, user.ollamaKeys);
+      const messages = buildOllamaMessages(rephrasePrompt, history, tier, user, mood);
+      let reply = await callOllamaWithRotation(ollamaConfig, messages, user.ollamaKeys);
+
+      // Add deliberate typos
+      reply = addDeliberateTypos(reply, mood);
 
       // Save to history
       store.addMessage(userId, "user", "[sent media]");
@@ -972,7 +1738,7 @@ async function handleMediaMessage(
 
       const delay = typingDelay(reply) * timeOfDayMultiplier();
       await new Promise((r) => setTimeout(r, Math.min(delay, 6000)));
-      await sendAsBubbles(ctx, reply);
+      await sendAsBubbles(ctx, reply, quoteReplyId);
 
       // Maybe self-correct
       const correction = maybeSelfCorrect(reply);
@@ -1005,7 +1771,33 @@ bot.on(message("text"), async (ctx) => {
     if (handled) return;
   }
 
-  await handleTextMessage(ctx);
+  // Record pace for this message
+  recordMessagePace(userId);
+
+  // ── Rapid-fire batching: collect multiple quick messages into one reply
+  addToBatch(
+    userId,
+    ctx.message.text,
+    ctx.message.message_id,
+    ctx as Context & { message: { text: string } },
+    async (batchedMessages) => {
+      const lastMsg = batchedMessages[batchedMessages.length - 1];
+      if (batchedMessages.length === 1) {
+        // Single message — normal flow
+        await handleTextMessage(lastMsg.ctx);
+      } else {
+        // Multiple messages — batch them
+        const texts = batchedMessages.map((m) => m.text);
+        // Quote-reply to the first message in the batch
+        const quoteId = shouldQuoteReply(
+          store.getComfortTier(userId),
+          texts.join(" ")
+        ) ? batchedMessages[0].msgId : undefined;
+        console.log(`[Batch] User ${userId} sent ${texts.length} messages in rapid succession, batching`);
+        await handleTextMessage(lastMsg.ctx, texts, quoteId);
+      }
+    }
+  );
 });
 
 // Photos
@@ -1105,12 +1897,18 @@ async function proactiveLoop() {
     const hour = getISTHour();
     if (hour >= 2 && hour < 7) continue;
 
-    const prompt = INITIATE_PROMPTS[tier];
+    const mood = store.getMood(userId);
+
+    // ── Content sharing: 20% chance to share random content instead of a ping (comfortable+)
+    const shareContent = (tier === "comfortable" || tier === "close") && Math.random() < 0.20;
+    const prompt = shareContent
+      ? (CONTENT_SHARE_PROMPTS[tier] ?? INITIATE_PROMPTS[tier])
+      : INITIATE_PROMPTS[tier];
     if (!prompt) continue;
 
     try {
       const history = store.getRecentHistory(userId);
-      const messages = buildOllamaMessages(prompt, history, tier, user);
+      const messages = buildOllamaMessages(prompt, history, tier, user, mood);
       const reply = await callOllamaWithRotation(ollamaConfig, messages, user.ollamaKeys);
 
       // Simulate typing delay before sending
@@ -1134,7 +1932,7 @@ async function proactiveLoop() {
       }
 
       store.updateUser(userId, { proactiveSent: true });
-      console.log(`[Proactive] Sent to user ${userId} (${tier})`);
+      console.log(`[Proactive] Sent to user ${userId} (${tier}, mood=${mood}${shareContent ? ", content-share" : ""})`);
     } catch (err) {
       console.error(`[Proactive] Failed for user ${userId}:`, err);
     }

@@ -19,7 +19,12 @@ export interface UserData {
   proactiveSent: boolean;
   totalMessages: number;
   ollamaKeys: string[];
+  mood: string;
+  lastMoodChange: number;
 }
+
+export const MOODS = ["happy", "bored", "clingy", "sassy", "tired", "excited", "chill", "annoyed"] as const;
+export type Mood = typeof MOODS[number];
 
 export function defaultUserData(): UserData {
   return {
@@ -32,6 +37,8 @@ export function defaultUserData(): UserData {
     proactiveSent: false,
     totalMessages: 0,
     ollamaKeys: [],
+    mood: "chill",
+    lastMoodChange: 0,
   };
 }
 
@@ -187,6 +194,20 @@ export class UserStore {
     if (count < 25) return "acquaintance";
     if (count < 60) return "comfortable";
     return "close";
+  }
+
+  /** Get current mood, rotating every 2-6 hours randomly */
+  getMood(userId: number): string {
+    const user = this.getUser(userId);
+    const now = Date.now();
+    const moodDuration = 2 * 3600 * 1000 + Math.random() * 4 * 3600 * 1000; // 2-6h
+    if (now - user.lastMoodChange > moodDuration) {
+      const newMood = MOODS[Math.floor(Math.random() * MOODS.length)];
+      user.mood = newMood;
+      user.lastMoodChange = now;
+      this.saveQueue.add(userId);
+    }
+    return user.mood;
   }
 
   /** All user IDs that are loaded in memory */
