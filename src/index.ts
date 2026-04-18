@@ -585,7 +585,7 @@ async function handleTextMessage(ctx: Context & { message: { text: string } }) {
     } catch (err) {
       console.error("[Bot] Gemini voice error:", err);
       sessions.resetSession(userId);
-      await ctx.reply("Hmm, something went wrong. Try again?");
+      await ctx.reply("wait something messed up lol try again");
     } finally {
       stopTyping();
     }
@@ -614,7 +614,7 @@ async function handleTextMessage(ctx: Context & { message: { text: string } }) {
       maybeSendSticker(ctx, userId, reply).catch(() => {});
     } catch (err) {
       console.error("[Bot] Ollama error:", err);
-      await ctx.reply("Hmm, something went wrong. Try again?");
+      await ctx.reply("omg my brain just glitched 😭 say that again?");
     } finally {
       stopTyping();
     }
@@ -657,33 +657,50 @@ async function handleMediaMessage(
     const response = await session.send(parts as any);
 
     if (useAudio) {
-      // Comfortable+ → send audio response
+      // Comfortable+ → send audio response directly from Gemini Live
       await sendGeminiResponse(ctx, response);
-    } else {
-      // Stranger/acquaintance → send text only
+
+      // Save to history
+      store.addMessage(userId, "user", "[sent media]");
       if (response.text.trim()) {
-        const delay = typingDelay(response.text);
-        await new Promise((r) => setTimeout(r, Math.min(delay, 3000)));
-        await sendText(ctx, response.text);
-      } else {
-        await ctx.reply("I see it! Cool 😊");
+        store.addMessage(userId, "assistant", response.text);
       }
-    }
 
-    // Save to Ollama history
-    store.addMessage(userId, "user", "[sent media]");
-    if (response.text.trim()) {
-      store.addMessage(userId, "assistant", response.text);
-    }
+      // Maybe send a sticker after
+      if (response.text.trim()) {
+        maybeSendSticker(ctx, userId, response.text).catch(() => {});
+      }
+    } else {
+      // Text response → rephrase Gemini's raw output through Ollama for natural girl tone
+      const geminiRaw = response.text.trim() || "I see it";
+      const user = store.getUser(userId);
+      const history = store.getRecentHistory(userId);
 
-    // Maybe send a sticker after
-    if (response.text.trim()) {
-      maybeSendSticker(ctx, userId, response.text).catch(() => {});
+      // Build Ollama messages with Gemini's observation as context
+      const rephrasePrompt =
+        `The user sent you a photo/video/audio. Here's what you observed about it: "${geminiRaw}"\n\n` +
+        `Now respond to the user naturally as yourself (Meera) about what they sent. ` +
+        `Don't say "I observed" or quote the observation — just react naturally like a real girl would. ` +
+        `If the observation says you can't describe something, just dodge it naturally or tease them — never sound like an AI refusing.`;
+
+      const messages = buildOllamaMessages(rephrasePrompt, history, tier, user);
+      const reply = await callOllamaWithRotation(ollamaConfig, messages, user.ollamaKeys);
+
+      // Save to history
+      store.addMessage(userId, "user", "[sent media]");
+      store.addMessage(userId, "assistant", reply);
+
+      const delay = typingDelay(reply);
+      await new Promise((r) => setTimeout(r, Math.min(delay, 3000)));
+      await sendText(ctx, reply);
+
+      // Maybe send a sticker after
+      maybeSendSticker(ctx, userId, reply).catch(() => {});
     }
   } catch (err) {
     console.error("[Bot] Gemini error:", err);
     sessions.resetSession(userId);
-    await ctx.reply("⚠️ Something went wrong processing your media. Try again?");
+    await ctx.reply("ugh sorry that didn't load properly 😭 send it again?");
   } finally {
     stopTyping();
   }
