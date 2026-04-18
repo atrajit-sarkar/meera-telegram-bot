@@ -58,7 +58,7 @@ export class UserStore {
   private saveTimer: ReturnType<typeof setInterval> | null = null;
 
   // Community key pool — shared across all users
-  private communityKeys: Array<{ key: string; contributedBy: number; addedAt: number }> = [];
+  private communityKeys: Array<{ key: string; contributedBy: number; contributorName: string; addedAt: number }> = [];
   private communityKeysLoaded = false;
 
   constructor(maxHistory = 50, databaseId?: string) {
@@ -302,6 +302,7 @@ export class UserStore {
       this.communityKeys = snap.docs.map((d) => ({
         key: d.data().key as string,
         contributedBy: d.data().contributedBy as number,
+        contributorName: (d.data().contributorName as string) || "",
         addedAt: d.data().addedAt as number,
       }));
       console.log(`[UserStore] Loaded ${this.communityKeys.length} community keys`);
@@ -310,12 +311,22 @@ export class UserStore {
     }
   }
 
+  /** Check if a key already exists in community pool or any user's personal keys */
+  async isKeyDuplicate(key: string, userId: number): Promise<"community" | "personal" | false> {
+    await this.loadCommunityKeys();
+    if (this.communityKeys.some((k) => k.key === key)) return "community";
+    // Check the requesting user's own personal keys
+    const user = this.getUser(userId);
+    if (user.ollamaKeys.includes(key)) return "personal";
+    return false;
+  }
+
   /** Add a key to the community pool */
-  async addCommunityKey(key: string, contributedBy: number): Promise<boolean> {
+  async addCommunityKey(key: string, contributedBy: number, contributorName: string): Promise<boolean> {
     await this.loadCommunityKeys();
     // Check for duplicates
     if (this.communityKeys.some((k) => k.key === key)) return false;
-    const entry = { key, contributedBy, addedAt: Date.now() };
+    const entry = { key, contributedBy, contributorName, addedAt: Date.now() };
     this.communityKeys.push(entry);
     try {
       await this.db.collection("community_keys").add(entry);
@@ -361,10 +372,11 @@ export class UserStore {
   }
 
   /** Get community keys info for display */
-  getCommunityKeysInfo(): Array<{ maskedKey: string; contributedBy: number }> {
+  getCommunityKeysInfo(): Array<{ maskedKey: string; contributedBy: number; contributorName: string }> {
     return this.communityKeys.map((k) => ({
       maskedKey: `${k.key.slice(0, 6)}...${k.key.slice(-4)}`,
       contributedBy: k.contributedBy,
+      contributorName: k.contributorName || "",
     }));
   }
 

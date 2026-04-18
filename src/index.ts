@@ -989,7 +989,10 @@ bot.command("communitykeys", async (ctx) => {
     return;
   }
   const info = store.getCommunityKeysInfo();
-  const lines = info.map((k, i) => `${i + 1}. ${k.maskedKey}`);
+  const lines = info.map((k, i) => {
+    const credit = k.contributorName ? ` — contributed by ${k.contributorName}` : "";
+    return `${i + 1}. ${k.maskedKey}${credit}`;
+  });
   await ctx.reply(`🤝 Community Key Pool: ${count} key${count > 1 ? "s" : ""}\n\n${lines.join("\n")}\n\nThese keys are shared with all users. Use /contribute to add yours!`);
 });
 
@@ -1121,6 +1124,16 @@ async function handleFsmState(
         if (key.length < 10) {
           return ctx.reply("That doesn't look like a valid API key. Try again with /addkey").then(() => true);
         }
+        // Check for duplicates across personal + community pools
+        const dup = await store.isKeyDuplicate(key, userId);
+        if (dup === "personal") {
+          try { await ctx.deleteMessage(); } catch {}
+          return ctx.reply("This key is already in your personal keys!").then(() => true);
+        }
+        if (dup === "community") {
+          try { await ctx.deleteMessage(); } catch {}
+          return ctx.reply("This key is already in the community pool! No need to add it personally.").then(() => true);
+        }
         const user = store.getUser(userId);
         const keys = [...user.ollamaKeys, key];
         store.updateUser(userId, { ollamaKeys: keys });
@@ -1152,7 +1165,17 @@ async function handleFsmState(
         }
         // Try to delete the user's message containing the key
         try { await ctx.deleteMessage(); } catch {}
-        const added = await store.addCommunityKey(key, userId);
+        // Check for duplicates across personal + community pools
+        const dup = await store.isKeyDuplicate(key, userId);
+        if (dup === "community") {
+          return ctx.reply("This key is already in the community pool!").then(() => true);
+        }
+        if (dup === "personal") {
+          return ctx.reply("This key is already in your personal keys! Remove it with /removekey first if you want to contribute it to everyone.").then(() => true);
+        }
+        const name = ctx.from!.first_name + (ctx.from!.last_name ? " " + ctx.from!.last_name : "");
+        const contributor = ctx.from!.username ? `@${ctx.from!.username}` : name;
+        const added = await store.addCommunityKey(key, userId, contributor);
         if (!added) {
           return ctx.reply("This key is already in the community pool!").then(() => true);
         }
