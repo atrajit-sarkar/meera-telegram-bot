@@ -1922,7 +1922,7 @@ async function handleTextMessage(
   }
 
   // ── Mid-chat content sharing: maybe share a meme/video alongside the reply
-  const { shouldShare, reason } = shouldShareContentMidChat(tier, text, mood);
+  const { shouldShare, reason } = shouldShareContentMidChat(tier, text, mood, history);
   if (shouldShare) {
     // Small delay — she replies first, then "finds" the meme
     const shareDelay = reason === "asked"

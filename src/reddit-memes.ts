@@ -327,6 +327,38 @@ const MEME_TRIGGER_PATTERNS = [
   /\b(show me something|entertain me)\b/i,
   /\b(lol|lmao|haha|😂|🤣|💀){2,}/i,  // Multiple laughing = vibe is right
   /\b(meme|memes|funny video|reel|reels)\b/i,
+  // Hindi/Bengali/Hinglish patterns
+  /\b(bhej|bhejo|pathao|patao|de na|dena|dikha|dikhao|dikhana)\b/i,
+  /\b(kuch funny|kuch mast|kuch acha|majja|moja|hansi)\b/i,
+  /\b(bore ho raha|bore ho rahi|bore lagche|boring lagche)\b/i,
+];
+
+// Explicit content request patterns — English
+const EXPLICIT_REQUEST_EN = [
+  /send (me )?(a |some |another )?(meme|video|reel|something funny|content|funny)/i,
+  /show me (a |some |another )?(meme|video|funny|something|reel)/i,
+  /\b(entertain me)\b/i,
+  /\b(one more|another one|send more|more memes|more reels|more videos)\b/i,
+  /\b(again|send again|another)\b.*\b(meme|video|reel|funny)\b/i,
+];
+
+// Explicit content request patterns — Hindi/Bengali/Hinglish
+const EXPLICIT_REQUEST_INDIC = [
+  // Hindi: "bhej" / "bhejo" / "de" / "dena" + content words
+  /(bhej|bhejo|de na|dena|dikha|dikhao)\s*(meme|video|reel|funny|kuch)/i,
+  // Bengali: "pathao" / "patao" / "de" / "dao" + content words
+  /(pathao|patao|dao|de|daw)\s*(meme|video|reel|funny|ekta|akta|kichhu)/i,
+  // "aur ek" / "ek aur" / "ar ekta" / "arekta" — "another one" / "one more"
+  /\b(aur ek|ek aur|ar ekta|arekta|aur bhej|aur pathao|aur de|aaro ekta|r ekta)\b/i,
+  // "ekta pathao" / "ek bhej" — "send one"
+  /\b(ekta|akta|ek)\s*(pathao|patao|bhej|bhejo|de|dao)\b/i,
+  // Reversed: "pathao ekta" / "bhej ek"
+  /\b(pathao|patao|bhej|bhejo)\s*(ekta|akta|ek|na|to)\b/i,
+  // "hasi" / "hansi" / "funny" + "pathao" / "bhej" / "de"
+  /(hasi|hansi|hasir|funny|moja|maza|majja)\s*.{0,10}\s*(pathao|bhej|de|dao|dikha)/i,
+  /(pathao|bhej|de|dao|dikha)\s*.{0,10}\s*(hasi|hansi|hasir|funny|moja|maza|majja)/i,
+  // Simple "ar ekta" / "aur ek" even without content words (if recently shared)
+  /^(ar|aur|r)\s*(ekta|ek|1ta)\b/i,
 ];
 
 /**
@@ -337,11 +369,15 @@ const MEME_TRIGGER_PATTERNS = [
  * 1. User explicitly asks for content ("send me a meme", "show me something funny")
  * 2. Random chance during comfortable+ conversations (~5%)
  * 3. Conversation has "sharing vibe" (lots of laughing, bored energy)
+ * 4. User asks for "another" after content was recently shared
+ *
+ * @param recentHistory — last few messages to detect "send another" after a share
  */
 export function shouldShareContentMidChat(
   tier: string,
   userText: string,
-  mood: string
+  mood: string,
+  recentHistory?: { role: string; content: string }[]
 ): { shouldShare: boolean; reason: "asked" | "vibe" | "random" } {
   // Only for comfortable+ tiers
   if (tier === "stranger" || tier === "acquaintance") {
@@ -350,11 +386,34 @@ export function shouldShareContentMidChat(
 
   const text = userText.toLowerCase();
 
-  // Explicit request — always share
-  if (/send (me )?(a |some )?(meme|video|reel|something funny|content)/i.test(text)
-    || /show me (a |some )?(meme|video|funny|something)/i.test(text)
-    || /entertain me/i.test(text)) {
+  // Explicit request (English) — always share
+  if (EXPLICIT_REQUEST_EN.some((p) => p.test(text))) {
     return { shouldShare: true, reason: "asked" };
+  }
+
+  // Explicit request (Hindi/Bengali/Hinglish) — always share
+  if (EXPLICIT_REQUEST_INDIC.some((p) => p.test(text))) {
+    return { shouldShare: true, reason: "asked" };
+  }
+
+  // "Another" / "more" detection: if we recently shared content and user asks for more
+  // Check if any recent assistant message contains "[shared:" (content was sent)
+  if (recentHistory) {
+    const recentAssistant = recentHistory
+      .filter((m) => m.role === "assistant")
+      .slice(-5);
+    const recentlyShared = recentAssistant.some((m) => m.content.includes("[shared:"));
+    if (recentlyShared) {
+      // Lower threshold for "another" patterns when we recently shared
+      const anotherPatterns = [
+        /\b(another|more|again|one more|next|ek aur|aur ek|ar ekta|arekta|aur bhej|aur pathao|r ekta|aaro)\b/i,
+        /\b(pathao|bhej|send|show|de|dao|dena)\b/i,  // Any "send" word after recent share
+        /^(plz|pls|please|hasi|😂|🤣|💀|wow|lol|lmao)/i,  // Reaction + implied "more"
+      ];
+      if (anotherPatterns.some((p) => p.test(text))) {
+        return { shouldShare: true, reason: "asked" };
+      }
+    }
   }
 
   // Vibe check — user is laughing a lot or mentions memes
