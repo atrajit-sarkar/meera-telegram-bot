@@ -74,7 +74,7 @@ export class GeminiSession {
               responseModalities: ["AUDIO"],
               speechConfig: {
                 voiceConfig: {
-                  prebuiltVoiceConfig: { voiceName: "Kore" },
+                  prebuiltVoiceConfig: { voiceName: "Leda" },
                 },
               },
             },
