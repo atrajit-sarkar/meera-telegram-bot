@@ -22,6 +22,7 @@ import {
   type OllamaConfig,
 } from "./ollama-service.js";
 import { UserStore } from "./user-store.js";
+import { getRandomContentAny, shouldShareContentMidChat, type ContentPost } from "./reddit-memes.js";
 import type { Context } from "telegraf";
 import type { GeminiResponse } from "./gemini-session.js";
 
@@ -1349,6 +1350,63 @@ function getEmojiEvolutionHint(tier: string): string {
   }
 }
 
+// ── SEND CONTENT (meme/video/YouTube link) ──────────────────────────
+
+/** Send a ContentPost (meme/video/YT short) to the user with a generated caption */
+async function sendContentToChat(
+  ctx: Context,
+  userId: number,
+  post: ContentPost,
+  reason: "asked" | "vibe" | "random"
+): Promise<boolean> {
+  const tier = store.getComfortTier(userId);
+  const mood = store.getMood(userId);
+  const user = store.getUser(userId);
+  const history = store.getRecentHistory(userId);
+
+  // Generate a natural caption depending on the reason
+  let captionPrompt: string;
+  if (reason === "asked") {
+    captionPrompt = `Your friend asked you for something funny/a meme/a video. You found one titled: "${post.title}". Write a SHORT casual message (1 line) to go with it, like you're sharing from your phone. Examples: "here lol", "yeh le 😂", "found this for you", "is this funny enough for you 🙄". DON'T describe the content. Use the language from chat history.`;
+  } else if (reason === "vibe") {
+    captionPrompt = `You're vibing with your friend and want to share this meme/video titled "${post.title}". Write a SHORT line (1 line) like: "omg wait this is literally us", "this reminded me of you 😂", "okay but this tho 💀", "arey dekh ye 🤣". Match the chat language.`;
+  } else {
+    captionPrompt = `You randomly want to share a meme/video you found titled "${post.title}". Write a SHORT message (1 line) like a girl would when forwarding content: "LMAOO 😭", "bro look at this", "i can't 💀💀", "ye dekh 😂", "this sent me". Don't describe it. Match chat language.`;
+  }
+
+  const messages = buildOllamaMessages(captionPrompt, history, tier, user, mood);
+  let caption: string;
+  try {
+    caption = await callOllamaWithRotation(ollamaConfig, messages, user.ollamaKeys);
+  } catch {
+    caption = ["lol look at this", "😂😂", "bro", "dekh ye 💀"][Math.floor(Math.random() * 4)];
+  }
+
+  try {
+    if (post.isYouTubeLink) {
+      // YouTube Shorts — send as a link message
+      await (ctx as any).telegram.sendMessage(ctx.chat!.id, `${caption}\n${post.url}`);
+    } else if (post.isImage) {
+      await (ctx as any).telegram.sendPhoto(ctx.chat!.id, post.url, { caption });
+    } else if (post.isVideo) {
+      try {
+        await (ctx as any).telegram.sendVideo(ctx.chat!.id, post.url, { caption });
+      } catch {
+        // Reddit video URL might not be directly sendable — fall back to link
+        await (ctx as any).telegram.sendMessage(ctx.chat!.id, `${caption}\n${post.permalink}`);
+      }
+    }
+
+    const source = post.source === "youtube" ? "YouTube" : `r/${post.subreddit}`;
+    store.addMessage(userId, "assistant", `[shared: ${post.title}] ${caption}`);
+    console.log(`[Content] Shared ${post.source} content to user ${userId} (${reason}) from ${source}`);
+    return true;
+  } catch (err) {
+    console.error(`[Content] Failed to send to ${userId}:`, err);
+    return false;
+  }
+}
+
 /** Handle text messages — Meera decides naturally when to voice vs text
  *  When batching is active, `batchedTexts` contains all messages in the batch.
  *  `ctx` is from the LAST message in the batch (most recent).
@@ -1609,6 +1667,28 @@ async function handleTextMessage(
       console.error("[Bot] Ollama error:", err);
       await ctx.reply("omg my brain just glitched 😭 say that again?");
     }
+  }
+
+  // ── Mid-chat content sharing: maybe share a meme/video alongside the reply
+  const { shouldShare, reason } = shouldShareContentMidChat(tier, text, mood);
+  if (shouldShare) {
+    // Small delay — she replies first, then "finds" the meme
+    const shareDelay = reason === "asked"
+      ? 1500 + Math.random() * 2000      // Quick when asked
+      : 3000 + Math.random() * 5000;     // Natural delay when spontaneous
+    setTimeout(async () => {
+      try {
+        const post = await getRandomContentAny(userId);
+        if (post) {
+          // Show typing while "finding" the content
+          await ctx.sendChatAction("typing").catch(() => {});
+          await new Promise((r) => setTimeout(r, 800 + Math.random() * 1200));
+          await sendContentToChat(ctx, userId, post, reason);
+        }
+      } catch (err) {
+        console.error(`[Content] Mid-chat share failed for ${userId}:`, err);
+      }
+    }, shareDelay);
   }
 }
 
@@ -1907,6 +1987,37 @@ async function proactiveLoop() {
     if (!prompt) continue;
 
     try {
+      // ── If content sharing, try to send an actual meme/video/YouTube Short
+      if (shareContent) {
+        const post = await getRandomContentAny(userId);
+        if (post) {
+          // Use a fake context for sendContentToChat — we need to build one with chatId
+          const fakeCtx = {
+            chat: { id: user.chatId },
+            telegram: bot.telegram,
+            sendChatAction: (action: any) => bot.telegram.sendChatAction(user.chatId, action),
+          } as unknown as Context;
+
+          const sent = await sendContentToChat(fakeCtx, userId, post, "random");
+          if (sent) {
+            store.updateUser(userId, { proactiveSent: true });
+
+            // Double-text after meme: 30% chance
+            if (Math.random() < 0.30) {
+              const followUps = tier === "close"
+                ? ["😭😭😭", "i'm DEAD", "bro please", "tell me this isnt funny", "💀💀"]
+                : ["😂", "lol", "hehehe", "👀"];
+              const followUp = followUps[Math.floor(Math.random() * followUps.length)];
+              await new Promise((r) => setTimeout(r, 2000 + Math.random() * 5000));
+              await bot.telegram.sendMessage(user.chatId, followUp);
+              store.addMessage(userId, "assistant", followUp);
+            }
+            continue;
+          }
+          // If send failed, fall through to text-only content share below
+        }
+      }
+
       const history = store.getRecentHistory(userId);
       const messages = buildOllamaMessages(prompt, history, tier, user, mood);
       const reply = await callOllamaWithRotation(ollamaConfig, messages, user.ollamaKeys);
