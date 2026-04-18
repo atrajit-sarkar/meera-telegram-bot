@@ -1139,7 +1139,7 @@ function shouldSendVoice(tier: string, userText: string, timeModifier: number = 
 // ── REPLY CONTEXT ───────────────────────────────────────────────────
 
 /** Extract the text/caption of the message being replied to, if any */
-function getReplyContext(ctx: Context): string {
+function getReplyContext(ctx: Context, userId: number): string {
   const replyMsg = (ctx.message as any)?.reply_to_message;
   if (!replyMsg) return "";
 
@@ -1150,7 +1150,7 @@ function getReplyContext(ctx: Context): string {
   // Figure out who sent the replied-to message
   const botId = (ctx as any).botInfo?.id;
   const isFromBot = replyMsg.from?.id === botId;
-  const sender = isFromBot ? "you (Meera)" : "the user";
+  const sender = isFromBot ? "you" : "the user";
 
   return `(The user is replying to a specific message that ${sender} sent earlier: "${replyText.slice(0, 300)}")\n\n`;
 }
@@ -1511,7 +1511,7 @@ async function sendContentToChat(
   } else if (reason === "vibe") {
     captionPrompt = `You're vibing with your friend and want to share this meme/video titled "${post.title}". Write a SHORT line (1 line) like: "omg wait this is literally us", "this reminded me of you 😂", "okay but this tho 💀", "arey dekh ye 🤣". Match the chat language.`;
   } else {
-    captionPrompt = `You randomly want to share a meme/video you found titled "${post.title}". Write a SHORT message (1 line) like a girl would when forwarding content: "LMAOO 😭", "bro look at this", "i can't 💀💀", "ye dekh 😂", "this sent me". Don't describe it. Match chat language.`;
+    captionPrompt = `You randomly want to share a meme/video you found titled "${post.title}". Write a SHORT message (1 line) like you would when forwarding content: "LMAOO 😭", "bro look at this", "i can't 💀💀", "ye dekh 😂", "this sent me". Don't describe it. Match chat language.`;
   }
 
   const messages = buildOllamaMessages(captionPrompt, history, tier, user, mood);
@@ -1580,7 +1580,7 @@ async function handleTextMessage(
   const paceMult = paceMultiplier(userId);
 
   // ── Reply context: what message is the user replying to?
-  const replyContext = getReplyContext(ctx);
+  const replyContext = getReplyContext(ctx, userId);
 
   // ── Status-aware: detect gap since last interaction
   const gapMs = Date.now() - prevLastInteraction;
@@ -1864,7 +1864,7 @@ async function handleMediaMessage(
   const mediaHint = getMediaReactionHint(mediaType, tier);
 
   // ── Reply context: what message is the user replying to with this media?
-  const replyContext = getReplyContext(ctx);
+  const replyContext = getReplyContext(ctx, userId);
   if (replyContext) {
     // Prepend the reply context as a text part so Gemini/Ollama sees it
     parts.unshift({ text: replyContext });
@@ -1941,8 +1941,8 @@ async function handleMediaMessage(
       const rephrasePrompt =
         `The user sent you a photo/video/audio. Here's what you observed about it: "${geminiRaw}"\n\n` +
         (mediaHint ? mediaHint + "\n\n" : "") +
-        `Now respond to the user naturally as yourself (Meera) about what they sent. ` +
-        `Don't say "I observed" or quote the observation — just react naturally like a real girl would. ` +
+        `Now respond to the user naturally as yourself about what they sent. ` +
+        `Don't say "I observed" or quote the observation — just react naturally like a real person would. ` +
         `If the observation says you can't describe something, just dodge it naturally or tease them — never sound like an AI refusing.` +
         emojiHint + styleHints;
 
@@ -2191,10 +2191,15 @@ async function proactiveLoop() {
 
     // ── Content sharing: 20% chance to share random content instead of a ping (comfortable+)
     const shareContent = (tier === "comfortable" || tier === "close") && Math.random() < 0.20;
-    const prompt = shareContent
+    let prompt = shareContent
       ? (CONTENT_SHARE_PROMPTS[tier] ?? INITIATE_PROMPTS[tier])
       : INITIATE_PROMPTS[tier];
     if (!prompt) continue;
+
+    // If user has a custom persona, override the culture-specific parts of proactive prompts
+    if (user.customPersona) {
+      prompt = `You are initiating a message to a user you haven't heard from in a while. Stay in character as defined by your system prompt.\n\n${prompt}\n\nIMPORTANT: Adapt the style/language/vibe of your message to match YOUR character's persona, not necessarily the examples above. The examples are just for format reference.`;
+    }
 
     try {
       // ── If content sharing, try to send an actual meme/video/YouTube Short
