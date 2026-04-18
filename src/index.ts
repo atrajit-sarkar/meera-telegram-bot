@@ -2260,8 +2260,32 @@ async function proactiveLoop() {
 
 console.log(`Starting ${botName} Telegram bot...`);
 
-bot.launch().then(() => {
+bot.launch().then(async () => {
   console.log(`🤖 ${botName} Telegram bot is running!`);
+
+  // Register commands so Telegram shows autocomplete suggestions when user types /
+  await bot.telegram.setMyCommands([
+    { command: "profile", description: "Your profile" },
+    { command: "setname", description: "Set your name" },
+    { command: "setbio", description: "Set your bio" },
+    { command: "tone", description: "Change tone (casual/formal)" },
+    { command: "replies_short", description: "Short replies" },
+    { command: "replies_medium", description: "Medium replies" },
+    { command: "replies_long", description: "Long replies" },
+    { command: "talk", description: "Toggle voice-only mode" },
+    { command: "clear", description: "Reset conversation" },
+    { command: "addstickers", description: "Add a sticker pack" },
+    { command: "stickers", description: "List sticker packs" },
+    { command: "removestickers", description: "Remove a sticker pack" },
+    { command: "addkey", description: "Add your Ollama API key" },
+    { command: "keys", description: "List your API keys" },
+    { command: "removekey", description: "Remove an API key" },
+    { command: "persona", description: "Customize AI personality" },
+    { command: "viewpersona", description: "View your custom persona" },
+    { command: "resetpersona", description: "Reset to default persona" },
+    { command: "help", description: "Show all commands" },
+  ]).catch((e) => console.warn("Failed to set bot commands:", e));
+
   // Check for proactive messages every 5 minutes
   setInterval(() => proactiveLoop().catch(console.error), 5 * 60 * 1000);
 }).catch((err) => {
