@@ -303,19 +303,28 @@ export async function getRandomYouTubeShort(userId: number): Promise<ContentPost
 /** Get any type of content — meme, Reddit video, or YouTube Short */
 export async function getRandomContentAny(userId: number): Promise<ContentPost | null> {
   const roll = Math.random();
+  let post: ContentPost | null = null;
+
   if (roll < 0.50) {
     // 50% — image meme
-    return getRandomMeme(userId);
+    post = await getRandomMeme(userId);
   } else if (roll < 0.75) {
     // 25% — Reddit video
-    return getRandomFunnyVideo(userId) ?? getRandomMeme(userId);
+    post = await getRandomFunnyVideo(userId) ?? await getRandomMeme(userId);
   } else {
     // 25% — YouTube Short (if API key available)
     if (YT_API_KEY) {
-      return getRandomYouTubeShort(userId) ?? getRandomMeme(userId);
+      post = await getRandomYouTubeShort(userId);
     }
-    return getRandomMeme(userId);
+    if (!post) post = await getRandomMeme(userId);
   }
+
+  // If Reddit is down, fall back to YouTube Shorts
+  if (!post && YT_API_KEY) {
+    post = await getRandomYouTubeShort(userId);
+  }
+
+  return post;
 }
 
 /**

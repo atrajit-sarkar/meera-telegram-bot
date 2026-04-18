@@ -1966,6 +1966,7 @@ async function handleTextMessage(
   // (detection ran in parallel with read delay, result was used for prompt hints above)
   const contentResult = await contentResultPromise;
   if (contentResult) {
+    console.log(`[Content] Will share content for ${userId}: reason=${contentResult.reason}, query=${contentResult.searchQuery ?? "none"}`);
     // Small delay — she replied first, now "finds" the content
     const shareDelay = contentResult.reason === "asked"
       ? 1500 + Math.random() * 2000      // Quick when asked
@@ -1986,6 +1987,8 @@ async function handleTextMessage(
           await ctx.sendChatAction("typing").catch(() => {});
           await new Promise((r) => setTimeout(r, 800 + Math.random() * 1200));
           await sendContentToChat(ctx, userId, post, contentResult.reason);
+        } else {
+          console.log(`[Content] No content found for ${userId} (reason=${contentResult.reason}) — all sources returned null`);
         }
       } catch (err) {
         console.error(`[Content] Mid-chat share failed for ${userId}:`, err);
