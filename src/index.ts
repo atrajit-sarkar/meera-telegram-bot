@@ -90,8 +90,19 @@ function typingIndicator(ctx: Context, action: "typing" | "record_voice" = "typi
 /** Simulate typing delay based on message length */
 function typingDelay(text: string): number {
   const words = text.split(/\s+/).length;
-  const base = 1000 + Math.random() * 2000;
-  return Math.min(base + words * 50, 5000);
+  // Base: 1.5-3.5s + ~80ms per word, capped at 6s
+  const base = 1500 + Math.random() * 2000;
+  return Math.min(base + words * 80, 6000);
+}
+
+/** Simulate "reading" the message before typing — real girls don't start typing instantly */
+function readDelay(userMessage: string): number {
+  const len = userMessage.length;
+  // Short messages: 0.5-1.5s read time
+  // Longer messages: up to 3s
+  const base = 500 + Math.random() * 1000;
+  const extra = Math.min(len * 15, 1500);
+  return base + extra;
 }
 
 /** Download a Telegram file by file_id and return its Buffer */
@@ -566,11 +577,18 @@ async function handleTextMessage(ctx: Context & { message: { text: string } }) {
 
   if (useVoice) {
     // Voice reply via Gemini Live
-    const stopTyping = typingIndicator(ctx, "record_voice");
     try {
+      // Simulate reading the message first (no indicator yet)
+      const readTime = readDelay(text);
+      await new Promise((r) => setTimeout(r, readTime));
+
+      // Now start "recording voice"
+      const stopTyping = typingIndicator(ctx, "record_voice");
       sessions.resetSession(userId);
       const session = await sessions.getSession(userId);
       const response = await session.send([{ text }]);
+
+      stopTyping();
       await sendGeminiResponse(ctx, response);
 
       // Save to Ollama history
@@ -587,13 +605,16 @@ async function handleTextMessage(ctx: Context & { message: { text: string } }) {
       console.error("[Bot] Gemini voice error:", err);
       sessions.resetSession(userId);
       await ctx.reply("wait something messed up lol try again");
-    } finally {
-      stopTyping();
     }
   } else {
     // Text reply via Ollama
-    const stopTyping = typingIndicator(ctx, "typing");
     try {
+      // Simulate reading the message first (no typing indicator yet)
+      const readTime = readDelay(text);
+      await new Promise((r) => setTimeout(r, readTime));
+
+      // Now start "typing"
+      const stopTyping = typingIndicator(ctx, "typing");
       const user = store.getUser(userId);
       const history = store.getRecentHistory(userId);
       const messages = buildOllamaMessages(text, history, tier, user);
@@ -604,9 +625,11 @@ async function handleTextMessage(ctx: Context & { message: { text: string } }) {
       store.addMessage(userId, "user", text);
       store.addMessage(userId, "assistant", reply);
 
-      // Simulate typing delay
+      // Simulate typing delay (on top of however long Ollama took)
       const delay = typingDelay(reply);
-      await new Promise((r) => setTimeout(r, Math.min(delay, 3000)));
+      await new Promise((r) => setTimeout(r, Math.min(delay, 4000)));
+
+      stopTyping();
 
       // Send reply
       await sendText(ctx, reply);
@@ -616,8 +639,6 @@ async function handleTextMessage(ctx: Context & { message: { text: string } }) {
     } catch (err) {
       console.error("[Bot] Ollama error:", err);
       await ctx.reply("omg my brain just glitched 😭 say that again?");
-    } finally {
-      stopTyping();
     }
   }
 }
