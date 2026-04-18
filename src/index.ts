@@ -1791,6 +1791,27 @@ async function handleTextMessage(
     ? `\n\n(The user sent ${batchedTexts!.length} messages in quick succession. Address ALL of them naturally in one reply — don't ignore any. Their messages were:\n${batchedTexts!.map((t, i) => `${i + 1}. "${t}"`).join("\n")}\n)`
     : "";
 
+  // ── Content detection: start EARLY so we know before generating the voice/text reply
+  // This runs in parallel with typing delays so it doesn't add latency
+  const regexResult = shouldShareContentMidChat(tier, text, mood, history);
+  const contentDetectionPromise = (tier === "comfortable" || tier === "close")
+    ? detectContentRequest(ollamaConfig, text, history, {
+        personaHint: store.getUser(userId).customPersona?.slice(0, 500),
+      }).catch(() => ({ wantsContent: false as const }))
+    : Promise.resolve(null);
+
+  // Build the content hint — we'll await this before generating the reply
+  const contentResultPromise = contentDetectionPromise.then((aiResult) => {
+    const aiWants = aiResult && aiResult.wantsContent;
+    const regexWants = regexResult.shouldShare;
+    if (!aiWants && !regexWants) return null;
+    return {
+      reason: (aiWants ? "asked" : regexResult.reason) as "asked" | "vibe" | "random",
+      searchQuery: aiWants && aiResult.wantsContent ? aiResult.searchQuery : undefined,
+      contentType: aiWants && aiResult.wantsContent ? aiResult.contentType : undefined as any,
+    };
+  });
+
   if (useVoice) {
     // Voice reply via Gemini Live
     let stopTyping = () => {};
@@ -1798,11 +1819,20 @@ async function handleTextMessage(
       const readTime = readDelay(text) * todMultiplier * paceMult;
       await new Promise((r) => setTimeout(r, readTime));
 
+      // Wait for content detection to resolve (it ran in parallel with readDelay)
+      const contentResult = await contentResultPromise;
+
+      // If user is asking for content, tell Gemini so it doesn't refuse
+      let contentHint = "";
+      if (contentResult) {
+        contentHint = "\n\n(IMPORTANT: The user is asking you to share content/meme/reel/video. You ARE able to send them content — it will be sent automatically after your voice reply. So DON'T say you can't send videos or reels. Instead, acknowledge naturally like 'okay wait let me find one', 'hold on', 'chal dhundhti hu', 'ruk ekta pathachhi', etc. Keep it short and natural — the content will follow your voice reply.)";
+      }
+
       stopTyping = typingIndicator(ctx, "record_voice");
       sessions.resetSession(userId);
       const session = await sessions.getSession(userId);
       const response = await session.send([{
-        text: replyContext + (gapContext ? gapContext + "\n\n" : "") + batchHint + lengthHint + text
+        text: replyContext + (gapContext ? gapContext + "\n\n" : "") + batchHint + lengthHint + contentHint + text
       }]);
 
       stopTyping();
@@ -1866,8 +1896,17 @@ async function handleTextMessage(
       const readTime = readDelay(text) * todMultiplier * paceMult;
       await new Promise((r) => setTimeout(r, readTime));
 
+      // Wait for content detection (ran in parallel with readDelay)
+      const contentResult = await contentResultPromise;
+
       stopTyping = typingIndicator(ctx, "typing");
       const user = store.getUser(userId);
+
+      // If user is asking for content, hint Ollama to acknowledge naturally
+      let contentHint = "";
+      if (contentResult) {
+        contentHint = "\n\n(The user wants you to share a meme/reel/video. You CAN and WILL send them one — it happens automatically after your reply. So DON'T say you can't. Just acknowledge naturally like 'ruk dhundhti hu', 'hold on let me find one', 'wait pathachhi', 'ok dekh' — keep it short, the content follows right after.)";
+      }
 
       // Build message with all context hints
       const userMsg = replyContext
@@ -1876,6 +1915,7 @@ async function handleTextMessage(
         + lengthHint
         + styleHints
         + emojiHint
+        + contentHint
         + "\n\n" + text;
       const messages = buildOllamaMessages(userMsg, history, tier, user, mood);
 
@@ -1922,51 +1962,36 @@ async function handleTextMessage(
     }
   }
 
-  // ── Mid-chat content sharing: AI decides if user wants content + generates search query
-  // Run AI detection and regex fallback in parallel with the reply
-  const contentDetectionPromise = (tier === "comfortable" || tier === "close")
-    ? detectContentRequest(ollamaConfig, text, history, {
-        personaHint: store.getUser(userId).customPersona?.slice(0, 500),
-      }).catch(() => ({ wantsContent: false as const }))
-    : Promise.resolve(null);
-
-  // Also keep regex as a fast fallback for obvious patterns
-  const regexResult = shouldShareContentMidChat(tier, text, mood, history);
-
-  contentDetectionPromise.then(async (aiResult) => {
-    const aiWants = aiResult && aiResult.wantsContent;
-    const regexWants = regexResult.shouldShare;
-
-    if (!aiWants && !regexWants) return;
-
-    const reason: "asked" | "vibe" | "random" = aiWants ? "asked" : regexResult.reason;
-
-    // Small delay — she replies first, then "finds" the content
-    const shareDelay = reason === "asked"
+  // ── Mid-chat content sharing: use the already-resolved content detection result
+  // (detection ran in parallel with read delay, result was used for prompt hints above)
+  const contentResult = await contentResultPromise;
+  if (contentResult) {
+    // Small delay — she replied first, now "finds" the content
+    const shareDelay = contentResult.reason === "asked"
       ? 1500 + Math.random() * 2000      // Quick when asked
       : 3000 + Math.random() * 5000;     // Natural delay when spontaneous
 
-    await new Promise((r) => setTimeout(r, shareDelay));
+    setTimeout(async () => {
+      try {
+        let post: ContentPost | null = null;
 
-    try {
-      let post: ContentPost | null = null;
+        // Use AI-generated search query for better relevance
+        if (contentResult.searchQuery) {
+          post = await getContentByAIQuery(userId, contentResult.searchQuery, contentResult.contentType);
+        } else {
+          post = await getRandomContentAny(userId);
+        }
 
-      // Use AI-generated search query for better relevance
-      if (aiWants && aiResult.wantsContent) {
-        post = await getContentByAIQuery(userId, aiResult.searchQuery, aiResult.contentType);
-      } else {
-        post = await getRandomContentAny(userId);
+        if (post) {
+          await ctx.sendChatAction("typing").catch(() => {});
+          await new Promise((r) => setTimeout(r, 800 + Math.random() * 1200));
+          await sendContentToChat(ctx, userId, post, contentResult.reason);
+        }
+      } catch (err) {
+        console.error(`[Content] Mid-chat share failed for ${userId}:`, err);
       }
-
-      if (post) {
-        await ctx.sendChatAction("typing").catch(() => {});
-        await new Promise((r) => setTimeout(r, 800 + Math.random() * 1200));
-        await sendContentToChat(ctx, userId, post, reason);
-      }
-    } catch (err) {
-      console.error(`[Content] Mid-chat share failed for ${userId}:`, err);
-    }
-  });
+    }, shareDelay);
+  }
 }
 
 /** Decide if Meera voice-replies to media — slightly higher chance since media is more expressive */
