@@ -660,6 +660,36 @@ async function sendGeminiResponse(ctx: Context, response: GeminiResponse, replyT
   }
 }
 
+// AI refusal patterns — if Gemini's transcription contains these, it's a safety block
+const AI_REFUSAL_PATTERNS = [
+  /i can'?t help (you )?with that/i,
+  /i'?m not able to/i,
+  /i cannot (assist|help|provide|generate|create)/i,
+  /as an ai/i,
+  /i'?m (just )?an ai/i,
+  /i don'?t feel comfortable/i,
+  /not appropriate/i,
+  /i'?m sorry,? but i (can'?t|cannot)/i,
+  /i'?m unable to/i,
+  /against my (guidelines|policies|programming)/i,
+  /i (can'?t|cannot|won'?t) (do|say|engage|respond|discuss) that/i,
+  /let'?s (talk|chat) about something else/i,
+  /i'?m designed to be helpful/i,
+  /safety (guidelines|policies|concerns)/i,
+];
+
+/** Check if a Gemini response is blocked or contains AI-refusal language */
+function isGeminiBlocked(response: GeminiResponse): boolean {
+  // Case 1: completely empty — both audio and text missing
+  if (response.audioChunks.length === 0 && !response.text.trim()) return true;
+
+  // Case 2: has audio but the transcription text reveals a refusal
+  const text = response.text.trim();
+  if (text && AI_REFUSAL_PATTERNS.some((p) => p.test(text))) return true;
+
+  return false;
+}
+
 /** Send text with Markdown fallback, optionally quoting a message */
 async function sendText(ctx: Context, text: string, replyToMsgId?: number): Promise<any> {
   const chunks: string[] = [];
@@ -1730,6 +1760,38 @@ async function handleTextMessage(
       }]);
 
       stopTyping();
+
+      // Check if Gemini blocked/refused the response
+      if (isGeminiBlocked(response)) {
+        console.log(`[Bot] Gemini blocked voice for user ${userId}, falling back to Ollama text`);
+        sessions.resetSession(userId);
+
+        // Fall back to Ollama text — naturally dodge the topic
+        const stopTyping2 = typingIndicator(ctx, "typing");
+        const user = store.getUser(userId);
+        const userMsg = replyContext
+          + (gapContext ? gapContext + "\n\n" : "")
+          + batchHint + lengthHint + styleHints + emojiHint
+          + "\n\n" + text;
+        const messages = buildOllamaMessages(userMsg, history, tier, user, mood);
+        let reply = await callOllamaWithRotation(ollamaConfig, messages, user.ollamaKeys);
+        reply = addDeliberateTypos(reply, mood);
+
+        if (isBatched) {
+          for (const t of batchedTexts!) store.addMessage(userId, "user", t);
+        } else {
+          store.addMessage(userId, "user", text);
+        }
+        store.addMessage(userId, "assistant", reply);
+
+        const delay = typingDelay(reply) * timeOfDayMultiplier();
+        await new Promise((r) => setTimeout(r, Math.min(delay, 6000)));
+        stopTyping2();
+        await sendAsBubbles(ctx, reply, quoteReplyId);
+        maybeSendSticker(ctx, userId, reply).catch(() => {});
+        return;
+      }
+
       await sendGeminiResponse(ctx, response, quoteReplyId);
 
       // Save to history
@@ -1918,21 +1980,31 @@ async function handleMediaMessage(
     const response = await session.send(parts as any);
 
     if (useAudio) {
-      // Comfortable+ → send audio response directly from Gemini Live
-      await sendGeminiResponse(ctx, response, quoteReplyId);
+      // Check if Gemini blocked/refused the response
+      if (isGeminiBlocked(response)) {
+        console.log(`[Bot] Gemini blocked media voice for user ${userId}, falling back to Ollama text`);
+        sessions.resetSession(userId);
+        // Fall through to text path instead of sending refusal audio
+      } else {
+        // Comfortable+ → send audio response directly from Gemini Live
+        await sendGeminiResponse(ctx, response, quoteReplyId);
 
-      // Save to history
-      store.addMessage(userId, "user", "[sent media]");
-      if (response.text.trim()) {
-        store.addMessage(userId, "assistant", response.text);
-      }
+        // Save to history
+        store.addMessage(userId, "user", "[sent media]");
+        if (response.text.trim()) {
+          store.addMessage(userId, "assistant", response.text);
+        }
 
-      // Maybe send a sticker after
-      if (response.text.trim()) {
-        maybeSendSticker(ctx, userId, response.text).catch(() => {});
+        // Maybe send a sticker after
+        if (response.text.trim()) {
+          maybeSendSticker(ctx, userId, response.text).catch(() => {});
+        }
+        return; // Done — audio was sent successfully
       }
-    } else {
-      // Text response → rephrase Gemini's raw output through Ollama for natural girl tone
+    }
+
+    {
+      // Text response → rephrase Gemini's raw output through Ollama for natural tone
       const geminiRaw = response.text.trim() || "I see it";
       const user = store.getUser(userId);
       const history = store.getRecentHistory(userId);
