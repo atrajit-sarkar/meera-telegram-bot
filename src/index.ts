@@ -35,9 +35,6 @@ import {
   shouldSendSelfie,
 } from "./image-gen.js";
 import { MeeraImageStore } from "./meera-image-store.js";
-import * as fs from "node:fs";
-import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import type { Context } from "telegraf";
 import type { GeminiResponse } from "./gemini-session.js";
 
@@ -79,13 +76,6 @@ const store = new UserStore(50, FIREBASE_DB_ID);
 
 // Community Meera image database (shares Firestore instance via store)
 const meeraImages = new MeeraImageStore(store.getDb());
-
-// Reference image path for contribute face
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const MEERA_REFERENCE_IMAGE = path.resolve(__dirname, "..", "MeeraAI.jpg");
-console.log(`[Init] __dirname = ${__dirname}`);
-console.log(`[Init] MEERA_REFERENCE_IMAGE = ${MEERA_REFERENCE_IMAGE}`);
-console.log(`[Init] MeeraAI.jpg exists = ${fs.existsSync(MEERA_REFERENCE_IMAGE)}`);
 
 // Gemini Live sessions — for image/audio/video (uses per-user persona)
 const sessions = new SessionManager((userId: number) => {
@@ -1139,22 +1129,21 @@ bot.command("removeimagecontribution", async (ctx) => {
 // ── MEERA FACE CONTRIBUTION COMMANDS ────────────────────────────────
 
 bot.command("contributeface", async (ctx) => {
-  // Send the reference image + instructions
+  // Send the reference image via GitHub raw URL + instructions
   try {
-    if (!fs.existsSync(MEERA_REFERENCE_IMAGE)) {
-      await ctx.reply("⚠️ Reference image not found. Please contact the bot admin.");
-      return;
-    }
+    const referenceUrl = "https://raw.githubusercontent.com/hrisav-sarkar/meera-telegram-bot/master/MeeraAI.jpg";
     await ctx.replyWithPhoto(
-      { source: fs.createReadStream(MEERA_REFERENCE_IMAGE) },
+      { url: referenceUrl },
       {
         caption:
-          "👆 This is Meera's reference photo.\n\n" +
+          "👆 This is Meera's reference photo\\.\n\n" +
+          "📥 *Download it here:* [MeeraAI\\.jpg](https://raw.githubusercontent.com/hrisav\\-sarkar/meera\\-telegram\\-bot/master/MeeraAI\\.jpg)\n\n" +
           "📸 *How to contribute:*\n" +
-          "1\\. Use an AI image generator \\(like Grok, Midjourney, etc\\.\\) with this photo as reference\n" +
-          "2\\. Generate images of Meera in different poses, outfits, moods, settings\n" +
-          "3\\. Send /uploadface to start uploading\n" +
-          "4\\. Send each image ONE AT A TIME with a caption describing the photo\n\n" +
+          "1\\. Download the reference photo above\n" +
+          "2\\. Use an AI image generator \\(like Grok, Midjourney, etc\\.\\) with this photo as reference\n" +
+          "3\\. Generate images of Meera in different poses, outfits, moods, settings\n" +
+          "4\\. Send /uploadface to start uploading\n" +
+          "5\\. Send each image ONE AT A TIME with a caption describing the photo\n\n" +
           "💡 *Caption tips:*\n" +
           "• Describe the pose, mood, setting, outfit, time of day\n" +
           "• Example: _\"Meera smiling in a cafe, holding coffee, casual outfit, warm afternoon light\"_\n" +
