@@ -3621,47 +3621,80 @@ bot.on("poll_answer", async (ctx) => {
 
   const chosenText = chosenOptions.join(", ");
 
-  // Log to history so the bot has context
+  // Log to history so Meera has context
   store.addMessage(poll.userId, "user", `[poll answer: chose "${chosenText}" for "${poll.question}"]`);
   console.log(`[PollAnswer] User ${userId} chose "${chosenText}" for "${poll.question}"`);
 
-  // Generate a natural reaction to their answer
+  // Let Ollama decide naturally whether to react and what to say
   try {
     const user = store.getUser(poll.userId);
     const tier = store.getComfortTier(poll.userId);
     const mood = store.getMood(poll.userId);
     const history = store.getRecentHistory(poll.userId);
 
-    const reactionPrompt = `You sent a poll asking: "${poll.question}" with options: ${poll.options.map((o, i) => `${i + 1}. ${o}`).join(", ")}.
+    // Feed it like a normal conversation — Ollama decides the response naturally
+    const userMsg = `[The user just answered your poll "${poll.question}" — they chose "${chosenText}"]`;
+    const messages = buildOllamaMessages(userMsg, history, tier, user, mood);
+    const behavior = await decideResponseBehavior(ollamaConfig, userMsg, history, {
+      tier,
+      mood,
+      timeOfDay: `${getISTHour()} IST`,
+      personaHint: user.customPersona?.slice(0, 500),
+    });
 
-The user picked: "${chosenText}".
+    // Ollama decides: maybe she ignores it, delays, or reacts
+    if (behavior.action === "leave_on_read") {
+      console.log(`[PollAnswer] Meera left poll answer on read for user ${userId}`);
+      activePolls.delete(pollId);
+      return;
+    }
 
-React to their choice naturally like a real person would — tease them, agree, be dramatic, be judgmental in a fun way, etc. Keep it SHORT (1-2 lines max). Examples of vibes:
-- "REALLY?? that one?? 😭"
-- "okay taste 👀"
-- "knew it lol"
-- "umm wrong answer but ok"
-- "yesss that's what I would've picked too!!"
-- "bro no way 💀"
-Match the conversation language. Be natural.`;
+    if (behavior.action === "delay_reply") {
+      console.log(`[PollAnswer] Meera will react to poll later for user ${userId} (${behavior.delayMinutes}min)`);
+      const delayMs = behavior.delayMinutes * 60 * 1000;
+      setTimeout(async () => {
+        try {
+          const freshHistory = store.getRecentHistory(poll.userId);
+          const freshUser = store.getUser(poll.userId);
+          const freshMood = store.getMood(poll.userId);
+          const freshTier = store.getComfortTier(poll.userId);
+          const msgs = buildOllamaMessages(userMsg, freshHistory, freshTier, freshUser, freshMood);
+          let reply = await ollamaChat(msgs, freshUser.ollamaKeys);
+          reply = addDeliberateTypos(reply, freshMood);
+          await bot.telegram.sendChatAction(poll.chatId, "typing");
+          await new Promise(r => setTimeout(r, typingDelay(reply)));
+          await bot.telegram.sendMessage(poll.chatId, reply);
+          store.addMessage(poll.userId, "assistant", reply);
+        } catch {}
+      }, delayMs);
+      activePolls.delete(pollId);
+      return;
+    }
 
-    const messages = buildOllamaMessages(reactionPrompt, history, tier, user, mood);
+    if (behavior.action === "emoji_only") {
+      await new Promise(r => setTimeout(r, 2000 + Math.random() * 3000));
+      await bot.telegram.sendMessage(poll.chatId, behavior.emoji);
+      store.addMessage(poll.userId, "assistant", behavior.emoji);
+      activePolls.delete(pollId);
+      return;
+    }
+
+    // Normal reply — let Ollama generate naturally
     let reply = await ollamaChat(messages, user.ollamaKeys);
-    reply = reply.replace(/^["']|["']$/g, "").trim();
-    if (!reply || reply.length > 300) return;
+    reply = addDeliberateTypos(reply, mood);
+    if (!reply || reply.length > 300) { activePolls.delete(pollId); return; }
 
-    // Small delay — like she's processing the answer
-    await new Promise(r => setTimeout(r, 2000 + Math.random() * 4000));
-
+    // Natural delay
+    await new Promise(r => setTimeout(r, 3000 + Math.random() * 5000));
     await bot.telegram.sendChatAction(poll.chatId, "typing");
-    await new Promise(r => setTimeout(r, 800 + Math.random() * 1500));
+    await new Promise(r => setTimeout(r, typingDelay(reply)));
     await bot.telegram.sendMessage(poll.chatId, reply);
     store.addMessage(poll.userId, "assistant", reply);
   } catch (err) {
-    console.error(`[PollAnswer] Failed to react for user ${userId}:`, err);
+    console.error(`[PollAnswer] Failed for user ${userId}:`, err);
   }
 
-  // Clean up — poll answered
+  // Clean up
   activePolls.delete(pollId);
 });
 
