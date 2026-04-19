@@ -26,6 +26,14 @@ import {
 } from "./ollama-service.js";
 import { UserStore } from "./user-store.js";
 import { getRandomContentAny, getContentByAIQuery, shouldShareContentMidChat, type ContentPost } from "./reddit-memes.js";
+import {
+  generateImage,
+  generateUserSeed,
+  buildCharacterDescription,
+  parseGenderFromPersona,
+  pickSelfieScenario,
+  shouldSendSelfie,
+} from "./image-gen.js";
 import type { Context } from "telegraf";
 import type { GeminiResponse } from "./gemini-session.js";
 
@@ -1641,6 +1649,90 @@ async function sendContentToChat(
   }
 }
 
+/**
+ * Generate and send a selfie image to a user.
+ * Uses Stability AI with per-user seed for consistent face.
+ */
+async function sendSelfieToChat(
+  ctx: Context,
+  userId: number,
+  reason: "asked" | "vibe" | "spontaneous",
+): Promise<boolean> {
+  const user = store.getUser(userId);
+  const mood = store.getMood(userId);
+
+  // Ensure user has a stable seed
+  let seed = user.imageSeed;
+  if (!seed) {
+    seed = generateUserSeed(userId);
+    store.updateUser(userId, { imageSeed: seed });
+  }
+
+  // Rate limit: max 1 selfie per 10 minutes
+  const now = Date.now();
+  if (user.lastSelfieSent && now - user.lastSelfieSent < 10 * 60 * 1000) {
+    console.log(`[ImageGen] Rate limited for user ${userId} — last selfie was ${Math.round((now - user.lastSelfieSent) / 1000)}s ago`);
+    return false;
+  }
+
+  // Build character description (consistent face)
+  const charDesc = buildCharacterDescription(user.customPersona);
+  const scenario = pickSelfieScenario(mood);
+
+  // Generate the image
+  const result = await generateImage(
+    charDesc,
+    scenario.prompt,
+    seed,
+    scenario.aspectRatio,
+    scenario.style,
+  );
+
+  if (!result) return false;
+
+  // Generate a natural caption via Ollama
+  let caption: string;
+  try {
+    const tier = store.getComfortTier(userId);
+    const gender = parseGenderFromPersona(user.customPersona);
+    const captionPrompt = reason === "asked"
+      ? `You're a ${gender === "girl" ? "girl" : "guy"} sending a selfie that was requested. The photo shows: ${scenario.prompt.slice(0, 100)}. Write a very short casual caption (1 line, max 10 words) in your style. Maybe add an emoji. Don't describe the photo literally. Be natural like real texting.`
+      : reason === "vibe"
+      ? `You're a ${gender === "girl" ? "girl" : "guy"} sending a selfie because the conversation vibes are good. The photo shows: ${scenario.prompt.slice(0, 100)}. Write a super short casual caption (1 line, max 8 words) — maybe like "me rn", "current situation", or something playful. Don't be cringe.`
+      : `You're a ${gender === "girl" ? "girl" : "guy"} spontaneously sending a selfie to someone you're close with. The photo shows: ${scenario.prompt.slice(0, 100)}. Write a very short casual caption (1 line, max 8 words) — natural and low effort like "vibes", "bored lol", "hi" with an emoji. Don't explain why you're sending it.`;
+
+    const messages: OllamaMessage[] = [
+      { role: "system", content: user.customPersona || `You are ${botName}. Reply with just the caption, nothing else.` },
+      { role: "user", content: captionPrompt },
+    ];
+    caption = await ollamaChat(messages, user.ollamaKeys);
+    // Clean: remove quotes and extra whitespace
+    caption = caption.replace(/^["']|["']$/g, "").trim();
+    if (caption.length > 100) caption = caption.slice(0, 100);
+  } catch {
+    const fallbacks = reason === "asked"
+      ? ["here u go 📸", "for u", "le 😊", "👀✨"]
+      : ["me rn", "vibes", "👋", "hi lol", "🤳", "bored hehe"];
+    caption = fallbacks[Math.floor(Math.random() * fallbacks.length)];
+  }
+
+  try {
+    await ctx.sendChatAction("upload_photo").catch(() => {});
+    await (ctx as any).telegram.sendPhoto(ctx.chat!.id, { source: result.imageBuffer }, { caption });
+
+    store.addMessage(userId, "assistant", `[selfie: ${scenario.prompt.slice(0, 50)}] ${caption}`);
+    store.updateUser(userId, {
+      lastSelfieSent: now,
+      selfiesSent: (user.selfiesSent ?? 0) + 1,
+    });
+    console.log(`[ImageGen] Sent selfie to user ${userId} (${reason}), seed=${seed}`);
+    return true;
+  } catch (err) {
+    console.error(`[ImageGen] Failed to send selfie to ${userId}:`, err);
+    return false;
+  }
+}
+
 /** Handle text messages — Meera decides naturally when to voice vs text
  *  When batching is active, `batchedTexts` contains all messages in the batch.
  *  `ctx` is from the LAST message in the batch (most recent).
@@ -1812,6 +1904,9 @@ async function handleTextMessage(
     };
   });
 
+  // ── Selfie detection: should Meera send a photo of herself?
+  const selfieDecision = shouldSendSelfie(tier, mood, text, history);
+
   if (useVoice) {
     // Voice reply via Gemini Live
     let stopTyping = () => {};
@@ -1827,12 +1922,19 @@ async function handleTextMessage(
       if (contentResult) {
         contentHint = "\n\n(IMPORTANT: The user is asking you to share content/meme/reel/video. You ARE able to send them content — it will be sent automatically after your voice reply. So DON'T say you can't send videos or reels. Instead, acknowledge naturally like 'okay wait let me find one', 'hold on', 'chal dhundhti hu', 'ruk ekta pathachhi', etc. Keep it short and natural — the content will follow your voice reply.)";
       }
+      // If Meera will send a selfie, hint so she acknowledges it naturally
+      let selfieHint = "";
+      if (selfieDecision.shouldSend) {
+        selfieHint = selfieDecision.reason === "asked"
+          ? "\n\n(The user is asking for a pic/selfie/photo. You WILL send one — it will be attached after your voice reply. Acknowledge naturally like 'okay hold on', 'fine fine here', 'ruk ektu', 'accha ruk' — don't say you can't send photos. Keep it short and natural.)"
+          : "\n\n(You're about to send a selfie spontaneously — it will appear after your voice reply. You can briefly hint at it like 'look at me rn lol' or 'btw' or just continue the conversation normally. Don't make a big deal of it.)";
+      }
 
       stopTyping = typingIndicator(ctx, "record_voice");
       sessions.resetSession(userId);
       const session = await sessions.getSession(userId);
       const response = await session.send([{
-        text: replyContext + (gapContext ? gapContext + "\n\n" : "") + batchHint + lengthHint + contentHint + text
+        text: replyContext + (gapContext ? gapContext + "\n\n" : "") + batchHint + lengthHint + contentHint + selfieHint + text
       }]);
 
       stopTyping();
@@ -1908,6 +2010,14 @@ async function handleTextMessage(
         contentHint = "\n\n(The user wants you to share a meme/reel/video. You CAN and WILL send them one — it happens automatically after your reply. So DON'T say you can't. Just acknowledge naturally like 'ruk dhundhti hu', 'hold on let me find one', 'wait pathachhi', 'ok dekh' — keep it short, the content follows right after.)";
       }
 
+      // If Meera will send a selfie, hint for natural acknowledgement
+      let selfieHint = "";
+      if (selfieDecision.shouldSend && !contentResult) {
+        selfieHint = selfieDecision.reason === "asked"
+          ? "\n\n(The user asked for a pic/selfie. You WILL send one — it happens automatically after your reply. Acknowledge naturally like 'ok wait', 'hold on lol', 'fine fine', 'ruk bhejti hu' — keep it super short, the photo follows right after.)"
+          : "\n\n(You're about to send a selfie spontaneously. You can hint at it briefly like 'look at me rn' or 'btw' or just continue normally. Don't make a big deal of it.)";
+      }
+
       // Build message with all context hints
       const userMsg = replyContext
         + (gapContext ? gapContext + "\n\n" : "")
@@ -1916,6 +2026,7 @@ async function handleTextMessage(
         + styleHints
         + emojiHint
         + contentHint
+        + selfieHint
         + "\n\n" + text;
       const messages = buildOllamaMessages(userMsg, history, tier, user, mood);
 
@@ -1994,6 +2105,27 @@ async function handleTextMessage(
         console.error(`[Content] Mid-chat share failed for ${userId}:`, err);
       }
     }, shareDelay);
+  }
+
+  // ── Selfie sending: if detected, generate and send after reply
+  if (selfieDecision.shouldSend && !contentResult) {
+    // Don't send selfie and content at the same time — content takes priority if both
+    const selfieDelay = selfieDecision.reason === "asked"
+      ? 2000 + Math.random() * 2000     // Quick when explicitly asked
+      : 4000 + Math.random() * 6000;    // Natural delay for vibe/spontaneous
+
+    setTimeout(async () => {
+      try {
+        const sent = await sendSelfieToChat(ctx, userId, selfieDecision.reason);
+        if (!sent && selfieDecision.reason === "asked") {
+          // If user asked but generation failed, apologize naturally
+          await ctx.reply("ugh my camera's being weird rn 😩 later ok?");
+          store.addMessage(userId, "assistant", "ugh my camera's being weird rn 😩 later ok?");
+        }
+      } catch (err) {
+        console.error(`[ImageGen] Mid-chat selfie failed for ${userId}:`, err);
+      }
+    }, selfieDelay);
   }
 }
 

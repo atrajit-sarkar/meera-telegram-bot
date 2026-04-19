@@ -22,6 +22,9 @@ export interface UserData {
   mood: string;
   lastMoodChange: number;
   customPersona?: string;
+  imageSeed?: number;         // Per-user fixed seed for consistent face generation
+  selfiesSent?: number;       // Track how many selfies sent (for rate limiting)
+  lastSelfieSent?: number;    // Timestamp of last selfie sent
 }
 
 export const MOODS = ["happy", "bored", "clingy", "sassy", "tired", "excited", "chill", "annoyed"] as const;
