@@ -1204,6 +1204,7 @@ bot.command("facepool", async (ctx) => {
 });
 
 bot.command("changedp", async (ctx) => {
+  if (ctx.from?.id !== 7990300718) return;
   try {
     const hasImages = await meeraImages.hasImages();
     if (!hasImages) {
