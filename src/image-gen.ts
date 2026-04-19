@@ -7,6 +7,7 @@
 
 const STABILITY_API_KEY = process.env.STABILITY_API_KEY ?? "";
 const STABILITY_ENDPOINT = "https://api.stability.ai/v2beta/stable-image/generate/ultra";
+const FORCE_SELFIE_DEBUG = process.env.FORCE_SELFIE_DEBUG === "true";
 
 // ── Character description system ────────────────────────────────────
 
@@ -362,6 +363,11 @@ export function shouldSendSelfie(
   ];
 
   if (selfieRequestPatterns.some((p) => p.test(text))) {
+    // Debug mode: bypass tier check, always send when asked
+    if (FORCE_SELFIE_DEBUG) {
+      console.log("[ImageGen][DEBUG] Force selfie mode — bypassing tier check");
+      return { shouldSend: true, reason: "asked" };
+    }
     if (tier === "stranger") return { shouldSend: false, reason: "asked" }; // Too early
     return { shouldSend: true, reason: "asked" };
   }

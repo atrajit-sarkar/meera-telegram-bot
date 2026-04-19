@@ -1668,9 +1668,10 @@ async function sendSelfieToChat(
     store.updateUser(userId, { imageSeed: seed });
   }
 
-  // Rate limit: max 1 selfie per 10 minutes
+  // Rate limit: max 1 selfie per 10 minutes (skip in debug mode)
   const now = Date.now();
-  if (user.lastSelfieSent && now - user.lastSelfieSent < 10 * 60 * 1000) {
+  const forceDebug = process.env.FORCE_SELFIE_DEBUG === "true";
+  if (!forceDebug && user.lastSelfieSent && now - user.lastSelfieSent < 10 * 60 * 1000) {
     console.log(`[ImageGen] Rate limited for user ${userId} — last selfie was ${Math.round((now - user.lastSelfieSent) / 1000)}s ago`);
     return false;
   }
