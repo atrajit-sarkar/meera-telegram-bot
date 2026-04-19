@@ -634,19 +634,20 @@ function shouldQuoteReply(tier: string, userText: string): boolean {
 }
 
 /** Send Gemini's audio-only response */
-async function sendGeminiResponse(ctx: Context, response: GeminiResponse, replyToMsgId?: number) {
+async function sendGeminiResponse(ctx: Context, response: GeminiResponse, replyToMsgId?: number): Promise<number | undefined> {
   const { audioChunks } = response;
   if (audioChunks.length > 0) {
     const wav = pcmToWav(audioChunks);
     const opts: Record<string, unknown> = {};
     if (replyToMsgId) opts.reply_parameters = { message_id: replyToMsgId };
-    await ctx.replyWithVoice({ source: wav, filename: "response.wav" }, opts as any);
-    return;
+    const sent = await ctx.replyWithVoice({ source: wav, filename: "response.wav" }, opts as any);
+    return sent.message_id;
   }
   // Fallback if no audio (shouldn't happen)
   if (response.text.trim()) {
     await sendText(ctx, response.text, replyToMsgId);
   }
+  return undefined;
 }
 
 // AI refusal patterns — if Gemini's transcription contains these, it's a safety block
@@ -1652,14 +1653,39 @@ function getReplyContext(ctx: Context, userId: number): string {
 
   // Get text from the replied-to message
   const replyText = replyMsg.text || replyMsg.caption || "";
-  if (!replyText) return "";
 
   // Figure out who sent the replied-to message
   const botId = (ctx as any).botInfo?.id;
   const isFromBot = replyMsg.from?.id === botId;
   const sender = isFromBot ? "you" : "the user";
 
-  return `(The user is replying to a specific message that ${sender} sent earlier: "${replyText.slice(0, 300)}")\n\n`;
+  if (replyText) {
+    return `(The user is replying to a specific message that ${sender} sent earlier: "${replyText.slice(0, 300)}")\n\n`;
+  }
+
+  // If replied-to message is a voice/audio/video_note, look up transcription from history by msgId
+  if (replyMsg.voice || replyMsg.audio || replyMsg.video_note) {
+    const targetMsgId = replyMsg.message_id;
+    const history = store.getRecentHistory(userId);
+
+    // Try exact match by Telegram message_id first
+    for (let i = history.length - 1; i >= 0; i--) {
+      if (history[i].msgId === targetMsgId) {
+        const content = history[i].content;
+        // Strip the [voice message] or [voice reply] tag to get the transcription
+        const transcribed = content.replace(/^\[voice (?:message|reply)\]\s*/, "").trim();
+        if (transcribed && transcribed !== "[sent voice message]") {
+          return `(The user is replying to a voice message that ${sender} sent earlier. Transcription: "${transcribed.slice(0, 300)}")\n\n`;
+        }
+        break;
+      }
+    }
+
+    // Fallback: we know it's a voice message but couldn't find transcription
+    return `(The user is replying to a voice message that ${sender} sent earlier, but the exact words are unavailable)\n\n`;
+  }
+
+  return "";
 }
 
 // ── RAPID-FIRE MESSAGE BATCHING ─────────────────────────────────────
@@ -2512,7 +2538,7 @@ async function handleTextMessage(
         return;
       }
 
-      await sendGeminiResponse(ctx, response, quoteReplyId);
+      const sentVoiceMsgId = await sendGeminiResponse(ctx, response, quoteReplyId);
 
       // Save to history — tag Gemini's audio response as voice reply
       if (isBatched) {
@@ -2521,7 +2547,7 @@ async function handleTextMessage(
         store.addMessage(userId, "user", text);
       }
       if (response.text.trim()) {
-        store.addMessage(userId, "assistant", `[voice reply] ${response.text}`);
+        store.addMessage(userId, "assistant", `[voice reply] ${response.text}`, sentVoiceMsgId);
       }
 
       if (response.text.trim()) {
@@ -2791,13 +2817,14 @@ async function handleMediaMessage(
         sessions.resetSession(userId);
       } else {
         // Comfortable+ → send audio response directly from Gemini Live
-        await sendGeminiResponse(ctx, response, quoteReplyId);
+        const sentMsgId = await sendGeminiResponse(ctx, response, quoteReplyId);
 
         // Save to history — use input transcription if available, tag as voice
         const userSaid = response.inputTranscription?.trim();
-        store.addMessage(userId, "user", userSaid ? `[voice message] ${userSaid}` : "[sent voice message]");
+        const incomingMsgId = (ctx.message as any).message_id;
+        store.addMessage(userId, "user", userSaid ? `[voice message] ${userSaid}` : "[sent voice message]", incomingMsgId);
         if (response.text.trim()) {
-          store.addMessage(userId, "assistant", `[voice reply] ${response.text}`);
+          store.addMessage(userId, "assistant", `[voice reply] ${response.text}`, sentMsgId);
         }
 
         // Maybe send a sticker after
@@ -2833,7 +2860,8 @@ async function handleMediaMessage(
 
       // Save to history — use input transcription if available, tag as voice
       const userSaid = response.inputTranscription?.trim();
-      store.addMessage(userId, "user", userSaid ? `[voice message] ${userSaid}` : "[sent voice message]");
+      const incomingMsgId = (ctx.message as any).message_id;
+      store.addMessage(userId, "user", userSaid ? `[voice message] ${userSaid}` : "[sent voice message]", incomingMsgId);
       store.addMessage(userId, "assistant", reply);
 
       const delay = typingDelay(reply) * timeOfDayMultiplier();

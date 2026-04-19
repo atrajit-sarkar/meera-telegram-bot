@@ -6,6 +6,7 @@
 export interface OllamaMessage {
   role: "system" | "user" | "assistant";
   content: string;
+  msgId?: number;
 }
 
 export interface OllamaConfig {

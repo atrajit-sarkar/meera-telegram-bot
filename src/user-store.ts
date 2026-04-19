@@ -121,10 +121,11 @@ export class UserStore {
         .orderBy("ts", "asc")
         .get();
       if (!histSnap.empty) {
-        const msgs: OllamaMessage[] = histSnap.docs.map((d) => ({
-          role: d.data().role,
-          content: d.data().content,
-        }));
+        const msgs: OllamaMessage[] = histSnap.docs.map((d) => {
+          const entry: OllamaMessage = { role: d.data().role, content: d.data().content };
+          if (d.data().msgId != null) entry.msgId = d.data().msgId;
+          return entry;
+        });
         this.history.set(userId, msgs);
         console.log(`[UserStore] Loaded ${msgs.length} history messages for user ${userId}`);
       }
@@ -157,13 +158,15 @@ export class UserStore {
     return this.history.get(userId) ?? [];
   }
 
-  addMessage(userId: number, role: "user" | "assistant", content: string) {
+  addMessage(userId: number, role: "user" | "assistant", content: string, msgId?: number) {
     let hist = this.history.get(userId);
     if (!hist) {
       hist = [];
       this.history.set(userId, hist);
     }
-    hist.push({ role, content });
+    const entry: OllamaMessage = { role, content };
+    if (msgId != null) entry.msgId = msgId;
+    hist.push(entry);
 
     // Trim in memory to 2x maxHistory
     if (hist.length > this.maxHistory * 2) {
@@ -264,12 +267,14 @@ export class UserStore {
           .doc(String(userId))
           .collection("history");
         for (let i = 0; i < hist.length; i++) {
-          const docRef = histRef.doc(String(i).padStart(6, "0"));
-          batch.set(docRef, {
+          const doc: Record<string, unknown> = {
             role: hist[i].role,
             content: hist[i].content,
             ts: i,
-          });
+          };
+          if (hist[i].msgId != null) doc.msgId = hist[i].msgId;
+          const docRef = histRef.doc(String(i).padStart(6, "0"));
+          batch.set(docRef, doc);
         }
         await batch.commit();
       }
