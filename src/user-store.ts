@@ -19,6 +19,7 @@ export interface UserData {
   proactiveSent: boolean;
   totalMessages: number;
   ollamaKeys: string[];
+  stabilityKeys: string[];    // Per-user Stability AI API keys
   mood: string;
   lastMoodChange: number;
   customPersona?: string;
@@ -41,6 +42,7 @@ export function defaultUserData(): UserData {
     proactiveSent: false,
     totalMessages: 0,
     ollamaKeys: [],
+    stabilityKeys: [],
     mood: "chill",
     lastMoodChange: 0,
   };
@@ -60,9 +62,11 @@ export class UserStore {
   private saveQueue = new Set<number>();
   private saveTimer: ReturnType<typeof setInterval> | null = null;
 
-  // Community key pool — shared across all users
+  // Community key pools — shared across all users
   private communityKeys: Array<{ key: string; contributedBy: number; contributorName: string; addedAt: number }> = [];
   private communityKeysLoaded = false;
+  private stabilityCommunityKeys: Array<{ key: string; contributedBy: number; contributorName: string; addedAt: number }> = [];
+  private stabilityCommunityKeysLoaded = false;
 
   constructor(maxHistory = 50, databaseId?: string) {
     this.maxHistory = maxHistory;
@@ -386,5 +390,94 @@ export class UserStore {
   /** Get count of community keys */
   getCommunityKeyCount(): number {
     return this.communityKeys.length;
+  }
+
+  // ── STABILITY AI COMMUNITY KEY POOL ─────────────────────────────
+
+  /** Load Stability community keys from Firestore (once) */
+  async loadStabilityCommunityKeys(): Promise<void> {
+    if (this.stabilityCommunityKeysLoaded) return;
+    this.stabilityCommunityKeysLoaded = true;
+    try {
+      const snap = await this.db.collection("stability_community_keys").get();
+      this.stabilityCommunityKeys = snap.docs.map((d) => ({
+        key: d.data().key as string,
+        contributedBy: d.data().contributedBy as number,
+        contributorName: (d.data().contributorName as string) || "",
+        addedAt: d.data().addedAt as number,
+      }));
+      console.log(`[UserStore] Loaded ${this.stabilityCommunityKeys.length} Stability community keys`);
+    } catch (err) {
+      console.error("[UserStore] Failed to load Stability community keys:", err);
+    }
+  }
+
+  /** Check if a Stability key already exists in community pool or user's personal keys */
+  async isStabilityKeyDuplicate(key: string, userId: number): Promise<"community" | "personal" | false> {
+    await this.loadStabilityCommunityKeys();
+    if (this.stabilityCommunityKeys.some((k) => k.key === key)) return "community";
+    const user = this.getUser(userId);
+    if (user.stabilityKeys.includes(key)) return "personal";
+    return false;
+  }
+
+  /** Add a Stability key to the community pool */
+  async addStabilityCommunityKey(key: string, contributedBy: number, contributorName: string): Promise<boolean> {
+    await this.loadStabilityCommunityKeys();
+    if (this.stabilityCommunityKeys.some((k) => k.key === key)) return false;
+    const entry = { key, contributedBy, contributorName, addedAt: Date.now() };
+    this.stabilityCommunityKeys.push(entry);
+    try {
+      await this.db.collection("stability_community_keys").add(entry);
+    } catch (err) {
+      console.error("[UserStore] Failed to save Stability community key:", err);
+    }
+    return true;
+  }
+
+  /** Remove a Stability community key by index */
+  async removeStabilityCommunityKey(index: number, requestedBy: number): Promise<{ removed: boolean; key?: string; notOwner?: boolean }> {
+    await this.loadStabilityCommunityKeys();
+    if (index < 0 || index >= this.stabilityCommunityKeys.length) return { removed: false };
+    const entry = this.stabilityCommunityKeys[index];
+    const adminId = process.env.ADMIN_USER_ID ? parseInt(process.env.ADMIN_USER_ID) : 0;
+    if (entry.contributedBy !== requestedBy && requestedBy !== adminId) {
+      return { removed: false, notOwner: true };
+    }
+    this.stabilityCommunityKeys.splice(index, 1);
+    try {
+      const snap = await this.db.collection("stability_community_keys")
+        .where("key", "==", entry.key)
+        .limit(1)
+        .get();
+      if (!snap.empty) await snap.docs[0].ref.delete();
+    } catch (err) {
+      console.error("[UserStore] Failed to delete Stability community key:", err);
+    }
+    return { removed: true, key: entry.key };
+  }
+
+  /** Get all Stability community keys (shuffled for load distribution) */
+  getStabilityCommunityKeyStrings(): string[] {
+    const keys = this.stabilityCommunityKeys.map((k) => k.key);
+    for (let i = keys.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [keys[i], keys[j]] = [keys[j], keys[i]];
+    }
+    return keys;
+  }
+
+  /** Get Stability community keys info for display */
+  getStabilityCommunityKeysInfo(): Array<{ maskedKey: string; contributedBy: number; contributorName: string }> {
+    return this.stabilityCommunityKeys.map((k) => ({
+      maskedKey: `${k.key.slice(0, 6)}...${k.key.slice(-4)}`,
+      contributedBy: k.contributedBy,
+      contributorName: k.contributorName || "",
+    }));
+  }
+
+  /** Get count of Stability community keys */
+  getStabilityCommunityKeyCount(): number {
+    return this.stabilityCommunityKeys.length;
   }
 }

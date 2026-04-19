@@ -268,53 +268,77 @@ export async function generateImage(
   seed: number,
   aspectRatio: string = "4:5",
   stylePreset?: string,
+  extraKeys: string[] = [],
 ): Promise<ImageGenResult | null> {
-  if (!STABILITY_API_KEY) {
-    console.log("[ImageGen] No STABILITY_API_KEY set, skipping");
+  // Build key list: personal → community → default env key
+  const allKeys = [...extraKeys, STABILITY_API_KEY].filter(Boolean);
+  const seen = new Set<string>();
+  const uniqueKeys = allKeys.filter((k) => {
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+
+  if (uniqueKeys.length === 0) {
+    console.log("[ImageGen] No Stability API keys available, skipping");
     return null;
   }
 
   // Build the full prompt: character description + scene
   const fullPrompt = `Ultra realistic photo, iPhone selfie quality. ${characterDesc}, ${scenePrompt}. Detailed skin texture, natural imperfections, realistic lighting, shot on iPhone 15 Pro, shallow depth of field`;
 
-  // Use FormData to build multipart request
-  const formData = new FormData();
-  formData.append("prompt", fullPrompt);
-  formData.append("negative_prompt", NEGATIVE_PROMPT);
-  formData.append("seed", seed.toString());
-  formData.append("aspect_ratio", aspectRatio);
-  formData.append("output_format", "jpeg");
-  if (stylePreset) {
-    formData.append("style_preset", stylePreset);
-  }
+  console.log(`[ImageGen] Generating image — seed=${seed}, aspect=${aspectRatio}, style=${stylePreset ?? "none"}, keys=${uniqueKeys.length}`);
+  console.log(`[ImageGen] Prompt: ${fullPrompt.slice(0, 120)}...`);
 
-  try {
-    console.log(`[ImageGen] Generating image — seed=${seed}, aspect=${aspectRatio}, style=${stylePreset ?? "none"}`);
-    console.log(`[ImageGen] Prompt: ${fullPrompt.slice(0, 120)}...`);
+  let lastError: string = "";
 
-    const response = await fetch(STABILITY_ENDPOINT, {
-      method: "POST",
-      headers: {
-        "authorization": `Bearer ${STABILITY_API_KEY}`,
-        "accept": "image/*",
-      },
-      body: formData,
-    });
-
-    if (!response.ok) {
-      const errBody = await response.text().catch(() => "unknown");
-      console.error(`[ImageGen] Stability API error ${response.status}: ${errBody}`);
-      return null;
+  for (const apiKey of uniqueKeys) {
+    // Build FormData fresh for each attempt (consumed by fetch)
+    const formData = new FormData();
+    formData.append("prompt", fullPrompt);
+    formData.append("negative_prompt", NEGATIVE_PROMPT);
+    formData.append("seed", seed.toString());
+    formData.append("aspect_ratio", aspectRatio);
+    formData.append("output_format", "jpeg");
+    if (stylePreset) {
+      formData.append("style_preset", stylePreset);
     }
 
-    const buffer = Buffer.from(await response.arrayBuffer());
-    console.log(`[ImageGen] Generated ${buffer.length} bytes`);
+    try {
+      const response = await fetch(STABILITY_ENDPOINT, {
+        method: "POST",
+        headers: {
+          "authorization": `Bearer ${apiKey}`,
+          "accept": "image/*",
+        },
+        body: formData,
+      });
 
-    return { imageBuffer: buffer, seed, prompt: fullPrompt };
-  } catch (err) {
-    console.error("[ImageGen] Generation failed:", err);
-    return null;
+      if (!response.ok) {
+        const errBody = await response.text().catch(() => "unknown");
+        lastError = `${response.status}: ${errBody}`;
+        // Rotate to next key on auth/quota errors
+        if (response.status === 401 || response.status === 403 || response.status === 429) {
+          console.log(`[ImageGen] Key ${apiKey.slice(0, 6)}... failed (${response.status}), trying next...`);
+          continue;
+        }
+        console.error(`[ImageGen] Stability API error ${response.status}: ${errBody}`);
+        return null;
+      }
+
+      const buffer = Buffer.from(await response.arrayBuffer());
+      console.log(`[ImageGen] Generated ${buffer.length} bytes`);
+
+      return { imageBuffer: buffer, seed, prompt: fullPrompt };
+    } catch (err) {
+      lastError = String(err);
+      console.log(`[ImageGen] Key ${apiKey.slice(0, 6)}... threw error, trying next...`);
+      continue;
+    }
   }
+
+  console.error(`[ImageGen] All ${uniqueKeys.length} keys exhausted. Last error: ${lastError}`);
+  return null;
 }
 
 // ── Generate a per-user seed (deterministic from userId) ────────────
@@ -345,8 +369,9 @@ export function shouldSendSelfie(
   mood: string,
   userText: string,
   recentHistory?: { role: string; content: string }[],
+  hasAnyKey: boolean = !!STABILITY_API_KEY,
 ): { shouldSend: boolean; reason: "asked" | "vibe" | "spontaneous" } {
-  if (!STABILITY_API_KEY) return { shouldSend: false, reason: "spontaneous" };
+  if (!hasAnyKey) return { shouldSend: false, reason: "spontaneous" };
 
   const text = userText.toLowerCase();
 

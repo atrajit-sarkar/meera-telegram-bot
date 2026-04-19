@@ -904,57 +904,96 @@ bot.command("reset", async (ctx) => {
   await ctx.reply("🔄 Conversation reset!");
 });
 
-// ── API KEY COMMANDS ────────────────────────────────────────────────
+// ── CHAT API KEY COMMANDS (Ollama/text generation) ──────────────────
 
+bot.command("addchatkey", async (ctx) => {
+  store.setFsmState(ctx.from.id, "waiting_for_ollama_key");
+  await ctx.reply("💬 Send me your Ollama/Chat API key. It will be stored securely and used as a backup when the default key hits its limit.\n\n⚠️ Delete your message after sending to keep it private!");
+});
+// Legacy alias
 bot.command("addkey", async (ctx) => {
   store.setFsmState(ctx.from.id, "waiting_for_ollama_key");
-  await ctx.reply("Send me your Ollama API key. It will be stored securely and used as a backup when the default key hits its limit.\n\n⚠️ Delete your message after sending to keep it private!");
+  await ctx.reply("💬 Send me your Ollama/Chat API key. It will be stored securely and used as a backup when the default key hits its limit.\n\n⚠️ Delete your message after sending to keep it private!");
 });
 
-bot.command("keys", async (ctx) => {
+bot.command("chatkeys", async (ctx) => {
   const user = store.getUser(ctx.from.id);
   if (!user.ollamaKeys.length) {
-    await ctx.reply("No extra API keys added. Use /addkey to add one!");
+    await ctx.reply("No chat API keys added. Use /addchatkey to add one!");
     return;
   }
   const masked = user.ollamaKeys.map((k, i) =>
     `${i + 1}. ${k.slice(0, 6)}...${k.slice(-4)}`
   );
-  await ctx.reply("Your API keys:\n" + masked.join("\n") + "\n\nUse /removekey to remove one.");
+  await ctx.reply("💬 Your Chat API keys:\n" + masked.join("\n") + "\n\nUse /removechatkey to remove one.");
 });
-
-bot.command("removekey", async (ctx) => {
+bot.command("keys", async (ctx) => {
   const user = store.getUser(ctx.from.id);
   if (!user.ollamaKeys.length) {
-    await ctx.reply("No API keys to remove.");
+    await ctx.reply("No chat API keys added. Use /addchatkey to add one!");
+    return;
+  }
+  const masked = user.ollamaKeys.map((k, i) =>
+    `${i + 1}. ${k.slice(0, 6)}...${k.slice(-4)}`
+  );
+  await ctx.reply("💬 Your Chat API keys:\n" + masked.join("\n") + "\n\nUse /removechatkey to remove one.");
+});
+
+bot.command("removechatkey", async (ctx) => {
+  const user = store.getUser(ctx.from.id);
+  if (!user.ollamaKeys.length) {
+    await ctx.reply("No chat API keys to remove.");
     return;
   }
   const masked = user.ollamaKeys.map((k, i) =>
     `${i + 1}. ${k.slice(0, 6)}...${k.slice(-4)}`
   );
   store.setFsmState(ctx.from.id, "waiting_for_remove_key");
-  await ctx.reply("Which key to remove?\n" + masked.join("\n") + "\n\nSend the number.");
+  await ctx.reply("Which chat API key to remove?\n" + masked.join("\n") + "\n\nSend the number.");
+});
+bot.command("removekey", async (ctx) => {
+  const user = store.getUser(ctx.from.id);
+  if (!user.ollamaKeys.length) {
+    await ctx.reply("No chat API keys to remove.");
+    return;
+  }
+  const masked = user.ollamaKeys.map((k, i) =>
+    `${i + 1}. ${k.slice(0, 6)}...${k.slice(-4)}`
+  );
+  store.setFsmState(ctx.from.id, "waiting_for_remove_key");
+  await ctx.reply("Which chat API key to remove?\n" + masked.join("\n") + "\n\nSend the number.");
 });
 
-// ── COMMUNITY KEY POOL COMMANDS ─────────────────────────────────────
+// ── CHAT COMMUNITY KEY POOL COMMANDS ────────────────────────────────
 
+bot.command("contributechat", async (ctx) => {
+  store.setFsmState(ctx.from.id, "waiting_for_community_key");
+  await ctx.reply(
+    "🤝 *Chat Community Key Pool*\n\n" +
+    "Contribute your Ollama/Chat API key to help everyone\\! " +
+    "Your key will be shared with ALL users so they can chat even when the default key hits its limit\\.\n\n" +
+    "Send me your Chat API key now\\.\n\n" +
+    "⚠️ Delete your message after sending to keep it private\\!",
+    { parse_mode: "MarkdownV2" }
+  );
+});
 bot.command("contribute", async (ctx) => {
   store.setFsmState(ctx.from.id, "waiting_for_community_key");
   await ctx.reply(
-    "🤝 *Community Key Pool*\n\n" +
-    "Contribute your Ollama API key to help everyone\\! " +
+    "🤝 *Chat Community Key Pool*\n\n" +
+    "Contribute your Ollama/Chat API key to help everyone\\! " +
     "Your key will be shared with ALL users so they can chat even when the default key hits its limit\\.\n\n" +
-    "Send me your Ollama API key now\\.\n\n" +
+    "Send me your Chat API key now\\.\n\n" +
     "⚠️ Delete your message after sending to keep it private\\!",
     { parse_mode: "MarkdownV2" }
   );
 });
 
-bot.command("communitykeys", async (ctx) => {
+bot.command("chatpool", async (ctx) => {
   await store.loadCommunityKeys();
   const count = store.getCommunityKeyCount();
   if (count === 0) {
-    await ctx.reply("No community keys yet. Be the first to /contribute one! 🤝");
+    await ctx.reply("No chat community keys yet. Be the first to /contributechat one! 🤝");
     return;
   }
   const info = store.getCommunityKeysInfo();
@@ -962,20 +1001,120 @@ bot.command("communitykeys", async (ctx) => {
     const credit = k.contributorName ? ` — contributed by ${k.contributorName}` : "";
     return `${i + 1}. ${k.maskedKey}${credit}`;
   });
-  await ctx.reply(`🤝 Community Key Pool: ${count} key${count > 1 ? "s" : ""}\n\n${lines.join("\n")}\n\nThese keys are shared with all users. Use /contribute to add yours!`);
+  await ctx.reply(`🤝 Chat Community Key Pool: ${count} key${count > 1 ? "s" : ""}\n\n${lines.join("\n")}\n\nThese keys are shared with all users. Use /contributechat to add yours!`);
 });
-
-bot.command("removecontribution", async (ctx) => {
+bot.command("communitykeys", async (ctx) => {
   await store.loadCommunityKeys();
   const count = store.getCommunityKeyCount();
   if (count === 0) {
-    await ctx.reply("No community keys to remove.");
+    await ctx.reply("No chat community keys yet. Be the first to /contributechat one! 🤝");
+    return;
+  }
+  const info = store.getCommunityKeysInfo();
+  const lines = info.map((k, i) => {
+    const credit = k.contributorName ? ` — contributed by ${k.contributorName}` : "";
+    return `${i + 1}. ${k.maskedKey}${credit}`;
+  });
+  await ctx.reply(`🤝 Chat Community Key Pool: ${count} key${count > 1 ? "s" : ""}\n\n${lines.join("\n")}\n\nThese keys are shared with all users. Use /contributechat to add yours!`);
+});
+
+bot.command("removechatcontribution", async (ctx) => {
+  await store.loadCommunityKeys();
+  const count = store.getCommunityKeyCount();
+  if (count === 0) {
+    await ctx.reply("No chat community keys to remove.");
     return;
   }
   const info = store.getCommunityKeysInfo();
   const lines = info.map((k, i) => `${i + 1}. ${k.maskedKey}`);
   store.setFsmState(ctx.from.id, "waiting_for_remove_community_key");
-  await ctx.reply("Which community key to remove? (You can only remove keys you contributed)\n\n" + lines.join("\n") + "\n\nSend the number.");
+  await ctx.reply("Which chat community key to remove? (You can only remove keys you contributed)\n\n" + lines.join("\n") + "\n\nSend the number.");
+});
+bot.command("removecontribution", async (ctx) => {
+  await store.loadCommunityKeys();
+  const count = store.getCommunityKeyCount();
+  if (count === 0) {
+    await ctx.reply("No chat community keys to remove.");
+    return;
+  }
+  const info = store.getCommunityKeysInfo();
+  const lines = info.map((k, i) => `${i + 1}. ${k.maskedKey}`);
+  store.setFsmState(ctx.from.id, "waiting_for_remove_community_key");
+  await ctx.reply("Which chat community key to remove? (You can only remove keys you contributed)\n\n" + lines.join("\n") + "\n\nSend the number.");
+});
+
+// ── IMAGE/STABILITY API KEY COMMANDS ────────────────────────────────
+
+bot.command("addimagekey", async (ctx) => {
+  store.setFsmState(ctx.from.id, "waiting_for_stability_key");
+  await ctx.reply("🎨 Send me your Stability AI API key. It will be used for generating selfie/photo images.\n\nGet one at https://platform.stability.ai/account/keys\n\n⚠️ Delete your message after sending to keep it private!");
+});
+
+bot.command("imagekeys", async (ctx) => {
+  const user = store.getUser(ctx.from.id);
+  if (!user.stabilityKeys.length) {
+    await ctx.reply("No image API keys added. Use /addimagekey to add one!");
+    return;
+  }
+  const masked = user.stabilityKeys.map((k, i) =>
+    `${i + 1}. ${k.slice(0, 6)}...${k.slice(-4)}`
+  );
+  await ctx.reply("🎨 Your Image API keys (Stability AI):\n" + masked.join("\n") + "\n\nUse /removeimagekey to remove one.");
+});
+
+bot.command("removeimagekey", async (ctx) => {
+  const user = store.getUser(ctx.from.id);
+  if (!user.stabilityKeys.length) {
+    await ctx.reply("No image API keys to remove.");
+    return;
+  }
+  const masked = user.stabilityKeys.map((k, i) =>
+    `${i + 1}. ${k.slice(0, 6)}...${k.slice(-4)}`
+  );
+  store.setFsmState(ctx.from.id, "waiting_for_remove_stability_key");
+  await ctx.reply("Which image API key to remove?\n" + masked.join("\n") + "\n\nSend the number.");
+});
+
+// ── IMAGE COMMUNITY KEY POOL COMMANDS ───────────────────────────────
+
+bot.command("contributeimage", async (ctx) => {
+  store.setFsmState(ctx.from.id, "waiting_for_stability_community_key");
+  await ctx.reply(
+    "🤝 *Image Community Key Pool*\n\n" +
+    "Contribute your Stability AI API key to help everyone generate selfies/photos\\!\n" +
+    "Your key will be shared with ALL users\\.\n\n" +
+    "Send me your Stability AI API key now\\.\n\n" +
+    "⚠️ Delete your message after sending to keep it private\\!",
+    { parse_mode: "MarkdownV2" }
+  );
+});
+
+bot.command("imagepool", async (ctx) => {
+  await store.loadStabilityCommunityKeys();
+  const count = store.getStabilityCommunityKeyCount();
+  if (count === 0) {
+    await ctx.reply("No image community keys yet. Be the first to /contributeimage one! 🤝");
+    return;
+  }
+  const info = store.getStabilityCommunityKeysInfo();
+  const lines = info.map((k, i) => {
+    const credit = k.contributorName ? ` — contributed by ${k.contributorName}` : "";
+    return `${i + 1}. ${k.maskedKey}${credit}`;
+  });
+  await ctx.reply(`🎨 Image Community Key Pool: ${count} key${count > 1 ? "s" : ""}\n\n${lines.join("\n")}\n\nThese Stability AI keys are shared with all users. Use /contributeimage to add yours!`);
+});
+
+bot.command("removeimagecontribution", async (ctx) => {
+  await store.loadStabilityCommunityKeys();
+  const count = store.getStabilityCommunityKeyCount();
+  if (count === 0) {
+    await ctx.reply("No image community keys to remove.");
+    return;
+  }
+  const info = store.getStabilityCommunityKeysInfo();
+  const lines = info.map((k, i) => `${i + 1}. ${k.maskedKey}`);
+  store.setFsmState(ctx.from.id, "waiting_for_remove_stability_community_key");
+  await ctx.reply("Which image community key to remove? (You can only remove keys you contributed)\n\n" + lines.join("\n") + "\n\nSend the number.");
 });
 
 // ── CUSTOM PERSONA COMMANDS ─────────────────────────────────────────
@@ -1161,6 +1300,83 @@ async function handleFsmState(
         }
         if (result.removed && result.key) {
           return ctx.reply(`Removed community key: ${result.key.slice(0, 6)}...${result.key.slice(-4)}`).then(() => true);
+        }
+        return ctx.reply("Invalid number.").then(() => true);
+      }
+
+    // ── Stability AI (Image) key FSM handlers ──
+
+    case "waiting_for_stability_key":
+      store.clearFsmState(userId);
+      {
+        const key = text.trim();
+        if (key.length < 10) {
+          return ctx.reply("That doesn't look like a valid API key. Try again with /addimagekey").then(() => true);
+        }
+        const dup = await store.isStabilityKeyDuplicate(key, userId);
+        if (dup === "personal") {
+          try { await ctx.deleteMessage(); } catch {}
+          return ctx.reply("This key is already in your personal image keys!").then(() => true);
+        }
+        if (dup === "community") {
+          try { await ctx.deleteMessage(); } catch {}
+          return ctx.reply("This key is already in the image community pool! No need to add it personally.").then(() => true);
+        }
+        const user = store.getUser(userId);
+        const keys = [...user.stabilityKeys, key];
+        store.updateUser(userId, { stabilityKeys: keys });
+        try { await ctx.deleteMessage(); } catch {}
+        return ctx.reply(`✅ Image API key added (${key.slice(0, 6)}...${key.slice(-4)}). I'll use it for generating selfies/photos!`).then(() => true);
+      }
+
+    case "waiting_for_remove_stability_key":
+      store.clearFsmState(userId);
+      {
+        const idx = parseInt(text) - 1;
+        const user = store.getUser(userId);
+        if (idx >= 0 && idx < user.stabilityKeys.length) {
+          const removed = user.stabilityKeys[idx];
+          const keys = user.stabilityKeys.filter((_, i) => i !== idx);
+          store.updateUser(userId, { stabilityKeys: keys });
+          return ctx.reply(`Removed image key: ${removed.slice(0, 6)}...${removed.slice(-4)}`).then(() => true);
+        }
+        return ctx.reply("Invalid number.").then(() => true);
+      }
+
+    case "waiting_for_stability_community_key":
+      store.clearFsmState(userId);
+      {
+        const key = text.trim();
+        if (key.length < 10) {
+          return ctx.reply("That doesn't look like a valid API key. Try again with /contributeimage").then(() => true);
+        }
+        try { await ctx.deleteMessage(); } catch {}
+        const dup = await store.isStabilityKeyDuplicate(key, userId);
+        if (dup === "community") {
+          return ctx.reply("This key is already in the image community pool!").then(() => true);
+        }
+        if (dup === "personal") {
+          return ctx.reply("This key is already in your personal image keys! Remove it with /removeimagekey first if you want to contribute it to everyone.").then(() => true);
+        }
+        const name = ctx.from!.first_name + (ctx.from!.last_name ? " " + ctx.from!.last_name : "");
+        const contributor = ctx.from!.username ? `@${ctx.from!.username}` : name;
+        const added = await store.addStabilityCommunityKey(key, userId, contributor);
+        if (!added) {
+          return ctx.reply("This key is already in the image community pool!").then(() => true);
+        }
+        return ctx.reply(`🤝 Thank you! Your Stability AI key (${key.slice(0, 6)}...${key.slice(-4)}) has been added to the image community pool. All users can now generate selfies with it!`).then(() => true);
+      }
+
+    case "waiting_for_remove_stability_community_key":
+      store.clearFsmState(userId);
+      {
+        const idx = parseInt(text) - 1;
+        const result = await store.removeStabilityCommunityKey(idx, userId);
+        if (result.notOwner) {
+          return ctx.reply("You can only remove keys you contributed.").then(() => true);
+        }
+        if (result.removed && result.key) {
+          return ctx.reply(`Removed image community key: ${result.key.slice(0, 6)}...${result.key.slice(-4)}`).then(() => true);
         }
         return ctx.reply("Invalid number.").then(() => true);
       }
@@ -1681,13 +1897,15 @@ async function sendSelfieToChat(
   const charDesc = buildCharacterDescription(user.customPersona);
   const scenario = pickSelfieScenario(mood);
 
-  // Generate the image
+  // Generate the image — pass user's personal + community stability keys
+  const stabilityKeys = [...user.stabilityKeys, ...store.getStabilityCommunityKeyStrings()];
   const result = await generateImage(
     charDesc,
     scenario.prompt,
     seed,
     scenario.aspectRatio,
     scenario.style,
+    stabilityKeys,
   );
 
   if (!result) return false;
@@ -1907,7 +2125,9 @@ async function handleTextMessage(
   });
 
   // ── Selfie detection: should Meera send a photo of herself?
-  const selfieDecision = shouldSendSelfie(tier, mood, text, history);
+  const userForSelfie = store.getUser(userId);
+  const hasStabilityKey = !!(process.env.STABILITY_API_KEY || userForSelfie.stabilityKeys.length > 0 || store.getStabilityCommunityKeyCount() > 0);
+  const selfieDecision = shouldSendSelfie(tier, mood, text, history, hasStabilityKey);
 
   // ── Resolve conflict: if both content and selfie are triggered, decide which to send ──
   // We await contentResult here so the decision + hints are ready before generating the reply
