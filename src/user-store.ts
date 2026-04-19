@@ -73,6 +73,10 @@ export class UserStore {
   private stabilityCommunityKeys: Array<{ key: string; contributedBy: number; contributorName: string; addedAt: number }> = [];
   private stabilityCommunityKeysLoaded = false;
 
+  // Global sticker pack pool — shared across all users
+  private globalStickerPacks: Array<{ packName: string; addedBy: number; addedByName: string; addedAt: number }> = [];
+  private globalStickerPacksLoaded = false;
+
   constructor(maxHistory = 50, databaseId?: string) {
     this.maxHistory = maxHistory;
 
@@ -484,5 +488,90 @@ export class UserStore {
   /** Get count of Stability community keys */
   getStabilityCommunityKeyCount(): number {
     return this.stabilityCommunityKeys.length;
+  }
+
+  // ── GLOBAL STICKER PACK POOL ──────────────────────────────────────
+
+  /** Load global sticker packs from Firestore (once) */
+  async loadGlobalStickerPacks(): Promise<void> {
+    if (this.globalStickerPacksLoaded) return;
+    this.globalStickerPacksLoaded = true;
+    try {
+      const snap = await this.db.collection("global_sticker_packs").get();
+      this.globalStickerPacks = snap.docs.map((d) => ({
+        packName: d.data().packName as string,
+        addedBy: d.data().addedBy as number,
+        addedByName: (d.data().addedByName as string) || "",
+        addedAt: d.data().addedAt as number,
+      }));
+      console.log(`[UserStore] Loaded ${this.globalStickerPacks.length} global sticker packs`);
+    } catch (err) {
+      console.error("[UserStore] Failed to load global sticker packs:", err);
+    }
+  }
+
+  /** Check if a sticker pack already exists in the global pool */
+  async isStickerPackDuplicate(packName: string): Promise<boolean> {
+    await this.loadGlobalStickerPacks();
+    return this.globalStickerPacks.some(
+      (p) => p.packName.toLowerCase() === packName.toLowerCase()
+    );
+  }
+
+  /** Add a sticker pack to the global pool */
+  async addGlobalStickerPack(packName: string, addedBy: number, addedByName: string): Promise<boolean> {
+    await this.loadGlobalStickerPacks();
+    if (this.globalStickerPacks.some((p) => p.packName.toLowerCase() === packName.toLowerCase())) {
+      return false; // duplicate
+    }
+    const entry = { packName, addedBy, addedByName, addedAt: Date.now() };
+    this.globalStickerPacks.push(entry);
+    try {
+      await this.db.collection("global_sticker_packs").add(entry);
+    } catch (err) {
+      console.error("[UserStore] Failed to save global sticker pack:", err);
+    }
+    return true;
+  }
+
+  /** Remove a global sticker pack by index */
+  async removeGlobalStickerPack(index: number, requestedBy: number): Promise<{ removed: boolean; packName?: string; notOwner?: boolean }> {
+    await this.loadGlobalStickerPacks();
+    if (index < 0 || index >= this.globalStickerPacks.length) return { removed: false };
+    const entry = this.globalStickerPacks[index];
+    const adminId = process.env.ADMIN_USER_ID ? parseInt(process.env.ADMIN_USER_ID) : 0;
+    if (entry.addedBy !== requestedBy && requestedBy !== adminId) {
+      return { removed: false, notOwner: true };
+    }
+    this.globalStickerPacks.splice(index, 1);
+    try {
+      const snap = await this.db.collection("global_sticker_packs")
+        .where("packName", "==", entry.packName)
+        .limit(1)
+        .get();
+      if (!snap.empty) await snap.docs[0].ref.delete();
+    } catch (err) {
+      console.error("[UserStore] Failed to delete global sticker pack:", err);
+    }
+    return { removed: true, packName: entry.packName };
+  }
+
+  /** Get all global sticker pack names */
+  getGlobalStickerPackNames(): string[] {
+    return this.globalStickerPacks.map((p) => p.packName);
+  }
+
+  /** Get global sticker packs info for display */
+  getGlobalStickerPacksInfo(): Array<{ packName: string; addedBy: number; addedByName: string }> {
+    return this.globalStickerPacks.map((p) => ({
+      packName: p.packName,
+      addedBy: p.addedBy,
+      addedByName: p.addedByName || "",
+    }));
+  }
+
+  /** Get count of global sticker packs */
+  getGlobalStickerPackCount(): number {
+    return this.globalStickerPacks.length;
   }
 }

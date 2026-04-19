@@ -770,8 +770,9 @@ async function maybeSendSticker(
 ) {
   const msgCount = store.getMessageCount(userId);
   const user = store.getUser(userId);
-  // No sticker packs? Skip
-  if (!user.stickerPacks.length) return;
+  // No global sticker packs? Skip
+  const globalPacks = store.getGlobalStickerPackNames();
+  if (!globalPacks.length) return;
   // Probability by tier
   const shouldSend =
     msgCount < 8
@@ -788,8 +789,8 @@ async function maybeSendSticker(
   const emoji = await pickStickerEmoji(ollamaConfig, aiResponse, history, personaHint);
   if (!emoji) return;
 
-  // Try to find a sticker matching the emoji in user's packs
-  for (const packName of user.stickerPacks) {
+  // Try to find a sticker matching the emoji in global packs
+  for (const packName of globalPacks) {
     try {
       const stickerSet = await (ctx as any).telegram.getStickerSet(packName);
       const match = stickerSet.stickers.find(
@@ -874,7 +875,7 @@ bot.command("profile", async (ctx) => {
       `Reply length: ${user.replyLength}\n` +
       `Voice-only: ${user.voiceOnly ? "ON" : "OFF"}\n` +
       `Relationship: ${tier} (${msgs} messages)\n` +
-      `Sticker packs: ${user.stickerPacks.length}`,
+      `Global sticker packs: ${store.getGlobalStickerPackCount()}`,
     { parse_mode: "Markdown" }
   );
 });
@@ -928,28 +929,32 @@ bot.command("clear", async (ctx) => {
 
 bot.command("addstickers", async (ctx) => {
   store.setFsmState(ctx.from.id, "waiting_for_sticker_pack");
-  await ctx.reply("Send me the sticker pack name (you can find it in the sticker pack link):");
+  await ctx.reply("Send me the sticker pack name (you can find it in the sticker pack link).\nThis will be added to Meera's global sticker pool for everyone!");
 });
 
 bot.command("stickers", async (ctx) => {
-  const user = store.getUser(ctx.from.id);
-  if (!user.stickerPacks.length) {
-    await ctx.reply("No sticker packs added yet. Use /addstickers to add one!");
+  await store.loadGlobalStickerPacks();
+  const packs = store.getGlobalStickerPacksInfo();
+  if (!packs.length) {
+    await ctx.reply("No sticker packs in the global pool yet. Use /addstickers to add one!");
     return;
   }
-  await ctx.reply("Your sticker packs:\n" + user.stickerPacks.map((p, i) => `${i + 1}. ${p}`).join("\n"));
+  const list = packs.map((p, i) => `${i + 1}. ${p.packName}${p.addedByName ? ` (by ${p.addedByName})` : ""}`).join("\n");
+  await ctx.reply(`🎨 Global sticker pool (${packs.length} packs):\n${list}`);
 });
 
 bot.command("removestickers", async (ctx) => {
-  const user = store.getUser(ctx.from.id);
-  if (!user.stickerPacks.length) {
+  await store.loadGlobalStickerPacks();
+  const packs = store.getGlobalStickerPacksInfo();
+  if (!packs.length) {
     await ctx.reply("No sticker packs to remove.");
     return;
   }
   store.setFsmState(ctx.from.id, "waiting_for_remove_sticker_pack");
+  const list = packs.map((p, i) => `${i + 1}. ${p.packName}${p.addedByName ? ` (by ${p.addedByName})` : ""}`).join("\n");
   await ctx.reply(
-    "Which pack to remove?\n" +
-      user.stickerPacks.map((p, i) => `${i + 1}. ${p}`).join("\n") +
+    "Which pack to remove? (you can only remove packs you added)\n" +
+      list +
       "\n\nSend the number."
   );
 });
@@ -1358,22 +1363,32 @@ async function handleFsmState(
     case "waiting_for_sticker_pack":
       store.clearFsmState(userId);
       {
-        const user = store.getUser(userId);
-        const packs = [...user.stickerPacks, text.trim()];
-        store.updateUser(userId, { stickerPacks: packs });
-        return ctx.reply(`Added sticker pack: ${text.trim()}`).then(() => true);
+        const packName = text.trim();
+        const isDup = await store.isStickerPackDuplicate(packName);
+        if (isDup) {
+          return ctx.reply(`This sticker pack is already in the global pool!`).then(() => true);
+        }
+        const added = await store.addGlobalStickerPack(
+          packName,
+          userId,
+          ctx.from?.first_name || ""
+        );
+        if (!added) {
+          return ctx.reply(`Failed to add sticker pack.`).then(() => true);
+        }
+        return ctx.reply(`✅ Added sticker pack to global pool: ${packName}`).then(() => true);
       }
 
     case "waiting_for_remove_sticker_pack":
       store.clearFsmState(userId);
       {
         const idx = parseInt(text) - 1;
-        const user = store.getUser(userId);
-        if (idx >= 0 && idx < user.stickerPacks.length) {
-          const removed = user.stickerPacks[idx];
-          const packs = user.stickerPacks.filter((_, i) => i !== idx);
-          store.updateUser(userId, { stickerPacks: packs });
-          return ctx.reply(`Removed: ${removed}`).then(() => true);
+        const result = await store.removeGlobalStickerPack(idx, userId);
+        if (result.notOwner) {
+          return ctx.reply("You can only remove sticker packs you added.").then(() => true);
+        }
+        if (result.removed) {
+          return ctx.reply(`Removed: ${result.packName}`).then(() => true);
         }
         return ctx.reply("Invalid number.").then(() => true);
       }
@@ -1825,8 +1840,9 @@ async function maybeStickerOnlyReply(
   const tier = store.getComfortTier(userId);
   const user = store.getUser(userId);
 
-  // Need sticker packs and comfortable+ tier
-  if (!user.stickerPacks.length) return false;
+  // Need global sticker packs and comfortable+ tier
+  const globalPacks = store.getGlobalStickerPackNames();
+  if (!globalPacks.length) return false;
   if (tier === "stranger" || tier === "acquaintance") return false;
 
   const text = userText.trim().toLowerCase();
@@ -1842,8 +1858,8 @@ async function maybeStickerOnlyReply(
   const emoji = await pickStickerEmoji(ollamaConfig, userText, history, personaHint);
   if (!emoji) return false;
 
-  // Find matching sticker
-  for (const packName of user.stickerPacks) {
+  // Find matching sticker in global packs
+  for (const packName of globalPacks) {
     try {
       const stickerSet = await (ctx as any).telegram.getStickerSet(packName);
       const match = stickerSet.stickers.find(
@@ -3191,8 +3207,9 @@ bot.launch().then(async () => {
     { command: "help", description: "Show all commands" },
   ]).catch((e) => console.warn("Failed to set bot commands:", e));
 
-  // Pre-load community keys
+  // Pre-load community keys and global sticker packs
   await store.loadCommunityKeys();
+  await store.loadGlobalStickerPacks();
 
   // Check for proactive messages every 5 minutes
   setInterval(() => proactiveLoop().catch(console.error), 5 * 60 * 1000);
