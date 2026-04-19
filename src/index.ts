@@ -2027,7 +2027,25 @@ async function sendMeeraImage(
 
   const image = await meeraImages.getByIndex(chosenIndex);
   if (!image) {
-    console.log(`[MeeraImg] Selected index ${chosenIndex} not found`);
+    // No matching image found — Meera says she doesn't have that kind of photo
+    console.log(`[MeeraImg] No relevant image found (index=${chosenIndex}) for user ${userId}`);
+    if (reason === "asked") {
+      try {
+        const gender = parseGenderFromPersona(user.customPersona);
+        const noPhotoPrompt = `You're a ${gender === "girl" ? "girl" : "guy"} and someone asked you for a specific photo/selfie, but you haven't taken that kind of photo. Write a short casual reply (1-2 lines, max 20 words) saying you don't have that photo right now — like a real ${gender === "girl" ? "girl" : "guy"} would. Examples of vibes: "I haven't clicked that type of pic 😅", "don't have that rn lol", "nahi hai mere paas aisa photo 😭", "ugh I don't have one rn maybe later". Match the chat language. Be natural and a bit cute about it.`;
+        const messages: OllamaMessage[] = [
+          { role: "system", content: user.customPersona || `You are ${botName}. Reply with just the message, nothing else.` },
+          { role: "user", content: noPhotoPrompt },
+        ];
+        const noPhotoReply = await ollamaChat(messages, user.ollamaKeys);
+        const cleaned = noPhotoReply.replace(/^["']|["']$/g, "").trim();
+        await (ctx as any).telegram.sendMessage(ctx.chat!.id, cleaned.slice(0, 200));
+        store.addMessage(userId, "assistant", cleaned.slice(0, 200));
+      } catch {
+        await ctx.reply("I don't have that kind of pic rn 😅");
+        store.addMessage(userId, "assistant", "I don't have that kind of pic rn 😅");
+      }
+    }
     return false;
   }
 

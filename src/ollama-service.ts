@@ -562,8 +562,9 @@ Rules:
 - If no specific request, pick one that matches Meera's current mood or the conversation vibe
 - Consider the time of day — morning photos for morning, night photos for night, etc.
 - If multiple photos could work, pick randomly but lean towards ones that feel natural
+- If NONE of the available photos match what the user asked for, reply "0" — don't force a bad match
 
-Reply with ONLY the number of the photo you pick. Nothing else. Just the number.`;
+Reply with ONLY the number of the photo you pick (1-${captions.length}), or "0" if none fit. Nothing else.`;
 
   try {
     const messages: OllamaMessage[] = [
@@ -573,6 +574,7 @@ Reply with ONLY the number of the photo you pick. Nothing else. Just the number.
     ];
     const raw = await callOllamaWithRotation(config, messages, userKeys);
     const num = parseInt(raw.trim().replace(/[^0-9]/g, ""));
+    if (num === 0) return -1; // No matching image
     if (num >= 1 && num <= captions.length) {
       return captions[num - 1].index; // Convert 1-based to actual index
     }
