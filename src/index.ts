@@ -2017,14 +2017,7 @@ async function sendMeeraImage(
   const mood = store.getMood(userId);
   const tier = store.getComfortTier(userId);
   const history = store.getRecentHistory(userId);
-
-  // Rate limit: max 1 Meera image per 10 minutes (skip in debug mode)
   const now = Date.now();
-  const forceDebug = process.env.FORCE_SELFIE_DEBUG === "true";
-  if (!forceDebug && user.lastSelfieSent && now - user.lastSelfieSent < 10 * 60 * 1000) {
-    console.log(`[MeeraImg] Rate limited for user ${userId} — last sent ${Math.round((now - user.lastSelfieSent) / 1000)}s ago`);
-    return false;
-  }
 
   // Check if we have community images
   const hasImages = await meeraImages.hasImages();
