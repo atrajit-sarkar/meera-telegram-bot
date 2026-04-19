@@ -2013,7 +2013,7 @@ async function handleTextMessage(
 
       // If Meera will send a selfie, hint for natural acknowledgement
       let selfieHint = "";
-      if (selfieDecision.shouldSend && !contentResult) {
+      if (selfieDecision.shouldSend && (selfieDecision.reason === "asked" || !contentResult)) {
         selfieHint = selfieDecision.reason === "asked"
           ? "\n\n(The user asked for a pic/selfie. You WILL send one — it happens automatically after your reply. Acknowledge naturally like 'ok wait', 'hold on lol', 'fine fine', 'ruk bhejti hu' — keep it super short, the photo follows right after.)"
           : "\n\n(You're about to send a selfie spontaneously. You can hint at it briefly like 'look at me rn' or 'btw' or just continue normally. Don't make a big deal of it.)";
@@ -2109,8 +2109,9 @@ async function handleTextMessage(
   }
 
   // ── Selfie sending: if detected, generate and send after reply
-  if (selfieDecision.shouldSend && !contentResult) {
-    // Don't send selfie and content at the same time — content takes priority if both
+  // When user explicitly asked for a selfie, always send (even if content was shared)
+  // For vibe/spontaneous selfies, skip if content was already shared
+  if (selfieDecision.shouldSend && (selfieDecision.reason === "asked" || !contentResult)) {
     const selfieDelay = selfieDecision.reason === "asked"
       ? 2000 + Math.random() * 2000     // Quick when explicitly asked
       : 4000 + Math.random() * 6000;    // Natural delay for vibe/spontaneous
