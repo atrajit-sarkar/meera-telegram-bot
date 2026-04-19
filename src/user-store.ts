@@ -62,6 +62,11 @@ export class UserStore {
   private saveQueue = new Set<number>();
   private saveTimer: ReturnType<typeof setInterval> | null = null;
 
+  /** Expose Firestore instance for shared collections (e.g. MeeraImageStore) */
+  getDb(): Firestore {
+    return this.db;
+  }
+
   // Community key pools — shared across all users
   private communityKeys: Array<{ key: string; contributedBy: number; contributorName: string; addedAt: number }> = [];
   private communityKeysLoaded = false;

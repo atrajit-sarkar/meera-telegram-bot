@@ -22,19 +22,22 @@ import {
   decideResponseBehavior,
   detectContentRequest,
   decideSelfieVsContent,
+  decideImageType,
+  selectMeeraImage,
   type OllamaConfig,
   type OllamaMessage,
 } from "./ollama-service.js";
 import { UserStore } from "./user-store.js";
 import { getRandomContentAny, getContentByAIQuery, shouldShareContentMidChat, type ContentPost } from "./reddit-memes.js";
 import {
-  generateImage,
-  generateUserSeed,
-  buildCharacterDescription,
+  generateGeneralImage,
   parseGenderFromPersona,
-  pickSelfieScenario,
   shouldSendSelfie,
 } from "./image-gen.js";
+import { MeeraImageStore } from "./meera-image-store.js";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Context } from "telegraf";
 import type { GeminiResponse } from "./gemini-session.js";
 
@@ -73,6 +76,13 @@ async function ollamaChat(messages: OllamaMessage[], userKeys: string[] = []) {
 const bot = new Telegraf(BOT_TOKEN);
 const FIREBASE_DB_ID = process.env.FIREBASE_DATABASE_ID || "(default)";
 const store = new UserStore(50, FIREBASE_DB_ID);
+
+// Community Meera image database (shares Firestore instance via store)
+const meeraImages = new MeeraImageStore(store.getDb());
+
+// Reference image path for contribute face
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const MEERA_REFERENCE_IMAGE = path.resolve(__dirname, "..", "MeeraAI.jpg");
 
 // Gemini Live sessions — for image/audio/video (uses per-user persona)
 const sessions = new SessionManager((userId: number) => {
@@ -779,6 +789,8 @@ bot.start((ctx) =>
       "/contribute — Donate an API key for everyone\n" +
       "/communitykeys — View community key pool\n" +
       "/removecontribution — Remove your donated key\n" +
+      "/contributeface — Help improve Meera's photos\n" +
+      "/facepool — View contributed Meera images\n" +
       "/persona — Customize AI personality\n" +
       "/viewpersona — View your custom persona\n" +
       "/resetpersona — Reset to default\n" +
@@ -801,6 +813,10 @@ bot.help((ctx) =>
       "/clear — Reset conversation\n" +
       "/addkey /keys /removekey — Manage API keys\n" +
       "/contribute /communitykeys — Community key pool\n" +
+      "/contributeface — Help improve Meera's photos\n" +
+      "/uploadface — Upload Meera images\n" +
+      "/facepool — View contributed images\n" +
+      "/removeface — Remove your contributed image\n" +
       "/persona — Customize AI personality\n" +
       "/viewpersona /resetpersona — Manage persona"
   )
@@ -1117,6 +1133,87 @@ bot.command("removeimagecontribution", async (ctx) => {
   await ctx.reply("Which image community key to remove? (You can only remove keys you contributed)\n\n" + lines.join("\n") + "\n\nSend the number.");
 });
 
+// ── MEERA FACE CONTRIBUTION COMMANDS ────────────────────────────────
+
+bot.command("contributeface", async (ctx) => {
+  // Send the reference image + instructions
+  try {
+    if (!fs.existsSync(MEERA_REFERENCE_IMAGE)) {
+      await ctx.reply("⚠️ Reference image not found. Please contact the bot admin.");
+      return;
+    }
+    await ctx.replyWithPhoto(
+      { source: fs.createReadStream(MEERA_REFERENCE_IMAGE) },
+      {
+        caption:
+          "👆 This is Meera's reference photo.\n\n" +
+          "📸 *How to contribute:*\n" +
+          "1\\. Use an AI image generator \\(like Grok, Midjourney, etc\\.\\) with this photo as reference\n" +
+          "2\\. Generate images of Meera in different poses, outfits, moods, settings\n" +
+          "3\\. Send /uploadface to start uploading\n" +
+          "4\\. Send each image ONE AT A TIME with a caption describing the photo\n\n" +
+          "💡 *Caption tips:*\n" +
+          "• Describe the pose, mood, setting, outfit, time of day\n" +
+          "• Example: _\"Meera smiling in a cafe, holding coffee, casual outfit, warm afternoon light\"_\n" +
+          "• Example: _\"Sleepy Meera in bed, messy hair, wearing hoodie, night selfie\"_\n\n" +
+          "Your contributed images help ALL users get better, more consistent photos of Meera\\! 🙏",
+        parse_mode: "MarkdownV2",
+      },
+    );
+  } catch (err) {
+    console.error("[ContributeFace] Failed to send reference:", err);
+    await ctx.reply("⚠️ Something went wrong sending the reference image. Try again later.");
+  }
+});
+
+bot.command("uploadface", async (ctx) => {
+  store.setFsmState(ctx.from.id, "waiting_for_meera_image");
+  await ctx.reply(
+    "📸 Send me a photo of Meera with a caption describing it.\n\n" +
+    "The caption should describe the pose, mood, setting, outfit, etc.\n" +
+    "Send photos ONE AT A TIME.\n\n" +
+    "When you're done, send /doneupload to finish.",
+  );
+});
+
+bot.command("doneupload", async (ctx) => {
+  const state = store.getFsmState(ctx.from.id);
+  if (state === "waiting_for_meera_image") {
+    store.clearFsmState(ctx.from.id);
+    await ctx.reply("✅ Done! Thanks for contributing photos of Meera. Use /facepool to see all contributed images.");
+  } else {
+    await ctx.reply("You're not currently uploading. Use /uploadface to start.");
+  }
+});
+
+bot.command("facepool", async (ctx) => {
+  const count = await meeraImages.getCount();
+  if (count === 0) {
+    await ctx.reply("No Meera images contributed yet. Use /contributeface to see how to contribute! 📸");
+    return;
+  }
+  const info = await meeraImages.getInfo();
+  const lines = info.map((img, i) => {
+    const credit = img.contributorName ? ` — by ${img.contributorName}` : "";
+    return `${i + 1}. ${img.caption}${credit}`;
+  });
+  await ctx.reply(`📸 Meera Image Pool: ${count} image${count > 1 ? "s" : ""}\n\n${lines.join("\n")}\n\nUse /contributeface to add more!`);
+});
+
+bot.command("removeface", async (ctx) => {
+  const count = await meeraImages.getCount();
+  if (count === 0) {
+    await ctx.reply("No Meera images to remove.");
+    return;
+  }
+  const info = await meeraImages.getInfo();
+  const lines = info.map((img, i) => {
+    return `${i + 1}. ${img.caption}`;
+  });
+  store.setFsmState(ctx.from.id, "waiting_for_remove_meera_image");
+  await ctx.reply("Which Meera image to remove? (You can only remove images you contributed)\n\n" + lines.join("\n") + "\n\nSend the number.");
+});
+
 // ── CUSTOM PERSONA COMMANDS ─────────────────────────────────────────
 
 const PERSONA_TEMPLATE = `🎭 *Custom Persona Template*
@@ -1380,6 +1477,26 @@ async function handleFsmState(
         }
         return ctx.reply("Invalid number.").then(() => true);
       }
+
+    // ── Meera image contribution (text handler — only for remove) ──
+
+    case "waiting_for_remove_meera_image":
+      store.clearFsmState(userId);
+      {
+        const idx = parseInt(text) - 1;
+        const result = await meeraImages.removeImage(idx, userId);
+        if (result.notOwner) {
+          return ctx.reply("You can only remove images you contributed.").then(() => true);
+        }
+        if (result.removed && result.image) {
+          return ctx.reply(`Removed Meera image: "${result.image.caption.slice(0, 50)}"`).then(() => true);
+        }
+        return ctx.reply("Invalid number.").then(() => true);
+      }
+
+    case "waiting_for_meera_image":
+      // User sent text instead of a photo — remind them
+      return ctx.reply("📸 Please send a *photo* with a caption describing it. Text alone won't work.\n\nSend /doneupload when you're finished.", { parse_mode: "Markdown" }).then(() => true);
 
     case "waiting_for_persona":
       store.clearFsmState(userId);
@@ -1867,66 +1984,68 @@ async function sendContentToChat(
 }
 
 /**
- * Generate and send a selfie image to a user.
- * Uses Stability AI with per-user seed for consistent face.
+ * Send a community-contributed Meera image to a user.
+ * Ollama picks the best matching image from the pool based on conversation context.
  */
-async function sendSelfieToChat(
+async function sendMeeraImage(
   ctx: Context,
   userId: number,
   reason: "asked" | "vibe" | "spontaneous",
+  userText: string = "",
 ): Promise<boolean> {
   const user = store.getUser(userId);
   const mood = store.getMood(userId);
+  const tier = store.getComfortTier(userId);
+  const history = store.getRecentHistory(userId);
 
-  // Ensure user has a stable seed
-  let seed = user.imageSeed;
-  if (!seed) {
-    seed = generateUserSeed(userId);
-    store.updateUser(userId, { imageSeed: seed });
-  }
-
-  // Rate limit: max 1 selfie per 10 minutes (skip in debug mode)
+  // Rate limit: max 1 Meera image per 10 minutes (skip in debug mode)
   const now = Date.now();
   const forceDebug = process.env.FORCE_SELFIE_DEBUG === "true";
   if (!forceDebug && user.lastSelfieSent && now - user.lastSelfieSent < 10 * 60 * 1000) {
-    console.log(`[ImageGen] Rate limited for user ${userId} — last selfie was ${Math.round((now - user.lastSelfieSent) / 1000)}s ago`);
+    console.log(`[MeeraImg] Rate limited for user ${userId} — last sent ${Math.round((now - user.lastSelfieSent) / 1000)}s ago`);
     return false;
   }
 
-  // Build character description (consistent face)
-  const charDesc = buildCharacterDescription(user.customPersona);
-  const scenario = pickSelfieScenario(mood);
+  // Check if we have community images
+  const hasImages = await meeraImages.hasImages();
+  if (!hasImages) {
+    console.log(`[MeeraImg] No community images available`);
+    return false;
+  }
 
-  // Generate the image — pass user's personal + community stability keys
-  const stabilityKeys = [...user.stabilityKeys, ...store.getStabilityCommunityKeyStrings()];
-  const result = await generateImage(
-    charDesc,
-    scenario.prompt,
-    seed,
-    scenario.aspectRatio,
-    scenario.style,
-    stabilityKeys,
+  // Get all captions and let Ollama pick the best one
+  const captions = await meeraImages.getCaptionsWithIndices();
+  const chosenIndex = await selectMeeraImage(
+    ollamaConfig,
+    userText || "(spontaneous photo share)",
+    mood,
+    tier,
+    captions,
+    history,
+    user.ollamaKeys,
   );
 
-  if (!result) return false;
+  const image = await meeraImages.getByIndex(chosenIndex);
+  if (!image) {
+    console.log(`[MeeraImg] Selected index ${chosenIndex} not found`);
+    return false;
+  }
 
   // Generate a natural caption via Ollama
   let caption: string;
   try {
-    const tier = store.getComfortTier(userId);
     const gender = parseGenderFromPersona(user.customPersona);
     const captionPrompt = reason === "asked"
-      ? `You're a ${gender === "girl" ? "girl" : "guy"} sending a selfie that was requested. The photo shows: ${scenario.prompt.slice(0, 100)}. Write a very short casual caption (1 line, max 10 words) in your style. Maybe add an emoji. Don't describe the photo literally. Be natural like real texting.`
+      ? `You're a ${gender === "girl" ? "girl" : "guy"} sending a photo of yourself that was requested. The photo shows: ${image.caption.slice(0, 100)}. Write a very short casual caption (1 line, max 10 words) in your style. Maybe add an emoji. Don't describe the photo literally. Be natural like real texting.`
       : reason === "vibe"
-      ? `You're a ${gender === "girl" ? "girl" : "guy"} sending a selfie because the conversation vibes are good. The photo shows: ${scenario.prompt.slice(0, 100)}. Write a super short casual caption (1 line, max 8 words) — maybe like "me rn", "current situation", or something playful. Don't be cringe.`
-      : `You're a ${gender === "girl" ? "girl" : "guy"} spontaneously sending a selfie to someone you're close with. The photo shows: ${scenario.prompt.slice(0, 100)}. Write a very short casual caption (1 line, max 8 words) — natural and low effort like "vibes", "bored lol", "hi" with an emoji. Don't explain why you're sending it.`;
+      ? `You're a ${gender === "girl" ? "girl" : "guy"} sending a photo of yourself because the conversation vibes are good. The photo shows: ${image.caption.slice(0, 100)}. Write a super short casual caption (1 line, max 8 words) — maybe like "me rn", "current situation", or something playful. Don't be cringe.`
+      : `You're a ${gender === "girl" ? "girl" : "guy"} spontaneously sending a selfie to someone you're close with. The photo shows: ${image.caption.slice(0, 100)}. Write a very short casual caption (1 line, max 8 words) — natural and low effort like "vibes", "bored lol", "hi" with an emoji. Don't explain why you're sending it.`;
 
     const messages: OllamaMessage[] = [
       { role: "system", content: user.customPersona || `You are ${botName}. Reply with just the caption, nothing else.` },
       { role: "user", content: captionPrompt },
     ];
     caption = await ollamaChat(messages, user.ollamaKeys);
-    // Clean: remove quotes and extra whitespace
     caption = caption.replace(/^["']|["']$/g, "").trim();
     if (caption.length > 100) caption = caption.slice(0, 100);
   } catch {
@@ -1938,17 +2057,61 @@ async function sendSelfieToChat(
 
   try {
     await ctx.sendChatAction("upload_photo").catch(() => {});
-    await (ctx as any).telegram.sendPhoto(ctx.chat!.id, { source: result.imageBuffer }, { caption });
+    await (ctx as any).telegram.sendPhoto(ctx.chat!.id, image.fileId, { caption });
 
-    store.addMessage(userId, "assistant", `[selfie: ${scenario.prompt.slice(0, 50)}] ${caption}`);
+    store.addMessage(userId, "assistant", `[meera photo: ${image.caption.slice(0, 50)}] ${caption}`);
     store.updateUser(userId, {
       lastSelfieSent: now,
       selfiesSent: (user.selfiesSent ?? 0) + 1,
     });
-    console.log(`[ImageGen] Sent selfie to user ${userId} (${reason}), seed=${seed}`);
+    console.log(`[MeeraImg] Sent community image to user ${userId} (${reason}), caption="${image.caption.slice(0, 40)}"`);
     return true;
   } catch (err) {
-    console.error(`[ImageGen] Failed to send selfie to ${userId}:`, err);
+    console.error(`[MeeraImg] Failed to send to ${userId}:`, err);
+    return false;
+  }
+}
+
+/**
+ * Generate and send a general (non-Meera) image via Stability AI.
+ * Used for creative requests like "draw a sunset", "generate a cat", etc.
+ */
+async function sendGeneratedImage(
+  ctx: Context,
+  userId: number,
+  prompt: string,
+): Promise<boolean> {
+  const user = store.getUser(userId);
+
+  // Gather all available Stability keys
+  const stabilityKeys = [...user.stabilityKeys, ...store.getStabilityCommunityKeyStrings()];
+  const result = await generateGeneralImage(prompt, "1:1", stabilityKeys);
+
+  if (!result) return false;
+
+  // Generate a natural caption via Ollama
+  let caption: string;
+  try {
+    const messages: OllamaMessage[] = [
+      { role: "system", content: user.customPersona || `You are ${botName}. Reply with just the caption, nothing else.` },
+      { role: "user", content: `You just generated/created an image based on someone's request. The prompt was: "${prompt.slice(0, 100)}". Write a super short casual caption (1 line, max 10 words) — like you're sending something you made. Examples: "here!", "yeh le ✨", "tadaa 🎨", "how's this". Don't describe the image.` },
+    ];
+    caption = await ollamaChat(messages, user.ollamaKeys);
+    caption = caption.replace(/^["']|["']$/g, "").trim();
+    if (caption.length > 100) caption = caption.slice(0, 100);
+  } catch {
+    caption = ["here! 🎨", "tadaa ✨", "made this for u", "here u go"][Math.floor(Math.random() * 4)];
+  }
+
+  try {
+    await ctx.sendChatAction("upload_photo").catch(() => {});
+    await (ctx as any).telegram.sendPhoto(ctx.chat!.id, { source: result.imageBuffer }, { caption });
+
+    store.addMessage(userId, "assistant", `[generated image: ${prompt.slice(0, 50)}] ${caption}`);
+    console.log(`[ImageGen] Sent generated image to user ${userId}`);
+    return true;
+  } catch (err) {
+    console.error(`[ImageGen] Failed to send generated image to ${userId}:`, err);
     return false;
   }
 }
@@ -2124,41 +2287,82 @@ async function handleTextMessage(
     };
   });
 
-  // ── Selfie detection: should Meera send a photo of herself?
+  // ── Selfie/image detection: should Meera send a photo?
+  // Now uses AI-powered decision: "meera" (community image), "generate" (Stability AI), or "none"
   const userForSelfie = store.getUser(userId);
   const hasStabilityKey = !!(process.env.STABILITY_API_KEY || userForSelfie.stabilityKeys.length > 0 || store.getStabilityCommunityKeyCount() > 0);
-  const selfieDecision = shouldSendSelfie(tier, mood, text, history, hasStabilityKey);
+  const hasMeeraImgs = await meeraImages.hasImages();
+  const selfieDecision = shouldSendSelfie(tier, mood, text, history, hasMeeraImgs || hasStabilityKey);
 
-  // ── Resolve conflict: if both content and selfie are triggered, decide which to send ──
-  // We await contentResult here so the decision + hints are ready before generating the reply
+  // ── Image type decision (Ollama decides: meera image, generate, or none)
+  let imageDecision: { type: "meera" | "generate" | "none"; prompt?: string } = { type: "none" };
+  if (selfieDecision.shouldSend) {
+    const forceDebug = process.env.FORCE_SELFIE_DEBUG === "true";
+    if (forceDebug && hasMeeraImgs) {
+      // Debug mode: always send a Meera image if available
+      imageDecision = { type: "meera" };
+      console.log(`[ImageGen][DEBUG] Force mode — sending Meera community image`);
+    } else if (selfieDecision.reason === "asked" && hasMeeraImgs) {
+      // Explicit selfie request + community images available → use Ollama to decide type
+      imageDecision = await decideImageType(
+        ollamaConfig, text, tier, mood, hasMeeraImgs, hasStabilityKey,
+        history, userForSelfie.ollamaKeys,
+      );
+    } else if (selfieDecision.reason === "asked" && !hasMeeraImgs && hasStabilityKey) {
+      // Explicit request but no community images → try generating if it's not a selfie request
+      imageDecision = await decideImageType(
+        ollamaConfig, text, tier, mood, false, hasStabilityKey,
+        history, userForSelfie.ollamaKeys,
+      );
+    } else if (hasMeeraImgs) {
+      // Vibe/spontaneous + community images → send a Meera image
+      imageDecision = { type: "meera" };
+    }
+  } else if (hasStabilityKey) {
+    // Even if no selfie was triggered, check if user wants a generated image
+    // (e.g. "draw me a sunset" won't match selfie patterns but should trigger generation)
+    const generatePatterns = [
+      /\b(generate|create|draw|make|design|paint|render|imagine).{0,15}(image|picture|photo|art|illustration|drawing|pic)\b/i,
+      /\b(image|picture|photo|art|drawing|pic).{0,15}(generate|create|draw|make|bana|banao|banaw)\b/i,
+      /\b(ek|ekta|ek ta).{0,10}(photo|picture|image|art).{0,10}(bana|banao|banaw|draw|create)\b/i,
+    ];
+    if (generatePatterns.some((p) => p.test(text))) {
+      imageDecision = await decideImageType(
+        ollamaConfig, text, tier, mood, false, hasStabilityKey,
+        history, userForSelfie.ollamaKeys,
+      );
+    }
+  }
+
+  // ── Resolve conflict: if both content and image are triggered, decide which to send ──
   const contentResult = await contentResultPromise;
-  const forceDebug = process.env.FORCE_SELFIE_DEBUG === "true";
-  const bothTriggered = !!contentResult && selfieDecision.shouldSend;
+  const bothTriggered = !!contentResult && imageDecision.type !== "none";
 
   let sendContent = !!contentResult;
-  let sendSelfie = selfieDecision.shouldSend;
+  let sendImage = imageDecision.type !== "none";
 
   if (bothTriggered) {
-    if (forceDebug) {
-      console.log(`[ImageGen][DEBUG] Both content + selfie triggered — forcing selfie (debug mode)`);
+    const forceDebug = process.env.FORCE_SELFIE_DEBUG === "true";
+    if (forceDebug && imageDecision.type === "meera") {
+      console.log(`[ImageGen][DEBUG] Both content + image triggered — forcing image (debug mode)`);
       sendContent = false;
-      sendSelfie = true;
     } else {
-      console.log(`[Decision] Both content + selfie triggered for ${userId} — asking AI to decide`);
+      console.log(`[Decision] Both content + image triggered for ${userId} — asking AI to decide`);
       const user = store.getUser(userId);
+      const imgReason = selfieDecision.shouldSend ? selfieDecision.reason : "asked";
       const choice = await decideSelfieVsContent(
         ollamaConfig,
         text,
         tier,
         mood,
-        selfieDecision.reason,
+        imgReason,
         contentResult!.reason,
         history.map((m: any) => ({ role: m.role as "user" | "assistant", content: m.content })),
         user.ollamaKeys,
       );
       console.log(`[Decision] AI chose: ${choice} for ${userId}`);
       sendContent = choice === "content" || choice === "both";
-      sendSelfie = choice === "selfie" || choice === "both";
+      sendImage = choice === "selfie" || choice === "both";
     }
   }
 
@@ -2174,12 +2378,17 @@ async function handleTextMessage(
       if (sendContent && contentResult) {
         contentHint = "\n\n(IMPORTANT: The user is asking you to share content/meme/reel/video. You ARE able to send them content — it will be sent automatically after your voice reply. So DON'T say you can't send videos or reels. Instead, acknowledge naturally like 'okay wait let me find one', 'hold on', 'chal dhundhti hu', 'ruk ekta pathachhi', etc. Keep it short and natural — the content will follow your voice reply.)";
       }
-      // If Meera will send a selfie, hint so she acknowledges it naturally
+      // If Meera will send an image, hint so she acknowledges it naturally
       let selfieHint = "";
-      if (sendSelfie) {
-        selfieHint = selfieDecision.reason === "asked"
-          ? "\n\n(The user is asking for a pic/selfie/photo. You WILL send one — it will be attached after your voice reply. Acknowledge naturally like 'okay hold on', 'fine fine here', 'ruk ektu', 'accha ruk' — don't say you can't send photos. Keep it short and natural.)"
-          : "\n\n(You're about to send a selfie spontaneously — it will appear after your voice reply. You can briefly hint at it like 'look at me rn lol' or 'btw' or just continue the conversation normally. Don't make a big deal of it.)";
+      if (sendImage) {
+        if (imageDecision.type === "meera") {
+          const imgReason = selfieDecision.shouldSend ? selfieDecision.reason : "asked";
+          selfieHint = imgReason === "asked"
+            ? "\n\n(The user is asking for a pic/selfie/photo. You WILL send one — it will be attached after your voice reply. Acknowledge naturally like 'okay hold on', 'fine fine here', 'ruk ektu', 'accha ruk' — don't say you can't send photos. Keep it short and natural.)"
+            : "\n\n(You're about to send a selfie spontaneously — it will appear after your voice reply. You can briefly hint at it like 'look at me rn lol' or 'btw' or just continue the conversation normally. Don't make a big deal of it.)";
+        } else if (imageDecision.type === "generate") {
+          selfieHint = "\n\n(The user asked you to generate/create an image. You WILL generate and send one — it will appear after your voice reply. Acknowledge naturally like 'okay let me make that', 'hold on creating it', 'ruk banati hu' — keep it short and natural.)";
+        }
       }
 
       stopTyping = typingIndicator(ctx, "record_voice");
@@ -2259,12 +2468,17 @@ async function handleTextMessage(
         contentHint = "\n\n(The user wants you to share a meme/reel/video. You CAN and WILL send them one — it happens automatically after your reply. So DON'T say you can't. Just acknowledge naturally like 'ruk dhundhti hu', 'hold on let me find one', 'wait pathachhi', 'ok dekh' — keep it short, the content follows right after.)";
       }
 
-      // If Meera will send a selfie, hint for natural acknowledgement
+      // If Meera will send an image, hint for natural acknowledgement
       let selfieHint = "";
-      if (sendSelfie) {
-        selfieHint = selfieDecision.reason === "asked"
-          ? "\n\n(The user asked for a pic/selfie. You WILL send one — it happens automatically after your reply. Acknowledge naturally like 'ok wait', 'hold on lol', 'fine fine', 'ruk bhejti hu' — keep it super short, the photo follows right after.)"
-          : "\n\n(You're about to send a selfie spontaneously. You can hint at it briefly like 'look at me rn' or 'btw' or just continue normally. Don't make a big deal of it.)";
+      if (sendImage) {
+        if (imageDecision.type === "meera") {
+          const imgReason = selfieDecision.shouldSend ? selfieDecision.reason : "asked";
+          selfieHint = imgReason === "asked"
+            ? "\n\n(The user asked for a pic/selfie. You WILL send one — it happens automatically after your reply. Acknowledge naturally like 'ok wait', 'hold on lol', 'fine fine', 'ruk bhejti hu' — keep it super short, the photo follows right after.)"
+            : "\n\n(You're about to send a selfie spontaneously. You can hint at it briefly like 'look at me rn' or 'btw' or just continue normally. Don't make a big deal of it.)";
+        } else if (imageDecision.type === "generate") {
+          selfieHint = "\n\n(The user asked you to generate/create an image. You WILL generate and send one after your reply. Acknowledge naturally like 'ok wait let me make that', 'hold on banati hu', 'ruk creating' — keep it short, the image follows right after.)";
+        }
       }
 
       // Build message with all context hints
@@ -2350,23 +2564,32 @@ async function handleTextMessage(
     }, shareDelay);
   }
 
-  // ── Selfie sending
-  if (sendSelfie) {
-    const selfieDelay = selfieDecision.reason === "asked"
+  // ── Image sending (Meera community image OR Stability AI generated)
+  if (sendImage) {
+    const imgReason = selfieDecision.shouldSend ? selfieDecision.reason : "asked";
+    const imageDelay = imgReason === "asked"
       ? 2000 + Math.random() * 2000
       : 4000 + Math.random() * 6000;
 
     setTimeout(async () => {
       try {
-        const sent = await sendSelfieToChat(ctx, userId, selfieDecision.reason);
-        if (!sent && selfieDecision.reason === "asked") {
-          await ctx.reply("ugh my camera's being weird rn 😩 later ok?");
-          store.addMessage(userId, "assistant", "ugh my camera's being weird rn 😩 later ok?");
+        if (imageDecision.type === "meera") {
+          const sent = await sendMeeraImage(ctx, userId, imgReason as "asked" | "vibe" | "spontaneous", text);
+          if (!sent && imgReason === "asked") {
+            await ctx.reply("ugh my camera's being weird rn 😩 later ok?");
+            store.addMessage(userId, "assistant", "ugh my camera's being weird rn 😩 later ok?");
+          }
+        } else if (imageDecision.type === "generate" && imageDecision.prompt) {
+          const sent = await sendGeneratedImage(ctx, userId, imageDecision.prompt);
+          if (!sent) {
+            await ctx.reply("couldn't make that rn 😩 try again later?");
+            store.addMessage(userId, "assistant", "couldn't make that rn 😩 try again later?");
+          }
         }
       } catch (err) {
-        console.error(`[ImageGen] Mid-chat selfie failed for ${userId}:`, err);
+        console.error(`[ImageGen] Mid-chat image failed for ${userId}:`, err);
       }
-    }, selfieDelay);
+    }, imageDelay);
   }
 }
 
@@ -2570,6 +2793,37 @@ bot.on(message("text"), async (ctx) => {
 
 // Photos
 bot.on(message("photo"), async (ctx) => {
+  const userId = ctx.from.id;
+
+  // Check if user is contributing Meera images
+  const fsmState = store.getFsmState(userId);
+  if (fsmState === "waiting_for_meera_image") {
+    const photo = ctx.message.photo[ctx.message.photo.length - 1];
+    const caption = ctx.message.caption?.trim();
+
+    if (!caption || caption.length < 5) {
+      await ctx.reply(
+        "⚠️ Please include a caption describing this photo (pose, mood, setting, outfit, etc.)\n\n" +
+        "Example: \"Meera smiling at a cafe, holding coffee, warm afternoon light\"\n\n" +
+        "Send the photo again with a caption.",
+      );
+      return;
+    }
+
+    const name = ctx.from.first_name + (ctx.from.last_name ? " " + ctx.from.last_name : "");
+    const contributor = ctx.from.username ? `@${ctx.from.username}` : name;
+
+    const image = await meeraImages.addImage(photo.file_id, caption, userId, contributor);
+    const count = await meeraImages.getCount();
+
+    await ctx.reply(
+      `✅ Photo added! (${count} total in the pool)\n` +
+      `📝 Caption: "${caption}"\n\n` +
+      "Send another photo with caption, or /doneupload when finished.",
+    );
+    return;
+  }
+
   const photo = ctx.message.photo[ctx.message.photo.length - 1];
   const base64 = await downloadFile(photo.file_id);
   const parts: Record<string, unknown>[] = [];

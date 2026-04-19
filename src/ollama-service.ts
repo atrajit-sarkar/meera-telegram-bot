@@ -445,3 +445,141 @@ Reply with ONLY one word: "selfie", "content", or "both". Nothing else.`;
     return selfieReason === "asked" ? "selfie" : "content";
   }
 }
+
+// ── Image Type Decision ──────────────────────────────────────────
+
+export type ImageTypeChoice = "meera" | "generate" | "none";
+
+/**
+ * Decide what type of image to send:
+ * - "meera": Send a community-contributed Meera image (selfie/photo of herself)
+ * - "generate": Generate a new image via Stability AI (landscapes, objects, art, anything NOT Meera's face)
+ * - "none": No image needed
+ */
+export async function decideImageType(
+  config: OllamaConfig,
+  userMessage: string,
+  comfortTier: string,
+  mood: string,
+  hasMeeraImages: boolean,
+  hasStabilityKey: boolean,
+  chatHistory: OllamaMessage[],
+  userKeys: string[] = [],
+): Promise<{ type: ImageTypeChoice; prompt?: string }> {
+  const systemPrompt = `You are deciding what a real girl (Meera) should do in a Telegram chat when the user might want an image.
+
+Available options:
+${hasMeeraImages ? '- "meera": Send a photo OF Meera herself (selfie, photo, pic of her)' : ""}
+${hasStabilityKey ? '- "generate": Generate a NEW image that is NOT Meera (landscape, food, art, drawing, scenery, meme, anything creative)' : ""}
+- "none": No image is needed — just a normal text/voice reply
+
+Context:
+- Comfort tier: ${comfortTier} (stranger < acquaintance < comfortable < close)
+- Mood: ${mood}
+
+Rules (think like a real girl deciding what to send):
+- If user asks for a selfie/pic/photo OF HER (e.g. "send pic", "show me your face", "selfie bhej") → "meera"
+- If user asks to CREATE/GENERATE/DRAW something (e.g. "draw a sunset", "generate an image of a cat", "make me a picture of...") → "generate"
+- If the conversation vibe suggests she'd spontaneously send a pic of herself → "meera" (only for comfortable+)
+- If neither is needed → "none"
+- Strangers/acquaintances should rarely get "meera" (she's not comfortable sharing photos yet)
+${!hasMeeraImages ? '- "meera" is NOT available (no community images yet), use "generate" only for non-Meera image requests' : ""}
+${!hasStabilityKey ? '- "generate" is NOT available (no API key), use "meera" only for selfie requests' : ""}
+
+Reply format: TYPE|PROMPT
+- For "meera": just reply "meera" (no prompt needed)
+- For "generate": reply "generate|a detailed description of what to create" — write a high-quality image generation prompt
+- For "none": just reply "none"
+
+Examples:
+- User: "send me a pic" → meera
+- User: "draw me a sunset over the ocean" → generate|a breathtaking sunset over a calm ocean, golden hour light reflecting on the water, vibrant orange and purple sky, photorealistic
+- User: "how was your day" → none
+- User: "generate an image of a cute cat" → generate|an adorable fluffy orange tabby cat with big green eyes, sitting on a windowsill, soft natural lighting, photographic quality
+
+Reply with ONLY the format above. Nothing else.`;
+
+  try {
+    const messages: OllamaMessage[] = [
+      { role: "system", content: systemPrompt },
+      ...chatHistory.slice(-6).filter((m) => m.role !== "system"),
+      { role: "user", content: userMessage },
+    ];
+    const raw = await callOllamaWithRotation(config, messages, userKeys);
+    const cleaned = raw.trim();
+
+    if (cleaned.toLowerCase().startsWith("generate|") || cleaned.toLowerCase().startsWith("generate |")) {
+      const prompt = cleaned.slice(cleaned.indexOf("|") + 1).trim();
+      if (hasStabilityKey && prompt.length > 0) {
+        return { type: "generate", prompt };
+      }
+      // Fallback if no key
+      return { type: "none" };
+    }
+    if (cleaned.toLowerCase().startsWith("meera")) {
+      return hasMeeraImages ? { type: "meera" } : { type: "none" };
+    }
+    return { type: "none" };
+  } catch (err) {
+    console.error("[AI] decideImageType failed:", err);
+    return { type: "none" };
+  }
+}
+
+/**
+ * Given conversation context and a list of available Meera image captions,
+ * pick the best matching image to send.
+ * Returns the index of the chosen image.
+ */
+export async function selectMeeraImage(
+  config: OllamaConfig,
+  userMessage: string,
+  mood: string,
+  comfortTier: string,
+  captions: Array<{ index: number; caption: string }>,
+  chatHistory: OllamaMessage[],
+  userKeys: string[] = [],
+): Promise<number> {
+  if (captions.length === 0) return -1;
+  if (captions.length === 1) return captions[0].index;
+
+  const captionList = captions
+    .map((c) => `${c.index + 1}. ${c.caption}`)
+    .join("\n");
+
+  const systemPrompt = `You are helping Meera (a real girl) pick which photo of herself to send in a Telegram chat.
+
+Available photos:
+${captionList}
+
+Context:
+- Current mood: ${mood}
+- Comfort tier with user: ${comfortTier}
+
+Rules:
+- Pick the photo that best matches the conversation context and what the user asked for
+- If the user asked for a specific type of photo (e.g. "send me a morning selfie"), pick one that matches
+- If no specific request, pick one that matches Meera's current mood or the conversation vibe
+- Consider the time of day — morning photos for morning, night photos for night, etc.
+- If multiple photos could work, pick randomly but lean towards ones that feel natural
+
+Reply with ONLY the number of the photo you pick. Nothing else. Just the number.`;
+
+  try {
+    const messages: OllamaMessage[] = [
+      { role: "system", content: systemPrompt },
+      ...chatHistory.slice(-6).filter((m) => m.role !== "system"),
+      { role: "user", content: userMessage },
+    ];
+    const raw = await callOllamaWithRotation(config, messages, userKeys);
+    const num = parseInt(raw.trim().replace(/[^0-9]/g, ""));
+    if (num >= 1 && num <= captions.length) {
+      return captions[num - 1].index; // Convert 1-based to actual index
+    }
+    // Fallback: random
+    return captions[Math.floor(Math.random() * captions.length)].index;
+  } catch (err) {
+    console.error("[AI] selectMeeraImage failed:", err);
+    return captions[Math.floor(Math.random() * captions.length)].index;
+  }
+}

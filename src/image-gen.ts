@@ -341,6 +341,85 @@ export async function generateImage(
   return null;
 }
 
+// ── General image generation (non-Meera) ────────────────────────────
+
+/**
+ * Generate a general (non-Meera) image via Stability AI.
+ * Used for creative requests like "draw a sunset", "generate a cat", etc.
+ *
+ * @param prompt       The image generation prompt (from Ollama)
+ * @param aspectRatio  Image aspect ratio
+ * @param extraKeys    Additional Stability API keys to try
+ */
+export async function generateGeneralImage(
+  prompt: string,
+  aspectRatio: string = "1:1",
+  extraKeys: string[] = [],
+): Promise<ImageGenResult | null> {
+  const allKeys = [...extraKeys, STABILITY_API_KEY].filter(Boolean);
+  const seen = new Set<string>();
+  const uniqueKeys = allKeys.filter((k) => {
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+
+  if (uniqueKeys.length === 0) {
+    console.log("[ImageGen] No Stability API keys available for general image");
+    return null;
+  }
+
+  const fullPrompt = `High quality, detailed, professional photography. ${prompt}`;
+  const seed = Math.floor(Math.random() * 4294967293) + 1; // Random seed for variety
+
+  console.log(`[ImageGen] Generating general image — aspect=${aspectRatio}, keys=${uniqueKeys.length}`);
+  console.log(`[ImageGen] Prompt: ${fullPrompt.slice(0, 120)}...`);
+
+  let lastError = "";
+
+  for (const apiKey of uniqueKeys) {
+    const formData = new FormData();
+    formData.append("prompt", fullPrompt);
+    formData.append("negative_prompt", NEGATIVE_PROMPT);
+    formData.append("seed", seed.toString());
+    formData.append("aspect_ratio", aspectRatio);
+    formData.append("output_format", "jpeg");
+
+    try {
+      const response = await fetch(STABILITY_ENDPOINT, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${apiKey}`,
+          accept: "image/*",
+        },
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const errBody = await response.text().catch(() => "unknown");
+        lastError = `${response.status}: ${errBody}`;
+        if (response.status === 401 || response.status === 403 || response.status === 429) {
+          console.log(`[ImageGen] Key ${apiKey.slice(0, 6)}... failed (${response.status}), trying next...`);
+          continue;
+        }
+        console.error(`[ImageGen] Stability API error ${response.status}: ${errBody}`);
+        return null;
+      }
+
+      const buffer = Buffer.from(await response.arrayBuffer());
+      console.log(`[ImageGen] Generated general image ${buffer.length} bytes`);
+      return { imageBuffer: buffer, seed, prompt: fullPrompt };
+    } catch (err) {
+      lastError = String(err);
+      console.log(`[ImageGen] Key ${apiKey.slice(0, 6)}... threw error, trying next...`);
+      continue;
+    }
+  }
+
+  console.error(`[ImageGen] All ${uniqueKeys.length} keys exhausted for general image. Last error: ${lastError}`);
+  return null;
+}
+
 // ── Generate a per-user seed (deterministic from userId) ────────────
 
 /**
