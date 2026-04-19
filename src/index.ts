@@ -2514,14 +2514,14 @@ async function handleTextMessage(
 
       await sendGeminiResponse(ctx, response, quoteReplyId);
 
-      // Save to history
+      // Save to history — tag Gemini's audio response as voice reply
       if (isBatched) {
         for (const t of batchedTexts!) store.addMessage(userId, "user", t);
       } else {
         store.addMessage(userId, "user", text);
       }
       if (response.text.trim()) {
-        store.addMessage(userId, "assistant", response.text);
+        store.addMessage(userId, "assistant", `[voice reply] ${response.text}`);
       }
 
       if (response.text.trim()) {
@@ -2793,10 +2793,11 @@ async function handleMediaMessage(
         // Comfortable+ → send audio response directly from Gemini Live
         await sendGeminiResponse(ctx, response, quoteReplyId);
 
-        // Save to history
-        store.addMessage(userId, "user", "[sent media]");
+        // Save to history — use input transcription if available, tag as voice
+        const userSaid = response.inputTranscription?.trim();
+        store.addMessage(userId, "user", userSaid ? `[voice message] ${userSaid}` : "[sent voice message]");
         if (response.text.trim()) {
-          store.addMessage(userId, "assistant", response.text);
+          store.addMessage(userId, "assistant", `[voice reply] ${response.text}`);
         }
 
         // Maybe send a sticker after
@@ -2830,8 +2831,9 @@ async function handleMediaMessage(
       // Add deliberate typos
       reply = addDeliberateTypos(reply, mood);
 
-      // Save to history
-      store.addMessage(userId, "user", "[sent media]");
+      // Save to history — use input transcription if available, tag as voice
+      const userSaid = response.inputTranscription?.trim();
+      store.addMessage(userId, "user", userSaid ? `[voice message] ${userSaid}` : "[sent voice message]");
       store.addMessage(userId, "assistant", reply);
 
       const delay = typingDelay(reply) * timeOfDayMultiplier();

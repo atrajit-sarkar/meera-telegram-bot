@@ -22,6 +22,7 @@ type Part = { text: string } | { inlineData: { data: string; mimeType: string } 
 export interface GeminiResponse {
   text: string;
   audioChunks: Buffer[];
+  inputTranscription: string;
 }
 
 /**
@@ -40,6 +41,7 @@ export class GeminiSession {
   private ready = false;
   private responseTextParts: string[] = [];
   private responseAudioChunks: Buffer[] = [];
+  private inputTranscriptionParts: string[] = [];
   private responseResolve: ((res: GeminiResponse) => void) | null = null;
   private responseReject: ((err: Error) => void) | null = null;
   private responseTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -85,6 +87,7 @@ export class GeminiSession {
               ? [{ functionDeclarations: this.config.tools }]
               : undefined,
             outputAudioTranscription: {},
+            inputAudioTranscription: {},
           },
         };
         console.log("[GeminiSession] Setup model:", setupMsg.setup.model);
@@ -124,6 +127,11 @@ export class GeminiSession {
             // Audio output transcription
             if (sc.outputTranscription?.text) {
               this.responseTextParts.push(sc.outputTranscription.text);
+            }
+
+            // Audio input transcription (user's speech)
+            if (sc.inputTranscription?.text) {
+              this.inputTranscriptionParts.push(sc.inputTranscription.text);
             }
 
             if (sc.turnComplete) {
@@ -176,10 +184,12 @@ export class GeminiSession {
   private resolveCurrentResponse() {
     const text = this.responseTextParts.join("");
     const audioChunks = [...this.responseAudioChunks];
+    const inputTranscription = this.inputTranscriptionParts.join("");
     this.responseTextParts = [];
     this.responseAudioChunks = [];
+    this.inputTranscriptionParts = [];
     if (this.responseTimeout) clearTimeout(this.responseTimeout);
-    this.responseResolve?.({ text, audioChunks });
+    this.responseResolve?.({ text, audioChunks, inputTranscription });
     this.responseResolve = null;
     this.responseReject = null;
   }
@@ -191,6 +201,7 @@ export class GeminiSession {
     this.responseReject = null;
     this.responseTextParts = [];
     this.responseAudioChunks = [];
+    this.inputTranscriptionParts = [];
   }
 
   private sendToolResponse(
@@ -229,12 +240,14 @@ export class GeminiSession {
       return await new Promise<GeminiResponse>((resolve, reject) => {
         this.responseTextParts = [];
         this.responseAudioChunks = [];
+        this.inputTranscriptionParts = [];
         this.responseResolve = resolve;
         this.responseReject = reject;
 
         this.responseTimeout = setTimeout(() => {
           this.responseTextParts = [];
           this.responseAudioChunks = [];
+          this.inputTranscriptionParts = [];
           this.responseReject?.(new Error("Response timeout (60s)"));
           this.responseResolve = null;
           this.responseReject = null;
