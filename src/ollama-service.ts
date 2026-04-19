@@ -385,3 +385,63 @@ export async function pickStickerEmoji(
     return null;
   }
 }
+
+// ── Selfie vs Content Decision ───────────────────────────────────
+
+export type SelfieVsContentChoice = "selfie" | "content" | "both";
+
+/**
+ * When both a selfie and content (meme/reel/video) are detected for the same message,
+ * ask the AI to decide which one to send — like a real girl would.
+ *
+ * E.g. if she's close with the user and they say "send me a pic", she'd send a selfie.
+ * But if they say "send me a funny reel" her photo isn't relevant.
+ */
+export async function decideSelfieVsContent(
+  config: OllamaConfig,
+  userMessage: string,
+  comfortTier: string,
+  mood: string,
+  selfieReason: "asked" | "vibe" | "spontaneous",
+  contentReason: "asked" | "vibe" | "random",
+  chatHistory: OllamaMessage[],
+  userKeys: string[] = []
+): Promise<SelfieVsContentChoice> {
+  const systemPrompt = `You are deciding what a real girl (Meera) should send in a Telegram chat when BOTH a selfie/photo AND a meme/reel/video could be sent.
+
+Context:
+- Comfort tier with user: ${comfortTier} (stranger < acquaintance < comfortable < close)
+- Current mood: ${mood}
+- Selfie trigger reason: ${selfieReason}
+- Content trigger reason: ${contentReason}
+
+Rules (think like a real girl):
+- If the user is EXPLICITLY asking for a selfie/pic/photo → "selfie"
+- If the user is EXPLICITLY asking for a meme/reel/video/content → "content"
+- If the user's message could mean either, decide based on comfort tier:
+  - "close" tier: lean towards "selfie" (she's comfortable sharing photos)
+  - "comfortable" tier: could go either way based on context
+  - "acquaintance"/"stranger" tier: lean towards "content" (not comfortable enough for selfies yet)
+- If both are explicitly asked for ("send me a pic and a meme") → "both"
+- If neither is explicitly asked (both are vibe/spontaneous triggers) → pick whichever fits the conversation better, usually "content" unless the vibe is very personal/intimate
+
+Reply with ONLY one word: "selfie", "content", or "both". Nothing else.`;
+
+  try {
+    const messages: OllamaMessage[] = [
+      { role: "system", content: systemPrompt },
+      ...chatHistory.slice(-6).filter((m) => m.role !== "system"),
+      { role: "user", content: userMessage },
+    ];
+    const raw = await callOllamaWithRotation(config, messages, userKeys);
+    const choice = raw.trim().toLowerCase().replace(/[^a-z]/g, "");
+    if (choice === "selfie" || choice === "content" || choice === "both") {
+      return choice;
+    }
+    // Default: if user asked for selfie explicitly, prefer selfie
+    return selfieReason === "asked" ? "selfie" : "content";
+  } catch (err) {
+    console.error("[AI] decideSelfieVsContent failed:", err);
+    return selfieReason === "asked" ? "selfie" : "content";
+  }
+}

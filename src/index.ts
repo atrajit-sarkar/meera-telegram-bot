@@ -21,6 +21,7 @@ import {
   pickStickerEmoji,
   decideResponseBehavior,
   detectContentRequest,
+  decideSelfieVsContent,
   type OllamaConfig,
   type OllamaMessage,
 } from "./ollama-service.js";
@@ -1908,6 +1909,39 @@ async function handleTextMessage(
   // ── Selfie detection: should Meera send a photo of herself?
   const selfieDecision = shouldSendSelfie(tier, mood, text, history);
 
+  // ── Resolve conflict: if both content and selfie are triggered, decide which to send ──
+  // We await contentResult here so the decision + hints are ready before generating the reply
+  const contentResult = await contentResultPromise;
+  const forceDebug = process.env.FORCE_SELFIE_DEBUG === "true";
+  const bothTriggered = !!contentResult && selfieDecision.shouldSend;
+
+  let sendContent = !!contentResult;
+  let sendSelfie = selfieDecision.shouldSend;
+
+  if (bothTriggered) {
+    if (forceDebug) {
+      console.log(`[ImageGen][DEBUG] Both content + selfie triggered — forcing selfie (debug mode)`);
+      sendContent = false;
+      sendSelfie = true;
+    } else {
+      console.log(`[Decision] Both content + selfie triggered for ${userId} — asking AI to decide`);
+      const user = store.getUser(userId);
+      const choice = await decideSelfieVsContent(
+        ollamaConfig,
+        text,
+        tier,
+        mood,
+        selfieDecision.reason,
+        contentResult!.reason,
+        history.map((m: any) => ({ role: m.role as "user" | "assistant", content: m.content })),
+        user.ollamaKeys,
+      );
+      console.log(`[Decision] AI chose: ${choice} for ${userId}`);
+      sendContent = choice === "content" || choice === "both";
+      sendSelfie = choice === "selfie" || choice === "both";
+    }
+  }
+
   if (useVoice) {
     // Voice reply via Gemini Live
     let stopTyping = () => {};
@@ -1915,17 +1949,14 @@ async function handleTextMessage(
       const readTime = readDelay(text) * todMultiplier * paceMult;
       await new Promise((r) => setTimeout(r, readTime));
 
-      // Wait for content detection to resolve (it ran in parallel with readDelay)
-      const contentResult = await contentResultPromise;
-
-      // If user is asking for content, tell Gemini so it doesn't refuse
+      // If user is asking for content and we're actually sending it, hint Gemini
       let contentHint = "";
-      if (contentResult) {
+      if (sendContent && contentResult) {
         contentHint = "\n\n(IMPORTANT: The user is asking you to share content/meme/reel/video. You ARE able to send them content — it will be sent automatically after your voice reply. So DON'T say you can't send videos or reels. Instead, acknowledge naturally like 'okay wait let me find one', 'hold on', 'chal dhundhti hu', 'ruk ekta pathachhi', etc. Keep it short and natural — the content will follow your voice reply.)";
       }
       // If Meera will send a selfie, hint so she acknowledges it naturally
       let selfieHint = "";
-      if (selfieDecision.shouldSend) {
+      if (sendSelfie) {
         selfieHint = selfieDecision.reason === "asked"
           ? "\n\n(The user is asking for a pic/selfie/photo. You WILL send one — it will be attached after your voice reply. Acknowledge naturally like 'okay hold on', 'fine fine here', 'ruk ektu', 'accha ruk' — don't say you can't send photos. Keep it short and natural.)"
           : "\n\n(You're about to send a selfie spontaneously — it will appear after your voice reply. You can briefly hint at it like 'look at me rn lol' or 'btw' or just continue the conversation normally. Don't make a big deal of it.)";
@@ -1999,21 +2030,18 @@ async function handleTextMessage(
       const readTime = readDelay(text) * todMultiplier * paceMult;
       await new Promise((r) => setTimeout(r, readTime));
 
-      // Wait for content detection (ran in parallel with readDelay)
-      const contentResult = await contentResultPromise;
-
       stopTyping = typingIndicator(ctx, "typing");
       const user = store.getUser(userId);
 
-      // If user is asking for content, hint Ollama to acknowledge naturally
+      // If we're sending content, hint Ollama to acknowledge naturally
       let contentHint = "";
-      if (contentResult) {
+      if (sendContent && contentResult) {
         contentHint = "\n\n(The user wants you to share a meme/reel/video. You CAN and WILL send them one — it happens automatically after your reply. So DON'T say you can't. Just acknowledge naturally like 'ruk dhundhti hu', 'hold on let me find one', 'wait pathachhi', 'ok dekh' — keep it short, the content follows right after.)";
       }
 
       // If Meera will send a selfie, hint for natural acknowledgement
       let selfieHint = "";
-      if (selfieDecision.shouldSend && (selfieDecision.reason === "asked" || !contentResult)) {
+      if (sendSelfie) {
         selfieHint = selfieDecision.reason === "asked"
           ? "\n\n(The user asked for a pic/selfie. You WILL send one — it happens automatically after your reply. Acknowledge naturally like 'ok wait', 'hold on lol', 'fine fine', 'ruk bhejti hu' — keep it super short, the photo follows right after.)"
           : "\n\n(You're about to send a selfie spontaneously. You can hint at it briefly like 'look at me rn' or 'btw' or just continue normally. Don't make a big deal of it.)";
@@ -2074,27 +2102,21 @@ async function handleTextMessage(
     }
   }
 
-  // ── Mid-chat content sharing: use the already-resolved content detection result
-  // (detection ran in parallel with read delay, result was used for prompt hints above)
-  const contentResult = await contentResultPromise;
-  if (contentResult) {
+  // ── Mid-chat content sharing (decision already resolved above)
+  if (sendContent && contentResult) {
     console.log(`[Content] Will share content for ${userId}: reason=${contentResult.reason}, query=${contentResult.searchQuery ?? "none"}`);
-    // Small delay — she replied first, now "finds" the content
     const shareDelay = contentResult.reason === "asked"
-      ? 1500 + Math.random() * 2000      // Quick when asked
-      : 3000 + Math.random() * 5000;     // Natural delay when spontaneous
+      ? 1500 + Math.random() * 2000
+      : 3000 + Math.random() * 5000;
 
     setTimeout(async () => {
       try {
         let post: ContentPost | null = null;
-
-        // Use AI-generated search query for better relevance
         if (contentResult.searchQuery) {
           post = await getContentByAIQuery(userId, contentResult.searchQuery, contentResult.contentType);
         } else {
           post = await getRandomContentAny(userId);
         }
-
         if (post) {
           await ctx.sendChatAction("typing").catch(() => {});
           await new Promise((r) => setTimeout(r, 800 + Math.random() * 1200));
@@ -2108,19 +2130,16 @@ async function handleTextMessage(
     }, shareDelay);
   }
 
-  // ── Selfie sending: if detected, generate and send after reply
-  // When user explicitly asked for a selfie, always send (even if content was shared)
-  // For vibe/spontaneous selfies, skip if content was already shared
-  if (selfieDecision.shouldSend && (selfieDecision.reason === "asked" || !contentResult)) {
+  // ── Selfie sending
+  if (sendSelfie) {
     const selfieDelay = selfieDecision.reason === "asked"
-      ? 2000 + Math.random() * 2000     // Quick when explicitly asked
-      : 4000 + Math.random() * 6000;    // Natural delay for vibe/spontaneous
+      ? 2000 + Math.random() * 2000
+      : 4000 + Math.random() * 6000;
 
     setTimeout(async () => {
       try {
         const sent = await sendSelfieToChat(ctx, userId, selfieDecision.reason);
         if (!sent && selfieDecision.reason === "asked") {
-          // If user asked but generation failed, apologize naturally
           await ctx.reply("ugh my camera's being weird rn 😩 later ok?");
           store.addMessage(userId, "assistant", "ugh my camera's being weird rn 😩 later ok?");
         }
