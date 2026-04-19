@@ -35,6 +35,7 @@ import {
   shouldSendSelfie,
 } from "./image-gen.js";
 import { MeeraImageStore } from "./meera-image-store.js";
+import { DpManager } from "./dp-manager.js";
 import type { Context } from "telegraf";
 import type { GeminiResponse } from "./gemini-session.js";
 
@@ -76,6 +77,16 @@ const store = new UserStore(50, FIREBASE_DB_ID);
 
 // Community Meera image database (shares Firestore instance via store)
 const meeraImages = new MeeraImageStore(store.getDb());
+
+// Auto-DP manager: changes bot profile photo based on aggregate user mood
+const dpManager = new DpManager({
+  telegram: bot.telegram,
+  botToken: BOT_TOKEN,
+  store,
+  meeraImages,
+  ollamaConfig,
+  getCommunityKeys: () => store.getCommunityKeyStrings(),
+});
 
 // Gemini Live sessions — for image/audio/video (uses per-user persona)
 const sessions = new SessionManager((userId: number) => {
@@ -3115,6 +3126,9 @@ bot.launch().then(async () => {
 
   // Check for proactive messages every 5 minutes
   setInterval(() => proactiveLoop().catch(console.error), 5 * 60 * 1000);
+
+  // Start auto-DP manager (changes bot profile photo like a real girl)
+  dpManager.start();
 }).catch((err) => {
   console.error("Failed to launch bot:", err);
   process.exit(1);
@@ -3122,11 +3136,13 @@ bot.launch().then(async () => {
 
 process.once("SIGINT", async () => {
   bot.stop("SIGINT");
+  dpManager.stop();
   sessions.destroy();
   await store.destroy();
 });
 process.once("SIGTERM", async () => {
   bot.stop("SIGTERM");
+  dpManager.stop();
   sessions.destroy();
   await store.destroy();
 });
