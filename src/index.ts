@@ -2049,6 +2049,17 @@ async function maybeSendLocation(
 }
 
 // Feature 9: Casual polls
+
+/** Track active polls so we can react to answers */
+interface ActivePoll {
+  chatId: number;
+  userId: number;
+  question: string;
+  options: string[];
+  sentAt: number;
+}
+const activePolls = new Map<string, ActivePoll>(); // keyed by poll_id
+
 async function maybeSendPoll(
   ctx: Context,
   userId: number,
@@ -2086,7 +2097,19 @@ async function maybeSendPoll(
     const options = [option1Match[1].trim().slice(0, 100), option2Match[1].trim().slice(0, 100)];
     if (option3Match) options.push(option3Match[1].trim().slice(0, 100));
 
-    await (ctx as any).telegram.sendPoll(ctx.chat!.id, question, options, { is_anonymous: false });
+    const pollMsg = await (ctx as any).telegram.sendPoll(ctx.chat!.id, question, options, { is_anonymous: false });
+    // Track poll so we can react when user answers
+    if (pollMsg?.poll?.id) {
+      activePolls.set(pollMsg.poll.id, {
+        chatId: ctx.chat!.id,
+        userId,
+        question,
+        options,
+        sentAt: Date.now(),
+      });
+      // Auto-cleanup after 1 hour
+      setTimeout(() => activePolls.delete(pollMsg.poll.id), 60 * 60 * 1000);
+    }
     store.addMessage(userId, "assistant", `[poll: ${question}]`);
     console.log(`[Poll] Sent poll to user ${userId}: "${question}"`);
     return true;
@@ -3575,6 +3598,71 @@ bot.on(message("document"), async (ctx) => {
     parts.push({ inlineData: { data: base64, mimeType: mime } });
     await handleMediaMessage(ctx, parts);
   }
+});
+
+// ── POLL ANSWER HANDLER ──────────────────────────────────────────────
+
+bot.on("poll_answer", async (ctx) => {
+  const answer = ctx.pollAnswer;
+  if (!answer) return;
+
+  const pollId = answer.poll_id;
+  const poll = activePolls.get(pollId);
+  if (!poll) return; // Not a poll we sent
+
+  const userId = answer.user?.id ?? poll.userId;
+  const chosenIndices = answer.option_ids;
+  if (!chosenIndices || chosenIndices.length === 0) return; // Retracted vote
+
+  const chosenOptions = chosenIndices
+    .map((i: number) => poll.options[i])
+    .filter(Boolean);
+  if (chosenOptions.length === 0) return;
+
+  const chosenText = chosenOptions.join(", ");
+
+  // Log to history so the bot has context
+  store.addMessage(poll.userId, "user", `[poll answer: chose "${chosenText}" for "${poll.question}"]`);
+  console.log(`[PollAnswer] User ${userId} chose "${chosenText}" for "${poll.question}"`);
+
+  // Generate a natural reaction to their answer
+  try {
+    const user = store.getUser(poll.userId);
+    const tier = store.getComfortTier(poll.userId);
+    const mood = store.getMood(poll.userId);
+    const history = store.getRecentHistory(poll.userId);
+
+    const reactionPrompt = `You sent a poll asking: "${poll.question}" with options: ${poll.options.map((o, i) => `${i + 1}. ${o}`).join(", ")}.
+
+The user picked: "${chosenText}".
+
+React to their choice naturally like a real person would — tease them, agree, be dramatic, be judgmental in a fun way, etc. Keep it SHORT (1-2 lines max). Examples of vibes:
+- "REALLY?? that one?? 😭"
+- "okay taste 👀"
+- "knew it lol"
+- "umm wrong answer but ok"
+- "yesss that's what I would've picked too!!"
+- "bro no way 💀"
+Match the conversation language. Be natural.`;
+
+    const messages = buildOllamaMessages(reactionPrompt, history, tier, user, mood);
+    let reply = await ollamaChat(messages, user.ollamaKeys);
+    reply = reply.replace(/^["']|["']$/g, "").trim();
+    if (!reply || reply.length > 300) return;
+
+    // Small delay — like she's processing the answer
+    await new Promise(r => setTimeout(r, 2000 + Math.random() * 4000));
+
+    await bot.telegram.sendChatAction(poll.chatId, "typing");
+    await new Promise(r => setTimeout(r, 800 + Math.random() * 1500));
+    await bot.telegram.sendMessage(poll.chatId, reply);
+    store.addMessage(poll.userId, "assistant", reply);
+  } catch (err) {
+    console.error(`[PollAnswer] Failed to react for user ${userId}:`, err);
+  }
+
+  // Clean up — poll answered
+  activePolls.delete(pollId);
 });
 
 // ── PROACTIVE MESSAGING ─────────────────────────────────────────────
