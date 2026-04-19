@@ -65,10 +65,20 @@ export class DpManager {
   /** Main tick: check if it's time to change DP */
   private async tick(): Promise<void> {
     const elapsed = Date.now() - this.lastDpChange;
-    if (elapsed < this.nextChangeDelay) return;
+    const remaining = Math.max(0, this.nextChangeDelay - elapsed);
+    if (elapsed < this.nextChangeDelay) {
+      console.log(`[DpManager] Tick — next DP change in ~${Math.round(remaining / 60_000)}min`);
+      return;
+    }
 
     const hasImages = await this.meeraImages.hasImages();
-    if (!hasImages) return;
+    if (!hasImages) {
+      console.log("[DpManager] Tick — no community images available, skipping");
+      // Re-check in 30 min instead of waiting full delay
+      this.lastDpChange = Date.now();
+      this.nextChangeDelay = 30 * 60_000;
+      return;
+    }
 
     try {
       await this.changeDp();
@@ -82,28 +92,28 @@ export class DpManager {
     console.log(`[DpManager] Next DP change in ~${Math.round(this.nextChangeDelay / 3600_000)}h`);
   }
 
-  /** Aggregate mood across all active users and change DP accordingly */
-  private async changeDp(): Promise<void> {
+  /** Aggregate mood across all active users and change DP accordingly. Public for manual trigger. */
+  async changeDp(): Promise<string> {
     const averageMood = this.getAverageMood();
     console.log(`[DpManager] Average mood across users: ${averageMood}`);
 
     // Get captions and let Ollama pick the best one based on average mood
     const captions = await this.meeraImages.getCaptionsWithIndices();
-    if (captions.length === 0) return;
+    if (captions.length === 0) return "No community images available";
 
     const chosenIndex = await this.pickImageForMood(averageMood, captions);
     if (chosenIndex < 0) {
       console.log("[DpManager] No suitable image found for current mood, skipping");
-      return;
+      return "No suitable image for current mood";
     }
 
     const image = await this.meeraImages.getByIndex(chosenIndex);
-    if (!image) return;
+    if (!image) return "Selected image not found";
 
-    // Don't set the same image again
+    // Don't set the same image again (skip for manual triggers)
     if (image.id === this.currentImageId) {
       console.log("[DpManager] Same image already set, skipping");
-      return;
+      return "Same image already set, skipped";
     }
 
     // Download the image from Telegram
@@ -114,7 +124,9 @@ export class DpManager {
     // Set as bot's profile photo via raw API call
     await this.setProfilePhoto(buffer);
     this.currentImageId = image.id;
-    console.log(`[DpManager] DP updated! Image: "${image.caption.slice(0, 50)}..." (mood: ${averageMood})`);
+    const msg = `DP updated! Mood: ${averageMood}, Image: "${image.caption.slice(0, 60)}"`;
+    console.log(`[DpManager] ${msg}`);
+    return msg;
   }
 
   /** Aggregate moods from all loaded users, return the most common one */

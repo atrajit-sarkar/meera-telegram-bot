@@ -1203,6 +1203,22 @@ bot.command("facepool", async (ctx) => {
   await ctx.reply(`📸 Meera Image Pool: ${count} image${count > 1 ? "s" : ""}\n\n${lines.join("\n")}\n\nUse /contributeface to add more!`);
 });
 
+bot.command("changedp", async (ctx) => {
+  try {
+    const hasImages = await meeraImages.hasImages();
+    if (!hasImages) {
+      await ctx.reply("❌ No community images available. Upload some with /uploadface first.");
+      return;
+    }
+    await ctx.reply("🔄 Changing DP...");
+    const result = await dpManager.changeDp();
+    await ctx.reply(`✅ ${result}`);
+  } catch (err: any) {
+    console.error("[ChangeDp] Error:", err);
+    await ctx.reply(`❌ Failed: ${err.message || "unknown error"}`);
+  }
+});
+
 bot.command("removeface", async (ctx) => {
   const count = await meeraImages.getCount();
   if (count === 0) {
