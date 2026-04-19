@@ -196,7 +196,7 @@ function splitIntoBubbles(text: string): string[] {
 }
 
 /** Send split bubbles with natural delays between them, optionally quoting on first bubble */
-async function sendAsBubbles(ctx: Context, text: string, replyToMsgId?: number): Promise<number | undefined> {
+async function sendAsBubbles(ctx: Context, text: string, replyToMsgId?: number, extras?: SendExtras): Promise<number | undefined> {
   const bubbles = splitIntoBubbles(text);
   let lastMsgId: number | undefined;
   for (let i = 0; i < bubbles.length; i++) {
@@ -208,8 +208,9 @@ async function sendAsBubbles(ctx: Context, text: string, replyToMsgId?: number):
       // Extra tiny delay for "typing" between bubbles
       await new Promise((r) => setTimeout(r, 300 + Math.random() * 700));
     }
-    // Only quote-reply on the first bubble
-    const sent = await sendText(ctx, bubbles[i], i === 0 ? replyToMsgId : undefined);
+    // Only quote-reply on the first bubble; only apply effect on first bubble
+    const bubbleExtras: SendExtras | undefined = i === 0 ? extras : (extras?.disableNotification ? { disableNotification: true } : undefined);
+    const sent = await sendText(ctx, bubbles[i], i === 0 ? replyToMsgId : undefined, bubbleExtras);
     if (sent && typeof (sent as any).message_id === "number") {
       lastMsgId = (sent as any).message_id;
     }
@@ -717,7 +718,7 @@ Examples of ok: "haha yeah totally", "omg that's so funny", "wait what do you me
 }
 
 /** Send text with Markdown fallback, optionally quoting a message */
-async function sendText(ctx: Context, text: string, replyToMsgId?: number): Promise<any> {
+async function sendText(ctx: Context, text: string, replyToMsgId?: number, extras?: SendExtras): Promise<any> {
   const chunks: string[] = [];
   let remaining = text;
   while (remaining.length > 0) {
@@ -728,7 +729,13 @@ async function sendText(ctx: Context, text: string, replyToMsgId?: number): Prom
   for (let i = 0; i < chunks.length; i++) {
     // Only quote-reply on the first chunk
     const opts: Record<string, unknown> = {};
-    if (i === 0 && replyToMsgId) opts.reply_parameters = { message_id: replyToMsgId };
+    if (i === 0 && replyToMsgId) {
+      const replyParams: Record<string, unknown> = { message_id: replyToMsgId };
+      if (extras?.quote) replyParams.quote = extras.quote;
+      opts.reply_parameters = replyParams;
+    }
+    if (extras?.disableNotification) opts.disable_notification = true;
+    if (extras?.messageEffectId) opts.message_effect_id = extras.messageEffectId;
     try {
       lastSent = await ctx.reply(chunks[i], { parse_mode: "Markdown", ...opts } as any);
     } catch {
@@ -1837,6 +1844,421 @@ async function maybeEditCorrection(
   }
 }
 
+// ── SEND EXTRAS ─────────────────────────────────────────────────────
+
+interface SendExtras {
+  disableNotification?: boolean;
+  messageEffectId?: string;
+  quote?: string;
+}
+
+// ── "REAL GIRL" FEATURES ────────────────────────────────────────────
+
+/** Track last few sent message IDs per user for forwarding */
+const recentSentMsgIds = new Map<number, number[]>();
+
+function trackSentMessage(userId: number, msgId: number) {
+  let ids = recentSentMsgIds.get(userId);
+  if (!ids) { ids = []; recentSentMsgIds.set(userId, ids); }
+  ids.push(msgId);
+  if (ids.length > 5) ids.shift();
+}
+
+// Feature 2: "Change mind" editing — edits a sent message to revise what she said
+async function maybeChangeMindEdit(
+  ctx: Context,
+  userId: number,
+  originalReply: string
+): Promise<void> {
+  const tier = store.getComfortTier(userId);
+  if (tier === "stranger" || tier === "acquaintance") return;
+  if (Math.random() > 0.04) return; // 4% chance
+
+  const lastMsgId = lastSentMessageIds.get(userId);
+  if (!lastMsgId) return;
+
+  // Wait 5-15s before editing
+  await new Promise(r => setTimeout(r, 5000 + Math.random() * 10000));
+
+  const user = store.getUser(userId);
+  const messages: OllamaMessage[] = [
+    { role: "system", content: user.customPersona || `You are ${getBotName()}.` },
+    { role: "user", content: `You just sent this message: "${originalReply}"\n\nNow you want to change your mind and edit it to say something slightly different — like you reconsidered, want to tone it down, or add a condition. Write ONLY the edited version. Keep it natural. Examples:\n- "yeah sure!" → "hmm actually let me think about it"\n- "I miss you" → "I miss you... sometimes lol"\n- "that's so cool" → "wait that's actually really cool"\nDon't make it completely different, just a natural revision.` },
+  ];
+
+  try {
+    let edited = await ollamaChat(messages, user.ollamaKeys);
+    edited = edited.replace(/^["']|["']$/g, "").trim();
+    if (edited && edited !== originalReply && edited.length < 500) {
+      await (ctx as any).telegram.editMessageText(ctx.chat!.id, lastMsgId, undefined, edited);
+      store.addMessage(userId, "assistant", `[edited] ${edited}`);
+      console.log(`[ChangeMind] Edited message for user ${userId}`);
+    }
+  } catch {}
+}
+
+// Feature 3: Regret delete — deletes own message shortly after sending
+async function maybeRegretDelete(
+  ctx: Context,
+  userId: number,
+  messageId: number
+): Promise<boolean> {
+  const tier = store.getComfortTier(userId);
+  if (tier === "stranger" || tier === "acquaintance") return false;
+  const prob = tier === "close" ? 0.05 : 0.03;
+  if (Math.random() > prob) return false;
+
+  await new Promise(r => setTimeout(r, 3000 + Math.random() * 5000));
+
+  try {
+    await (ctx as any).telegram.deleteMessage(ctx.chat!.id, messageId);
+    console.log(`[RegretDelete] Deleted message ${messageId} for user ${userId}`);
+
+    if (Math.random() < 0.4) {
+      await new Promise(r => setTimeout(r, 2000 + Math.random() * 3000));
+      const followUps = ["nvm", "forget that", "ignore that lol", "pretend I didn't say that", "that was nothing", "👀"];
+      const followUp = followUps[Math.floor(Math.random() * followUps.length)];
+      await (ctx as any).telegram.sendMessage(ctx.chat!.id, followUp);
+      store.addMessage(userId, "assistant", followUp);
+    }
+    return true;
+  } catch { return false; }
+}
+
+// Feature 4: Pin sentimental/funny messages
+async function maybePinMessage(
+  ctx: Context,
+  userId: number,
+  messageId: number,
+  text: string
+): Promise<void> {
+  const tier = store.getComfortTier(userId);
+  if (tier !== "close") return;
+
+  const pinPatterns = /love|miss|best|promise|always|forever|never forget|so sweet|cutest|fav|❤|🥺|💕|♥/i;
+  if (!pinPatterns.test(text)) return;
+  if (Math.random() > 0.08) return; // 8% when patterns match
+
+  await new Promise(r => setTimeout(r, 2000 + Math.random() * 3000));
+
+  try {
+    await (ctx as any).telegram.pinChatMessage(ctx.chat!.id, messageId, { disable_notification: true });
+    if (Math.random() < 0.5) {
+      const comments = ["pinned 📌", "saving this", "not letting you forget this", "📌", "this stays pinned forever", "this is too sweet not to pin"];
+      const comment = comments[Math.floor(Math.random() * comments.length)];
+      await new Promise(r => setTimeout(r, 1000 + Math.random() * 2000));
+      await (ctx as any).telegram.sendMessage(ctx.chat!.id, comment);
+      store.addMessage(userId, "assistant", comment);
+    }
+    console.log(`[Pin] Pinned message ${messageId} for user ${userId}`);
+  } catch {}
+}
+
+// Feature 5: Spoiler on photos
+function shouldUseSpoiler(tier: string, reason: "asked" | "vibe" | "spontaneous"): boolean {
+  if (tier === "stranger" || tier === "acquaintance") return false;
+  const prob = reason === "spontaneous" ? 0.20 : reason === "vibe" ? 0.15 : 0.08;
+  return Math.random() < prob;
+}
+
+// Feature 6: Silent late-night messages
+function shouldSendSilently(): boolean {
+  const hour = getISTHour();
+  if (hour >= 23 || hour < 6) return Math.random() < 0.40;
+  return false;
+}
+
+// Feature 7: Send dice/game emoji
+async function maybeSendDice(
+  ctx: Context,
+  userId: number,
+  userText: string
+): Promise<boolean> {
+  const tier = store.getComfortTier(userId);
+  if (tier === "stranger" || tier === "acquaintance") return false;
+
+  const text = userText.toLowerCase();
+  const gamePatterns = /\b(bet|dare|challenge|flip a coin|heads or tails|roll|dice|gamble|luck|chance|let's play|game|random)\b/i;
+  const isGameTriggered = gamePatterns.test(text);
+
+  const prob = isGameTriggered ? 0.25 : 0.03;
+  if (Math.random() > prob) return false;
+
+  const diceEmojis = ["🎲", "🎯", "🏀", "⚽", "🎰", "🎳"];
+  const emoji = diceEmojis[Math.floor(Math.random() * diceEmojis.length)];
+
+  try {
+    if (Math.random() < 0.6) {
+      const intros = ["wait watch this", "okay let's see", "here goes nothing", "🤞", "let's go"];
+      const intro = intros[Math.floor(Math.random() * intros.length)];
+      await (ctx as any).telegram.sendMessage(ctx.chat!.id, intro);
+      store.addMessage(userId, "assistant", intro);
+      await new Promise(r => setTimeout(r, 1000 + Math.random() * 1500));
+    }
+    await (ctx as any).telegram.sendDice(ctx.chat!.id, { emoji });
+    store.addMessage(userId, "assistant", `[dice: ${emoji}]`);
+    console.log(`[Dice] Sent ${emoji} to user ${userId}`);
+    return true;
+  } catch { return false; }
+}
+
+// Feature 8: Share fake location
+async function maybeSendLocation(
+  ctx: Context,
+  userId: number,
+  userText: string
+): Promise<boolean> {
+  const tier = store.getComfortTier(userId);
+  if (tier !== "close") return false;
+
+  const locationPatterns = /\b(where are you|kaha ho|kahan hai|location|where u at|kidhar|kothay)\b/i;
+  if (!locationPatterns.test(userText) && Math.random() > 0.02) return false;
+
+  const locations = [
+    { lat: 28.6139, lng: 77.2090, name: "Delhi" },
+    { lat: 19.0760, lng: 72.8777, name: "Mumbai" },
+    { lat: 12.9716, lng: 77.5946, name: "Bangalore" },
+    { lat: 22.5726, lng: 88.3639, name: "Kolkata" },
+    { lat: 26.9124, lng: 75.7873, name: "Jaipur" },
+    { lat: 17.3850, lng: 78.4867, name: "Hyderabad" },
+    { lat: 13.0827, lng: 80.2707, name: "Chennai" },
+    { lat: 15.2993, lng: 74.1240, name: "Goa" },
+  ];
+  const loc = locations[Math.floor(Math.random() * locations.length)];
+  const lat = loc.lat + (Math.random() - 0.5) * 0.02;
+  const lng = loc.lng + (Math.random() - 0.5) * 0.02;
+
+  try {
+    const user = store.getUser(userId);
+    const locMessages: OllamaMessage[] = [
+      { role: "system", content: user.customPersona || `You are ${getBotName()}.` },
+      { role: "user", content: `You're about to share your location (you're in ${loc.name}). Write a VERY short casual message (max 8 words) to go with it, like "guess where I am 😏", "here look", "sharing my location lol". Don't say the city name. Match chat language.` },
+    ];
+    let caption = await ollamaChat(locMessages, user.ollamaKeys);
+    caption = caption.replace(/^["']|["']$/g, "").trim();
+
+    await (ctx as any).telegram.sendMessage(ctx.chat!.id, caption.slice(0, 100));
+    store.addMessage(userId, "assistant", caption.slice(0, 100));
+    await new Promise(r => setTimeout(r, 1000 + Math.random() * 2000));
+
+    await (ctx as any).telegram.sendLocation(ctx.chat!.id, lat, lng);
+    store.addMessage(userId, "assistant", `[location: ${loc.name}]`);
+    console.log(`[Location] Sent location (${loc.name}) to user ${userId}`);
+    return true;
+  } catch { return false; }
+}
+
+// Feature 9: Casual polls
+async function maybeSendPoll(
+  ctx: Context,
+  userId: number,
+  userText: string
+): Promise<boolean> {
+  const tier = store.getComfortTier(userId);
+  if (tier === "stranger" || tier === "acquaintance") return false;
+
+  const decisionPatterns = /\b(can't decide|confused|what should|should i|help me choose|which one|kya karu|kya karun|ki kori|decide|dilemma|option)\b/i;
+  const isDecisionTriggered = decisionPatterns.test(userText);
+
+  const prob = isDecisionTriggered ? 0.20 : 0.02;
+  if (Math.random() > prob) return false;
+
+  try {
+    const user = store.getUser(userId);
+    const pollPrompt = isDecisionTriggered
+      ? `The user said: "${userText}". They seem to be deciding something. Create a fun Telegram poll to help them decide. Respond in this EXACT format:\nQUESTION: [poll question]\nOPTION1: [first option]\nOPTION2: [second option]\nOPTION3: [optional third option]\n\nMake it casual and fun. Match the language of the conversation. Keep the question under 100 chars and options under 50 chars each.`
+      : `Create a random fun casual Telegram poll — like something a real girl would ask her friend. Examples: "what should I eat?", "rate my taste in music", "am I annoying?". Respond in this EXACT format:\nQUESTION: [poll question]\nOPTION1: [first option]\nOPTION2: [second option]\nOPTION3: [optional third option]\n\nMatch the conversation language. Keep it short and casual.`;
+
+    const pollMessages: OllamaMessage[] = [
+      { role: "system", content: user.customPersona || `You are ${getBotName()}.` },
+      { role: "user", content: pollPrompt },
+    ];
+    const raw = await ollamaChat(pollMessages, user.ollamaKeys);
+
+    const questionMatch = raw.match(/QUESTION:\s*(.+)/i);
+    const option1Match = raw.match(/OPTION1:\s*(.+)/i);
+    const option2Match = raw.match(/OPTION2:\s*(.+)/i);
+    const option3Match = raw.match(/OPTION3:\s*(.+)/i);
+
+    if (!questionMatch || !option1Match || !option2Match) return false;
+
+    const question = questionMatch[1].trim().slice(0, 255);
+    const options = [option1Match[1].trim().slice(0, 100), option2Match[1].trim().slice(0, 100)];
+    if (option3Match) options.push(option3Match[1].trim().slice(0, 100));
+
+    await (ctx as any).telegram.sendPoll(ctx.chat!.id, question, options, { is_anonymous: false });
+    store.addMessage(userId, "assistant", `[poll: ${question}]`);
+    console.log(`[Poll] Sent poll to user ${userId}: "${question}"`);
+    return true;
+  } catch { return false; }
+}
+
+// Feature 10: Message effects
+function pickMessageEffect(text: string, mood: string): string | undefined {
+  if (Math.random() > 0.08) return undefined; // 8% chance
+
+  const t = text.toLowerCase();
+  if (/🎉|congratulat|congrats|yay|amazing|awesome|party|celebrate/i.test(t)) return "5046509860389126442"; // 🎉
+  if (/❤|love|miss|heart|pyaar|♥|💕|😘/i.test(t)) return "5159385139981059251"; // ❤
+  if (/🔥|fire|hot|damn|lit|slay|killer/i.test(t)) return "5104841245755180586"; // 🔥
+  if (/👍|great|nice|good|perfect|thanks|cool/i.test(t)) return "5107584321108051014"; // 👍
+  if (/ew|gross|disgusting|ugly|hate|wtf|💩/i.test(t)) return "5046589136895476101"; // 💩
+
+  if (mood === "excited" || mood === "happy") {
+    return Math.random() < 0.3 ? "5046509860389126442" : undefined;
+  }
+  return undefined;
+}
+
+// Feature 11: Protect content on special photos
+function shouldProtectContent(tier: string): boolean {
+  if (tier !== "close") return false;
+  return Math.random() < 0.12;
+}
+
+// Feature 13: Detect user DP changes
+const userProfilePhotoCounts = new Map<number, number>();
+
+async function maybeNoticeProfileChange(
+  ctx: Context,
+  userId: number
+): Promise<void> {
+  const tier = store.getComfortTier(userId);
+  if (tier === "stranger") return;
+  if (Math.random() > 0.10) return; // Only check 10% of the time
+
+  try {
+    const photos = await (ctx as any).telegram.getUserProfilePhotos(userId, 0, 1);
+    const currentCount = photos.total_count;
+    const previousCount = userProfilePhotoCounts.get(userId);
+    userProfilePhotoCounts.set(userId, currentCount);
+
+    if (previousCount === undefined) return;
+    if (currentCount <= previousCount) return;
+    if (Math.random() > 0.70) return; // 70% chance to comment
+
+    const user = store.getUser(userId);
+    const mood = store.getMood(userId);
+    const history = store.getRecentHistory(userId);
+    const gender = parseGenderFromPersona(user.customPersona);
+
+    const dpPrompt = `You just noticed your friend changed their Telegram profile picture/DP. Comment on it naturally like a real ${gender === "girl" ? "girl" : "person"} would. Keep it SHORT (1 line, max 15 words). Examples: "wait did you change your dp?? 👀", "new dp who dis", "ooh someone changed their profile pic 😏", "cute dp btw". Match the chat language.`;
+    const dpMessages: OllamaMessage[] = [
+      { role: "system", content: user.customPersona || `You are ${getBotName()}.` },
+      { role: "user", content: dpPrompt },
+    ];
+    let comment = await ollamaChat(dpMessages, user.ollamaKeys);
+    comment = comment.replace(/^["']|["']$/g, "").trim();
+
+    await new Promise(r => setTimeout(r, 3000 + Math.random() * 5000));
+    await (ctx as any).telegram.sendMessage(ctx.chat!.id, comment.slice(0, 200));
+    store.addMessage(userId, "assistant", comment.slice(0, 200));
+    console.log(`[DPNotice] Noticed DP change for user ${userId}`);
+  } catch {}
+}
+
+// Feature 14: Send video note (circle video) from community image
+function imageToVideoNote(imageBuffer: Buffer): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const proc = execFile(
+      ffmpegPath as unknown as string,
+      [
+        "-f", "image2pipe", "-i", "pipe:0",
+        "-vf", "scale=640:640:force_original_aspect_ratio=increase,crop=640:640,zoompan=z='min(zoom+0.002,1.3)':d=90:s=640x640:fps=30",
+        "-t", "3", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", "pipe:1"
+      ],
+      { encoding: "buffer" as const, maxBuffer: 20 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err) return reject(err);
+        resolve(Buffer.from(stdout));
+      }
+    );
+    proc.stdin!.write(imageBuffer);
+    proc.stdin!.end();
+  });
+}
+
+async function maybeSendVideoNote(
+  ctx: Context,
+  userId: number
+): Promise<boolean> {
+  const tier = store.getComfortTier(userId);
+  if (tier !== "close") return false;
+  if (Math.random() > 0.10) return false; // 10% chance
+
+  const hasMeeraImgs = await meeraImages.hasImages();
+  if (!hasMeeraImgs) return false;
+
+  try {
+    const captions = await meeraImages.getCaptionsWithIndices();
+    const mood = store.getMood(userId);
+    const history = store.getRecentHistory(userId);
+    const user = store.getUser(userId);
+
+    const chosenIndex = await selectMeeraImage(
+      ollamaConfig, "(quick video note selfie)", mood, tier, captions, history, user.ollamaKeys,
+    );
+    const image = await meeraImages.getByIndex(chosenIndex);
+    if (!image) return false;
+
+    const fileLink = await (ctx as any).telegram.getFileLink(image.fileId);
+    const response = await fetch(fileLink.href);
+    const imageBuffer = Buffer.from(await response.arrayBuffer());
+
+    const videoBuffer = await imageToVideoNote(imageBuffer);
+    await ctx.sendChatAction("record_video_note").catch(() => {});
+    await new Promise(r => setTimeout(r, 1500 + Math.random() * 2000));
+
+    await (ctx as any).telegram.sendVideoNote(ctx.chat!.id, { source: videoBuffer, filename: "vnote.mp4" }, { length: 640, duration: 3 });
+    store.addMessage(userId, "assistant", "[video note selfie]");
+    store.updateUser(userId, { lastSelfieSent: Date.now(), selfiesSent: (user.selfiesSent ?? 0) + 1 });
+    console.log(`[VideoNote] Sent video note to user ${userId}`);
+    return true;
+  } catch (err) {
+    console.error(`[VideoNote] Failed for user ${userId}:`, err);
+    return false;
+  }
+}
+
+// Feature 15: Forward own message — in proactive loop context
+async function maybeForwardOwnMessage(
+  chatId: number,
+  userId: number
+): Promise<boolean> {
+  const tier = store.getComfortTier(userId);
+  if (tier !== "close") return false;
+  if (Math.random() > 0.12) return false; // 12% chance
+
+  const ids = recentSentMsgIds.get(userId);
+  if (!ids || ids.length === 0) return false;
+
+  const msgId = ids[ids.length - 1];
+  try {
+    await bot.telegram.forwardMessage(chatId, chatId, msgId);
+    store.addMessage(userId, "assistant", "[forwarded own message]");
+    console.log(`[Forward] Forwarded own msg ${msgId} to user ${userId}`);
+    return true;
+  } catch { return false; }
+}
+
+// Feature 16: Quote specific parts of user messages
+function getQuoteText(userText: string, tier: string): string | undefined {
+  if (tier === "stranger" || tier === "acquaintance") return undefined;
+
+  const prob = tier === "close" ? 0.25 : 0.15;
+  if (Math.random() > prob) return undefined;
+
+  if (userText.length < 30) return undefined;
+
+  const sentences = userText.split(/[.!?।]+/).filter(s => s.trim().length > 5);
+  if (sentences.length < 2) return undefined;
+
+  const picked = sentences[Math.floor(Math.random() * sentences.length)].trim();
+  if (picked.length < 5 || picked.length > 200) return undefined;
+  return picked;
+}
+
 // ── VOICE TIMING AWARENESS ─────────────────────────────────────────
 
 /** Adjust voice note probability based on time of day */
@@ -2166,7 +2588,10 @@ async function sendMeeraImage(
 
   try {
     await ctx.sendChatAction("upload_photo").catch(() => {});
-    await (ctx as any).telegram.sendPhoto(ctx.chat!.id, image.fileId, { caption });
+    const photoOpts: Record<string, unknown> = { caption };
+    if (shouldUseSpoiler(tier, reason)) photoOpts.has_spoiler = true;
+    if (shouldProtectContent(tier)) photoOpts.protect_content = true;
+    await (ctx as any).telegram.sendPhoto(ctx.chat!.id, image.fileId, photoOpts);
 
     store.addMessage(userId, "assistant", `[meera photo: ${image.caption.slice(0, 50)}] ${caption}`);
     store.updateUser(userId, {
@@ -2214,7 +2639,11 @@ async function sendGeneratedImage(
 
   try {
     await ctx.sendChatAction("upload_photo").catch(() => {});
-    await (ctx as any).telegram.sendPhoto(ctx.chat!.id, { source: result.imageBuffer }, { caption });
+    const tier = store.getComfortTier(userId);
+    const genPhotoOpts: Record<string, unknown> = { caption };
+    if (shouldUseSpoiler(tier, "asked")) genPhotoOpts.has_spoiler = true;
+    if (shouldProtectContent(tier)) genPhotoOpts.protect_content = true;
+    await (ctx as any).telegram.sendPhoto(ctx.chat!.id, { source: result.imageBuffer }, genPhotoOpts);
 
     store.addMessage(userId, "assistant", `[generated image: ${prompt.slice(0, 50)}] ${caption}`);
     console.log(`[ImageGen] Sent generated image to user ${userId}`);
@@ -2253,6 +2682,9 @@ async function handleTextMessage(
 
   const tier = store.getComfortTier(userId);
   const mood = store.getMood(userId);
+
+  // ── Feature 13: notice profile photo changes (async, non-blocking)
+  maybeNoticeProfileChange(ctx, userId).catch(() => {});
 
   // ── Conversation pace detection
   const paceMult = paceMultiplier(userId);
@@ -2540,6 +2972,9 @@ async function handleTextMessage(
 
       const sentVoiceMsgId = await sendGeminiResponse(ctx, response, quoteReplyId);
 
+      // Track sent voice message
+      if (sentVoiceMsgId) trackSentMessage(userId, sentVoiceMsgId);
+
       // Save to history — tag Gemini's audio response as voice reply
       if (isBatched) {
         for (const t of batchedTexts!) store.addMessage(userId, "user", t);
@@ -2553,6 +2988,9 @@ async function handleTextMessage(
       if (response.text.trim()) {
         maybeSendSticker(ctx, userId, response.text).catch(() => {});
       }
+
+      // Feature 4: Maybe pin user's message after voice reply
+      maybePinMessage(ctx, userId, (ctx.message as any).message_id, text).catch(() => {});
     } catch (err) {
       console.error("[Bot] Gemini voice error:", err);
       stopTyping();
@@ -2621,21 +3059,53 @@ async function handleTextMessage(
       stopTyping();
 
       // Send reply as bubbles (may split into multiple messages)
-      const sentMsgId = await sendAsBubbles(ctx, reply, quoteReplyId);
-      if (sentMsgId) lastSentMessageIds.set(userId, sentMsgId);
+      // Features 6, 10, 16: silent mode, message effects, quote
+      const sendExtras: SendExtras = {};
+      if (shouldSendSilently()) sendExtras.disableNotification = true;
+      const msgEffect = pickMessageEffect(reply, mood);
+      if (msgEffect) sendExtras.messageEffectId = msgEffect;
+      const quoteStr = getQuoteText(text, tier);
+      if (quoteStr) sendExtras.quote = quoteStr;
 
-      // Maybe self-correct — try editing the message first, fall back to "*that" follow-up
-      const correction = maybeSelfCorrect(cleanReply);
-      if (correction) {
-        await new Promise((r) => setTimeout(r, 1500 + Math.random() * 2000));
-        const edited = await maybeEditCorrection(ctx, userId, cleanReply);
-        if (!edited) {
-          await ctx.reply(correction);
-        }
+      const sentMsgId = await sendAsBubbles(ctx, reply, quoteReplyId, sendExtras);
+      if (sentMsgId) {
+        lastSentMessageIds.set(userId, sentMsgId);
+        trackSentMessage(userId, sentMsgId);
       }
 
-      // Maybe send a sticker after
-      maybeSendSticker(ctx, userId, reply).catch(() => {});
+      // Post-send behaviors — pick ONE rare behavior at most to avoid overwhelming
+      const postRoll = Math.random();
+      if (sentMsgId && postRoll < 0.03 && tier !== "stranger" && tier !== "acquaintance") {
+        // Feature 3: Regret delete (3%)
+        maybeRegretDelete(ctx, userId, sentMsgId).catch(() => {});
+      } else if (postRoll < 0.07 && tier !== "stranger" && tier !== "acquaintance") {
+        // Feature 2: Change mind edit (4%)
+        maybeChangeMindEdit(ctx, userId, cleanReply).catch(() => {});
+      } else {
+        // Normal post-send behaviors
+        const correction = maybeSelfCorrect(cleanReply);
+        if (correction) {
+          await new Promise((r) => setTimeout(r, 1500 + Math.random() * 2000));
+          const edited = await maybeEditCorrection(ctx, userId, cleanReply);
+          if (!edited) {
+            await ctx.reply(correction);
+          }
+        }
+        // Maybe send a sticker after
+        maybeSendSticker(ctx, userId, reply).catch(() => {});
+      }
+
+      // Feature 4: Maybe pin user's message
+      maybePinMessage(ctx, userId, (ctx.message as any).message_id, text).catch(() => {});
+
+      // Features 7, 9, 8: Supplemental actions after reply (async, delayed)
+      setTimeout(async () => {
+        try {
+          if (await maybeSendDice(ctx, userId, text)) return;
+          if (await maybeSendPoll(ctx, userId, text)) return;
+          await maybeSendLocation(ctx, userId, text);
+        } catch {}
+      }, 2000 + Math.random() * 3000);
     } catch (err: any) {
       console.error("[Bot] Ollama error:", err);
       // If it's a key exhaustion error, all keys already rotated — show error
@@ -2708,10 +3178,14 @@ async function handleTextMessage(
     setTimeout(async () => {
       try {
         if (imageDecision.type === "meera") {
-          const sent = await sendMeeraImage(ctx, userId, imgReason as "asked" | "vibe" | "spontaneous", text);
-          if (!sent && imgReason === "asked") {
-            await ctx.reply("ugh my camera's being weird rn 😩 later ok?");
-            store.addMessage(userId, "assistant", "ugh my camera's being weird rn 😩 later ok?");
+          // Feature 14: 10% chance to send as video note instead of photo (close only)
+          const sentAsVideo = await maybeSendVideoNote(ctx, userId);
+          if (!sentAsVideo) {
+            const sent = await sendMeeraImage(ctx, userId, imgReason as "asked" | "vibe" | "spontaneous", text);
+            if (!sent && imgReason === "asked") {
+              await ctx.reply("ugh my camera's being weird rn 😩 later ok?");
+              store.addMessage(userId, "assistant", "ugh my camera's being weird rn 😩 later ok?");
+            }
           }
         } else if (imageDecision.type === "generate" && imageDecision.prompt) {
           const sent = await sendGeneratedImage(ctx, userId, imageDecision.prompt);
@@ -3141,6 +3615,13 @@ async function proactiveLoop() {
     }
 
     try {
+      // Feature 15: Sometimes forward own previous message instead of new one (close only)
+      if (await maybeForwardOwnMessage(user.chatId, userId)) {
+        store.updateUser(userId, { proactiveSent: true });
+        console.log(`[Proactive] Forwarded own msg to user ${userId} (${tier})`);
+        continue;
+      }
+
       // ── If content sharing, try to send an actual meme/video/YouTube Short
       if (shareContent) {
         const post = await getRandomContentAny(userId);
@@ -3181,8 +3662,16 @@ async function proactiveLoop() {
       const delay = Math.min(typingDelay(reply), 3000);
       await new Promise((r) => setTimeout(r, delay));
 
-      await bot.telegram.sendMessage(user.chatId, reply);
+      // Feature 6: Send silently late at night
+      const proactiveSilent = shouldSendSilently();
+      const proactiveOpts: Record<string, unknown> = {};
+      if (proactiveSilent) proactiveOpts.disable_notification = true;
+
+      await bot.telegram.sendMessage(user.chatId, reply, proactiveOpts);
       store.addMessage(userId, "assistant", reply);
+
+      // Track for forwarding (Feature 15)
+      // We don't have the msg_id easily here, but that's OK — forward tracks separately
 
       // Double-text: 25% chance for comfortable+, send a follow-up
       if ((tier === "comfortable" || tier === "close") && Math.random() < 0.25) {
@@ -3192,7 +3681,7 @@ async function proactiveLoop() {
         const followUp = followUps[Math.floor(Math.random() * followUps.length)];
         const gap = 3000 + Math.random() * 8000; // 3-11s later
         await new Promise((r) => setTimeout(r, gap));
-        await bot.telegram.sendMessage(user.chatId, followUp);
+        await bot.telegram.sendMessage(user.chatId, followUp, proactiveOpts);
         store.addMessage(userId, "assistant", followUp);
       }
 

@@ -34,13 +34,16 @@ export class DpManager {
   private nextChangeDelay = 0;
   private currentImageId: string | null = null; // track which image is currently set
 
-  // Name/bio change tracking (separate timers — real girls don't change everything at once)
+  // Name/bio/description change tracking (separate timers — real girls don't change everything at once)
   private lastNameChange = 0;
   private lastBioChange = 0;
+  private lastDescChange = 0;
   private nextNameDelay = 0;
   private nextBioDelay = 0;
+  private nextDescDelay = 0;
   private currentName = "Meera";
   private currentBio = "";
+  private currentDesc = "";
 
   constructor(opts: DpManagerOptions) {
     this.telegram = opts.telegram;
@@ -54,11 +57,13 @@ export class DpManager {
     this.nextChangeDelay = this.randomDelay(30 * 60_000, 2 * 3600_000);
     this.lastDpChange = Date.now();
 
-    // Name changes less often than DP (6–24h), bio more often (3–12h)
+    // Name changes less often than DP (6–24h), bio more often (3–12h), description rare (24–48h)
     this.nextNameDelay = this.randomDelay(6 * 3600_000, 24 * 3600_000);
     this.nextBioDelay = this.randomDelay(1 * 3600_000, 6 * 3600_000);
+    this.nextDescDelay = this.randomDelay(24 * 3600_000, 48 * 3600_000);
     this.lastNameChange = Date.now();
     this.lastBioChange = Date.now();
+    this.lastDescChange = Date.now();
   }
 
   /** Start the periodic check (every 10 minutes) */
@@ -129,6 +134,19 @@ export class DpManager {
       this.nextBioDelay = this.randomDelay(6 * 3600_000, 18 * 3600_000);
       this.lastBioChange = now;
       console.log(`[DpManager] Next bio change in ~${Math.round(this.nextBioDelay / 3600_000)}h`);
+    }
+
+    // ── Description change check (rare — every 24-48h)
+    const descElapsed = now - this.lastDescChange;
+    if (descElapsed >= this.nextDescDelay) {
+      try {
+        await this.maybeChangeDescription(averageMood);
+      } catch (err) {
+        console.error("[DpManager] Failed to change description:", err);
+      }
+      this.nextDescDelay = this.randomDelay(24 * 3600_000, 48 * 3600_000);
+      this.lastDescChange = now;
+      console.log(`[DpManager] Next description change in ~${Math.round(this.nextDescDelay / 3600_000)}h`);
     }
   }
 
@@ -391,6 +409,71 @@ Rules:
     }
   }
 
+  /** Ask Ollama to generate a bot description and set it via setMyDescription */
+  private async maybeChangeDescription(mood: string): Promise<void> {
+    const hour = new Date().getHours();
+    const timeOfDay = this.getTimeOfDay(hour);
+
+    // 15% chance to just clear the description
+    if (Math.random() < 0.15) {
+      if (this.currentDesc !== "") {
+        await this.setBotDescription("");
+        this.currentDesc = "";
+        console.log("[DpManager] Description cleared");
+      }
+      return;
+    }
+
+    const systemPrompt = `You are Meera — a 20-year-old Indian girl. You're updating your Telegram bot profile description (the longer "About" text that people see when they open your profile).
+
+Real girls write profile descriptions that are casual, aesthetic, or reflect their current vibe. Examples:
+- "just a girl trying to figure life out 🌸"
+- "music, chai, and overthinking ✨"
+- "probably sleeping or watching reels"
+- "21 | mumbai | caffeine addict"
+- "i don't bite... mostly 😏"
+- "here for good vibes only 🌻"
+- "professional overthinker, amateur dancer"
+- "send memes, get love 💕"
+- "currently in my villain era 💅"
+- "just existing and vibing ☁️"
+
+Current mood: ${mood}
+Time: ${timeOfDay}
+
+Rules:
+- Keep it SHORT (10-120 chars, most are under 60 chars)
+- Must feel authentic — like a real girl's profile
+- Can be in English or Hinglish
+- Can include emojis but don't overdo it
+- Can be funny, aesthetic, mysterious, or random
+- NEVER include quotes around it or explanations
+- Reply with ONLY the description text. Nothing else.`;
+
+    try {
+      const messages: OllamaMessage[] = [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: `Write a Telegram profile description. You're feeling ${mood}, it's ${timeOfDay}.` },
+      ];
+      let desc = await callOllamaWithRotation(
+        this.ollamaConfig, messages, [], this.getCommunityKeys(),
+      );
+      desc = desc.trim().replace(/^["']|["']$/g, "").trim();
+
+      if (desc.length > 512) desc = desc.slice(0, 512);
+      if (desc.toLowerCase() === this.currentDesc.toLowerCase()) {
+        console.log(`[DpManager] Description unchanged`);
+        return;
+      }
+
+      await this.setBotDescription(desc);
+      this.currentDesc = desc;
+      console.log(`[DpManager] Description updated to "${desc}" (mood: ${mood})`);
+    } catch (err) {
+      console.error("[DpManager] Description change failed:", err);
+    }
+  }
+
   /** Set the bot's display name via Telegram API */
   private async setBotName(name: string): Promise<void> {
     const res = await fetch(
@@ -420,6 +503,22 @@ Rules:
     const data = await res.json() as { ok: boolean; description?: string };
     if (!data.ok) {
       throw new Error(`setMyShortDescription failed: ${data.description || "unknown error"}`);
+    }
+  }
+
+  /** Set the bot's full description via Telegram API (setMyDescription) */
+  private async setBotDescription(description: string): Promise<void> {
+    const res = await fetch(
+      `https://api.telegram.org/bot${this.botToken}/setMyDescription`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ description }),
+      },
+    );
+    const data = await res.json() as { ok: boolean; description?: string };
+    if (!data.ok) {
+      throw new Error(`setMyDescription failed: ${data.description || "unknown error"}`);
     }
   }
 
