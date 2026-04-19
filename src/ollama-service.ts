@@ -48,7 +48,16 @@ export async function callOllamaWithRotation(
         console.log("[Ollama] Invalid key, trying next key...");
         continue;
       }
-      throw err; // Non-key error, don't rotate
+      // Also rotate on rate-limit or server errors (5xx)
+      if (err.message?.startsWith("ollama_error:")) {
+        const statusMatch = err.message.match(/ollama_error:\s*(\d+)/);
+        const status = statusMatch ? parseInt(statusMatch[1]) : 0;
+        if (status === 429 || status >= 500) {
+          console.log(`[Ollama] Server error ${status}, trying next key...`);
+          continue;
+        }
+      }
+      throw err; // Non-recoverable error, don't rotate
     }
   }
   throw lastError ?? new Error("All Ollama API keys exhausted");

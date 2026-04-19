@@ -668,13 +668,49 @@ const AI_REFUSAL_PATTERNS = [
 ];
 
 /** Check if a Gemini response is blocked or contains AI-refusal language */
-function isGeminiBlocked(response: GeminiResponse): boolean {
+function isGeminiBlockedBasic(response: GeminiResponse): boolean {
   // Case 1: completely empty — both audio and text missing
   if (response.audioChunks.length === 0 && !response.text.trim()) return true;
 
   // Case 2: has audio but the transcription text reveals a refusal
   const text = response.text.trim();
   if (text && AI_REFUSAL_PATTERNS.some((p) => p.test(text))) return true;
+
+  return false;
+}
+
+/** Enhanced blockage check: regex first, then Ollama analysis for ambiguous cases */
+async function isGeminiBlocked(response: GeminiResponse, userKeys: string[] = []): Promise<boolean> {
+  // Case 1: obvious block via regex
+  if (isGeminiBlockedBasic(response)) return true;
+
+  // Case 2: if there's meaningful text, ask Ollama to analyze for subtle AI refusal
+  const text = response.text.trim();
+  if (!text || text.length < 10) return false;
+
+  try {
+    const analysisMessages: OllamaMessage[] = [
+      {
+        role: "system",
+        content: `You are a classifier. Given a text snippet from an AI voice response, determine if it is an AI safety/refusal/blockage message (the AI refusing to answer, saying it can't help, deflecting due to safety policies, breaking character to say it's an AI, etc.).
+
+Respond with ONLY "blocked" or "ok" — nothing else.
+
+Examples of blocked: "I'm sorry, I can't help with that", "As an AI language model, I don't feel comfortable", "Let's talk about something more appropriate", "I cannot engage in that kind of conversation"
+Examples of ok: "haha yeah totally", "omg that's so funny", "wait what do you mean", "I don't think that's a good idea tbh" (opinion, not refusal)`,
+      },
+      { role: "user", content: text },
+    ];
+    const result = await ollamaChat(analysisMessages, userKeys);
+    const verdict = result.trim().toLowerCase();
+    if (verdict.includes("blocked")) {
+      console.log(`[BlockCheck] Ollama detected AI blockage in Gemini text: "${text.slice(0, 100)}"`);
+      return true;
+    }
+  } catch (err) {
+    console.error("[BlockCheck] Ollama analysis failed, falling back to regex-only:", err);
+    // If Ollama fails, rely on regex result (already false at this point)
+  }
 
   return false;
 }
@@ -2432,11 +2468,9 @@ async function handleTextMessage(
       stopTyping();
 
       // Check if Gemini blocked/refused the response
-      if (isGeminiBlocked(response)) {
+      if (await isGeminiBlocked(response, store.getUser(userId).ollamaKeys)) {
         console.log(`[Bot] Gemini blocked voice for user ${userId}, falling back to Ollama text`);
         sessions.resetSession(userId);
-
-        // Fall back to Ollama text
         stopTyping = typingIndicator(ctx, "typing");
         const user = store.getUser(userId);
         const userMsg = replyContext
@@ -2560,8 +2594,35 @@ async function handleTextMessage(
 
       // Maybe send a sticker after
       maybeSendSticker(ctx, userId, reply).catch(() => {});
-    } catch (err) {
+    } catch (err: any) {
       console.error("[Bot] Ollama error:", err);
+      // If it's a key exhaustion error, all keys already rotated — show error
+      // For other errors, try rotating keys before giving up
+      if (err?.message !== "All Ollama API keys exhausted") {
+        try {
+          const retryMessages = buildOllamaMessages(
+            replyContext
+              + (gapContext ? gapContext + "\n\n" : "")
+              + batchHint + lengthHint + styleHints + emojiHint
+              + "\n\n" + text,
+            store.getRecentHistory(userId), tier, store.getUser(userId), mood
+          );
+          let retryReply = await ollamaChat(retryMessages, store.getUser(userId).ollamaKeys);
+          retryReply = addDeliberateTypos(retryReply, mood);
+          if (isBatched) {
+            for (const t of batchedTexts!) store.addMessage(userId, "user", t);
+          } else {
+            store.addMessage(userId, "user", text);
+          }
+          store.addMessage(userId, "assistant", retryReply);
+          stopTyping();
+          await sendAsBubbles(ctx, retryReply, quoteReplyId);
+          maybeSendSticker(ctx, userId, retryReply).catch(() => {});
+          return;
+        } catch (retryErr) {
+          console.error("[Bot] Ollama retry also failed:", retryErr);
+        }
+      }
       stopTyping();
       await ctx.reply("omg my brain just glitched 😭 say that again?");
     }
@@ -2709,10 +2770,9 @@ async function handleMediaMessage(
 
     if (useAudio) {
       // Check if Gemini blocked/refused the response
-      if (isGeminiBlocked(response)) {
+      if (await isGeminiBlocked(response, store.getUser(userId).ollamaKeys)) {
         console.log(`[Bot] Gemini blocked media voice for user ${userId}, falling back to Ollama text`);
         sessions.resetSession(userId);
-        // Fall through to text path instead of sending refusal audio
       } else {
         // Comfortable+ → send audio response directly from Gemini Live
         await sendGeminiResponse(ctx, response, quoteReplyId);
