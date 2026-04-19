@@ -83,6 +83,9 @@ const meeraImages = new MeeraImageStore(store.getDb());
 // Reference image path for contribute face
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MEERA_REFERENCE_IMAGE = path.resolve(__dirname, "..", "MeeraAI.jpg");
+console.log(`[Init] __dirname = ${__dirname}`);
+console.log(`[Init] MEERA_REFERENCE_IMAGE = ${MEERA_REFERENCE_IMAGE}`);
+console.log(`[Init] MeeraAI.jpg exists = ${fs.existsSync(MEERA_REFERENCE_IMAGE)}`);
 
 // Gemini Live sessions — for image/audio/video (uses per-user persona)
 const sessions = new SessionManager((userId: number) => {
