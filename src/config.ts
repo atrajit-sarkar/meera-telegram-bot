@@ -12,6 +12,76 @@ export function getBotName(): string {
   return BOT_NAME;
 }
 
+// ── WEATHER CACHE ───────────────────────────────────────────────────
+
+interface WeatherCache {
+  data: { weather: string; tempC: string; feelsLikeC: string; humidity: string; wind: string } | null;
+  lastFetch: number;
+}
+
+const weatherCache: WeatherCache = { data: null, lastFetch: 0 };
+const WEATHER_CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+const WEATHER_CITY = process.env.WEATHER_CITY || "Kolkata";
+
+async function refreshWeatherCache(): Promise<void> {
+  try {
+    const url = `https://wttr.in/${encodeURIComponent(WEATHER_CITY)}?format=j1`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return;
+    const data = await res.json() as Record<string, unknown>;
+    const current = (data.current_condition as Record<string, unknown>[])?.[0];
+    if (!current) return;
+
+    weatherCache.data = {
+      weather: (current.weatherDesc as Record<string, string>[])?.[0]?.value || "Unknown",
+      tempC: current.temp_C as string,
+      feelsLikeC: current.FeelsLikeC as string,
+      humidity: current.humidity as string,
+      wind: current.windspeedKmph as string,
+    };
+    weatherCache.lastFetch = Date.now();
+  } catch (err) {
+    console.error("[WeatherCache] refresh error:", err);
+  }
+}
+
+/** Get cached weather string for system prompt. Non-blocking — returns stale/empty if fetch is in progress. */
+function getWeatherContext(): string {
+  // Trigger background refresh if stale
+  if (Date.now() - weatherCache.lastFetch > WEATHER_CACHE_TTL) {
+    refreshWeatherCache();
+  }
+  const w = weatherCache.data;
+  if (!w) return "";
+
+  const temp = parseInt(w.tempC, 10);
+  let weatherVibe: string;
+  if (temp >= 38) weatherVibe = "It's SCORCHING hot outside. You're dying in this heat, sweating, complaining about it.";
+  else if (temp >= 33) weatherVibe = "It's really hot outside. Uncomfortable, you'd rather stay inside with AC.";
+  else if (temp >= 28) weatherVibe = "It's warm outside. A bit sweaty but manageable.";
+  else if (temp >= 20) weatherVibe = "The weather is really nice right now. Pleasant, you're in a good mood because of it.";
+  else if (temp >= 15) weatherVibe = "It's a bit chilly. You might want a light jacket. Cozy vibes.";
+  else weatherVibe = "It's COLD. You're freezing, bundled up, not leaving your blanket.";
+
+  if (w.weather.toLowerCase().includes("rain") || w.weather.toLowerCase().includes("drizzle")) {
+    weatherVibe = "It's raining right now! You either love it (chai + rain = heaven) or hate it (hair ruined, can't go out, everything's wet).";
+  } else if (w.weather.toLowerCase().includes("thunder") || w.weather.toLowerCase().includes("storm")) {
+    weatherVibe = "There's a storm/thunderstorm outside! You're either scared, excited, or dramatically watching from your window.";
+  } else if (w.weather.toLowerCase().includes("fog") || w.weather.toLowerCase().includes("mist")) {
+    weatherVibe = "It's foggy/misty outside. Cozy, mysterious vibes. Can barely see anything.";
+  }
+
+  const humidityNum = parseInt(w.humidity, 10);
+  const humidityNote = humidityNum > 75 ? " The humidity is awful — your hair is frizzy, skin feels sticky, everything is gross." : "";
+
+  return `\nRight now in ${WEATHER_CITY}: ${w.weather}, ${w.tempC}°C (feels like ${w.feelsLikeC}°C), humidity ${w.humidity}%, wind ${w.wind} km/h.
+${weatherVibe}${humidityNote}
+You know the weather naturally like any real person — bring it up when it makes sense (complaining about heat, loving rain, cold mornings, etc). Don't force it into every message.`;
+}
+
+// Kick off the first fetch immediately on startup
+refreshWeatherCache();
+
 // ── MOOD MODIFIERS ──────────────────────────────────────────────────
 
 export const MOOD_MODIFIERS: Record<string, string> = {
@@ -111,7 +181,8 @@ function getISTContext(): string {
   return `\n\nCURRENT AWARENESS (you just know this naturally, like any real person):
 Right now it's ${time} IST, ${day}, ${date}.
 ${timeVibe}
-You naturally reference time when it makes sense — like saying "good morning" in the morning, "why are you up so late" at 2am, "happy friday!" on fridays, etc. Don't force it, just be naturally time-aware like a real person would be.`;
+You naturally reference time when it makes sense — like saying "good morning" in the morning, "why are you up so late" at 2am, "happy friday!" on fridays, etc. Don't force it, just be naturally time-aware like a real person would be.
+${getWeatherContext()}`;
 }
 
 export function buildSystemPrompt(tier: string, user: UserData, mood?: string): string {

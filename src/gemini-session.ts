@@ -14,7 +14,7 @@ export interface GeminiSessionConfig {
   model: string;
   systemInstruction: string;
   tools?: ToolDeclaration[];
-  onToolCall?: (name: string, args: Record<string, unknown>) => Record<string, unknown>;
+  onToolCall?: (name: string, args: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>;
 }
 
 type Part = { text: string } | { inlineData: { data: string; mimeType: string } };
@@ -151,11 +151,13 @@ export class GeminiSession {
           // Tool call
           if (msg.toolCall) {
             for (const fc of msg.toolCall.functionCalls) {
-              const result =
+              Promise.resolve(
                 this.config.onToolCall?.(fc.name, fc.args || {}) ?? {
                   error: "Unknown tool",
-                };
-              this.sendToolResponse(fc.id, fc.name, result);
+                }
+              ).then((result) => {
+                this.sendToolResponse(fc.id, fc.name, result);
+              });
             }
           }
         } catch (e) {
