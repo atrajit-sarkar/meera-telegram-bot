@@ -943,29 +943,47 @@ bot.start((ctx) =>
   ctx.reply(
     `Hey! 👋 I'm ${botName}.\n\n` +
       "Send me text, photos, voice messages, or videos!\n\n" +
-      "Commands:\n" +
+      "Commands:\n\n" +
+      "📋 Profile:\n" +
       "/profile — Your profile\n" +
       "/setname — Set your name\n" +
       "/setbio — Set your bio\n" +
       "/tone — Change tone\n" +
+      "/replies_short /replies_medium /replies_long\n" +
       "/talk — Toggle voice-only mode\n" +
+      "/clear — Reset conversation\n" +
+      "/reset — Full session reset\n\n" +
+      "🎭 Persona:\n" +
+      "/persona — Customize AI personality\n" +
+      "/viewpersona — View your custom persona\n" +
+      "/resetpersona — Reset to default\n\n" +
+      "🎨 Stickers:\n" +
       "/addstickers — Add a sticker pack\n" +
       "/stickers — List sticker packs\n" +
-      "/removestickers — Remove a sticker pack\n" +
-      "/clear — Reset conversation\n" +
+      "/removestickers — Remove a sticker pack\n\n" +
+      "🔑 Chat API Keys:\n" +
       "/addkey — Add your Ollama API key\n" +
       "/keys — List your API keys\n" +
       "/removekey — Remove an API key\n" +
-      "/contribute — Donate an API key for everyone\n" +
+      "/contribute — Donate a key for everyone\n" +
       "/communitykeys — View community key pool\n" +
-      "/removecontribution — Remove your donated key\n" +
-      "/contributeface — Help improve Meera's photos\n" +
-      "/facepool — View contributed Meera images\n" +
+      "/removecontribution — Remove your donated key\n\n" +
+      "🖼️ Image API Keys:\n" +
+      "/addimagekey — Add your Stability AI key\n" +
+      "/imagekeys — List your image keys\n" +
+      "/removeimagekey — Remove an image key\n" +
+      "/contributeimage — Donate an image key\n" +
+      "/imagepool — View image community keys\n" +
+      "/removeimagecontribution — Remove donated image key\n\n" +
+      "📸 Community Photos:\n" +
+      "/contributeface — How to contribute photos\n" +
+      "/uploadface — Upload Meera images\n" +
+      "/facepool — View contributed images\n" +
+      "/removeface — Remove your contributed image\n\n" +
+      "🎬 Community Videos:\n" +
       "/uploadvideo — Upload community videos\n" +
       "/videopool — View contributed videos\n" +
-      "/persona — Customize AI personality\n" +
-      "/viewpersona — View your custom persona\n" +
-      "/resetpersona — Reset to default\n" +
+      "/removevideo — Remove your contributed video\n\n" +
       "/help — Show this message"
   )
 );
@@ -977,23 +995,26 @@ bot.help((ctx) =>
       "• Photos (with or without captions)\n" +
       "• Voice messages\n" +
       "• Videos & video notes\n\n" +
-      "Profile commands:\n" +
+      "📋 Profile:\n" +
       "/profile /setname /setbio /tone\n" +
       "/replies_short /replies_medium /replies_long\n" +
       "/talk — Toggle voice-only replies\n" +
-      "/addstickers /stickers /removestickers\n" +
       "/clear — Reset conversation\n" +
-      "/addkey /keys /removekey — Manage API keys\n" +
-      "/contribute /communitykeys — Community key pool\n" +
-      "/contributeface — Help improve Meera's photos\n" +
-      "/uploadface — Upload Meera images\n" +
-      "/facepool — View contributed images\n" +
-      "/removeface — Remove your contributed image\n" +
-      "/uploadvideo — Upload community videos\n" +
-      "/videopool — View contributed videos\n" +
-      "/removevideo — Remove your contributed video\n" +
-      "/persona — Customize AI personality\n" +
-      "/viewpersona /resetpersona — Manage persona"
+      "/reset — Full session reset\n\n" +
+      "🎭 Persona:\n" +
+      "/persona /viewpersona /resetpersona\n\n" +
+      "🎨 Stickers:\n" +
+      "/addstickers /stickers /removestickers\n\n" +
+      "🔑 Chat API Keys:\n" +
+      "/addkey /keys /removekey\n" +
+      "/contribute /communitykeys /removecontribution\n\n" +
+      "🖼️ Image API Keys:\n" +
+      "/addimagekey /imagekeys /removeimagekey\n" +
+      "/contributeimage /imagepool /removeimagecontribution\n\n" +
+      "📸 Community Photos:\n" +
+      "/contributeface /uploadface /facepool /removeface\n\n" +
+      "🎬 Community Videos:\n" +
+      "/uploadvideo /videopool /removevideo"
   )
 );
 
@@ -4332,18 +4353,29 @@ bot.launch().then(async () => {
     { command: "replies_long", description: "Long replies" },
     { command: "talk", description: "Toggle voice-only mode" },
     { command: "clear", description: "Reset conversation" },
+    { command: "reset", description: "Full session reset" },
+    { command: "persona", description: "Customize AI personality" },
+    { command: "viewpersona", description: "View your custom persona" },
+    { command: "resetpersona", description: "Reset to default persona" },
     { command: "addstickers", description: "Add a sticker pack" },
     { command: "stickers", description: "List sticker packs" },
     { command: "removestickers", description: "Remove a sticker pack" },
     { command: "addkey", description: "Add your Ollama API key" },
     { command: "keys", description: "List your API keys" },
     { command: "removekey", description: "Remove an API key" },
-    { command: "persona", description: "Customize AI personality" },
-    { command: "viewpersona", description: "View your custom persona" },
-    { command: "resetpersona", description: "Reset to default persona" },
-    { command: "contribute", description: "Donate an API key for everyone" },
+    { command: "contribute", description: "Donate a chat key for everyone" },
     { command: "communitykeys", description: "View community key pool" },
     { command: "removecontribution", description: "Remove your donated key" },
+    { command: "addimagekey", description: "Add your Stability AI key" },
+    { command: "imagekeys", description: "List your image API keys" },
+    { command: "removeimagekey", description: "Remove an image API key" },
+    { command: "contributeimage", description: "Donate an image key" },
+    { command: "imagepool", description: "View image community keys" },
+    { command: "removeimagecontribution", description: "Remove donated image key" },
+    { command: "contributeface", description: "How to contribute photos" },
+    { command: "uploadface", description: "Upload Meera images" },
+    { command: "facepool", description: "View contributed images" },
+    { command: "removeface", description: "Remove your contributed image" },
     { command: "uploadvideo", description: "Upload community videos" },
     { command: "videopool", description: "View contributed videos" },
     { command: "removevideo", description: "Remove your contributed video" },
