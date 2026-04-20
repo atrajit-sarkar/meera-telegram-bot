@@ -267,6 +267,7 @@ function stripInternalArtifacts(text: string): string {
   cleaned = cleaned.replace(/\((?:image )?prompt:\s*[^)]+\)/gi, "");
   // Remove internal markers that might leak
   cleaned = cleaned.replace(/__REPLY_TO_BOT_IMAGE__[^\n]*/gi, "");
+  cleaned = cleaned.replace(/__REPLY_TO_VOICE__[^\n]*/gi, "");
   // Remove standalone file-ID-like UUIDs (v followed by hex-UUID pattern)
   cleaned = cleaned.replace(/v[0-9a-f]{8,}-[0-9a-f-]+\.(jpg|jpeg|png|webp|mp4)/gi, "");
   // Collapse multiple newlines and trim
@@ -1937,11 +1938,69 @@ function getReplyContext(ctx: Context, userId: number): string {
       }
     }
 
-    // Fallback: we know it's a voice message but couldn't find transcription
+    // Fallback: try to re-transcribe by downloading and analyzing the audio
+    const voiceFileId = replyMsg.voice?.file_id || replyMsg.audio?.file_id || replyMsg.video_note?.file_id;
+    if (voiceFileId) {
+      return `__REPLY_TO_VOICE__:${voiceFileId}:${sender}`;
+    }
+
     return `(The user is replying to a voice message that ${sender} sent earlier, but the exact words are unavailable)\n\n`;
   }
 
   return "";
+}
+
+/**
+ * Resolve a reply-to-voice marker by downloading and transcribing the audio via Gemini REST API.
+ */
+async function resolveVoiceReplyContext(marker: string): Promise<string> {
+  // Parse marker: __REPLY_TO_VOICE__:<fileId>:<sender>
+  const parts = marker.split(":");
+  const fileId = parts[1];
+  const sender = parts.slice(2).join(":");
+
+  try {
+    const raw = await downloadFileBuffer(fileId);
+    const audioBase64 = raw.toString("base64");
+
+    // Use Gemini REST API to transcribe the audio (send as OGG which is Telegram's voice format)
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(GEMINI_API_KEY!)}`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30_000);
+
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{
+            role: "user",
+            parts: [
+              { inlineData: { data: audioBase64, mimeType: "audio/ogg" } },
+              { text: "Transcribe this audio message exactly as spoken. Output only the transcription, nothing else." },
+            ],
+          }],
+          generationConfig: { temperature: 0.1, maxOutputTokens: 500 },
+        }),
+        signal: controller.signal,
+      });
+
+      if (res.ok) {
+        const json = await res.json();
+        const transcription = json.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+        if (transcription) {
+          console.log(`[ReplyCtx] Transcribed replied-to voice message: "${transcription.slice(0, 80)}..."`);
+          return `(The user is replying to a voice message that ${sender} sent earlier. Transcription: "${transcription.slice(0, 300)}")\n\n`;
+        }
+      }
+    } finally {
+      clearTimeout(timeout);
+    }
+  } catch (err) {
+    console.error("[ReplyCtx] Voice transcription failed:", err);
+  }
+
+  return `(The user is replying to a voice message that ${sender} sent earlier, but the exact words are unavailable)\n\n`;
 }
 
 // ── RAPID-FIRE MESSAGE BATCHING ─────────────────────────────────────
@@ -3182,6 +3241,10 @@ async function handleTextMessage(
   if (replyContext.startsWith("__REPLY_TO_BOT_IMAGE__")) {
     replyContext = await resolveImageReplyContext(replyContext, userId);
   }
+  // If replying to a voice message without stored transcription, re-transcribe
+  if (replyContext.startsWith("__REPLY_TO_VOICE__")) {
+    replyContext = await resolveVoiceReplyContext(replyContext);
+  }
 
   // ── Status-aware: detect gap since last interaction
   const gapMs = Date.now() - prevLastInteraction;
@@ -3748,6 +3811,9 @@ async function handleMediaMessage(
   if (replyContext.startsWith("__REPLY_TO_BOT_IMAGE__")) {
     replyContext = await resolveImageReplyContext(replyContext, userId);
   }
+  if (replyContext.startsWith("__REPLY_TO_VOICE__")) {
+    replyContext = await resolveVoiceReplyContext(replyContext);
+  }
   if (replyContext) {
     // Prepend the reply context as a text part so Gemini/Ollama sees it
     parts.unshift({ text: replyContext });
@@ -4275,9 +4341,9 @@ bot.on(message("poll"), async (ctx) => {
           store.addMessage(userId, "assistant", reply);
           await sendAsBubbles(ctx, reply);
         } else {
-          await sendGeminiResponse(ctx, response);
+          const sentVoiceMsgId = await sendGeminiResponse(ctx, response);
           if (response.text.trim()) {
-            store.addMessage(userId, "assistant", `[voice reply] ${response.text}`);
+            store.addMessage(userId, "assistant", `[voice reply] ${response.text}`, sentVoiceMsgId);
           }
         }
       } catch (err) {
@@ -4411,12 +4477,14 @@ bot.on("message_reaction", async (ctx) => {
           await bot.telegram.sendMessage(chatId, reply);
         } else {
           const { audioChunks } = response;
+          let sentVoiceMsgId: number | undefined;
           if (audioChunks.length > 0) {
             const wav = pcmToWav(audioChunks);
-            await bot.telegram.sendVoice(chatId, { source: wav, filename: "reaction.wav" });
+            const sent = await bot.telegram.sendVoice(chatId, { source: wav, filename: "reaction.wav" });
+            sentVoiceMsgId = sent.message_id;
           }
           if (response.text.trim()) {
-            store.addMessage(userId, "assistant", `[voice reply] ${response.text}`);
+            store.addMessage(userId, "assistant", `[voice reply] ${response.text}`, sentVoiceMsgId);
           }
         }
       } catch (err) {
