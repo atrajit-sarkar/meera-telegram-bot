@@ -961,6 +961,8 @@ bot.start((ctx) =>
       "/removecontribution — Remove your donated key\n" +
       "/contributeface — Help improve Meera's photos\n" +
       "/facepool — View contributed Meera images\n" +
+      "/uploadvideo — Upload community videos\n" +
+      "/videopool — View contributed videos\n" +
       "/persona — Customize AI personality\n" +
       "/viewpersona — View your custom persona\n" +
       "/resetpersona — Reset to default\n" +
@@ -987,6 +989,9 @@ bot.help((ctx) =>
       "/uploadface — Upload Meera images\n" +
       "/facepool — View contributed images\n" +
       "/removeface — Remove your contributed image\n" +
+      "/uploadvideo — Upload community videos\n" +
+      "/videopool — View contributed videos\n" +
+      "/removevideo — Remove your contributed video\n" +
       "/persona — Customize AI personality\n" +
       "/viewpersona /resetpersona — Manage persona"
   )
@@ -4339,6 +4344,9 @@ bot.launch().then(async () => {
     { command: "contribute", description: "Donate an API key for everyone" },
     { command: "communitykeys", description: "View community key pool" },
     { command: "removecontribution", description: "Remove your donated key" },
+    { command: "uploadvideo", description: "Upload community videos" },
+    { command: "videopool", description: "View contributed videos" },
+    { command: "removevideo", description: "Remove your contributed video" },
     { command: "help", description: "Show all commands" },
   ]).catch((e) => console.warn("Failed to set bot commands:", e));
 
