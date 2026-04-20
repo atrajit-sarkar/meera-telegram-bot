@@ -429,7 +429,15 @@ Reply with ONLY the photo number (1-${candidates.length}). Nothing else.`,
     }
 
     const json = await res.json();
-    const text = json.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    const candidate = json.candidates?.[0];
+
+    // Check for safety refusal or empty response
+    if (!candidate || candidate.finishReason === "SAFETY" || !candidate.content?.parts?.length) {
+      console.log("[GeminiVision] Image selection refused (safety/empty), signaling fallback");
+      throw new Error("gemini_refused");
+    }
+
+    const text = candidate.content.parts[0]?.text || "";
     const num = parseInt(text.trim().replace(/[^0-9]/g, ""));
 
     if (num >= 1 && num <= candidates.length) {
@@ -437,13 +445,80 @@ Reply with ONLY the photo number (1-${candidates.length}). Nothing else.`,
       return candidates[num - 1].index;
     }
 
-    // Fallback: return first candidate
-    console.log(`[GeminiVision] Could not parse selection "${text}", falling back to first candidate`);
-    return candidates[0].index;
+    // Could not parse a valid number — signal fallback
+    console.log(`[GeminiVision] Could not parse selection "${text}", signaling fallback`);
+    throw new Error("gemini_unparseable");
   } catch (err) {
     console.error("[GeminiVision] selectBestImageWithGemini failed:", err);
-    // Fallback: return first candidate
-    return candidates[0].index;
+    // Signal that Gemini failed so caller can fall back to Ollama
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
+ * Use Gemini vision to analyze an image and produce a natural description/reaction.
+ * Used when a user replies to a bot-sent image so the bot can "see" what it sent.
+ * Returns the analysis text, or null if Gemini refuses/fails.
+ */
+export async function analyzeImageWithGemini(
+  apiKey: string,
+  imageBase64: string,
+  prompt: string,
+  model: string = "gemini-2.5-flash",
+): Promise<string | null> {
+  const parts = [
+    {
+      inlineData: {
+        data: imageBase64,
+        mimeType: "image/jpeg",
+      },
+    },
+    { text: prompt },
+  ];
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30_000);
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts }],
+        generationConfig: {
+          temperature: 0.7,
+          maxOutputTokens: 300,
+        },
+      }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error(`[GeminiVision] analyzeImage API error: ${res.status} ${errText.slice(0, 200)}`);
+      return null;
+    }
+
+    const json = await res.json();
+    const candidate = json.candidates?.[0];
+
+    // Check for safety refusal
+    if (!candidate || candidate.finishReason === "SAFETY" || !candidate.content?.parts?.length) {
+      console.log("[GeminiVision] Image analysis refused (safety/empty)");
+      return null;
+    }
+
+    const text = candidate.content.parts[0]?.text || "";
+    if (!text.trim()) return null;
+
+    return text.trim();
+  } catch (err) {
+    console.error("[GeminiVision] analyzeImageWithGemini failed:", err);
+    return null;
   } finally {
     clearTimeout(timeout);
   }

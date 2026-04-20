@@ -39,7 +39,7 @@ import { MeeraImageStore } from "./meera-image-store.js";
 import { DpManager } from "./dp-manager.js";
 import type { Context } from "telegraf";
 import type { GeminiResponse } from "./gemini-session.js";
-import { selectBestImageWithGemini } from "./gemini-session.js";
+import { selectBestImageWithGemini, analyzeImageWithGemini } from "./gemini-session.js";
 
 // Catch unhandled errors so the bot doesn't crash
 process.on("unhandledRejection", (err) => console.error("[Unhandled]", err));
@@ -594,8 +594,25 @@ async function selectBestMeeraImageIndex(
     console.log(`[MeeraImg] Gemini selected image ${bestIndex} from ${candidates.length} candidates (shortlisted from ${captions.length} total)`);
     return bestIndex;
   } catch (err) {
-    console.error("[MeeraImg] Gemini visual selection failed, falling back to Ollama pick:", err);
-    // Fallback: use the first Ollama shortlist pick
+    console.error("[MeeraImg] Gemini visual selection failed, falling back to Ollama caption-based pick:", err);
+    // Fallback: use Ollama's caption-based selection on the shortlisted candidates
+    try {
+      const shortlistCaptions = [];
+      for (const idx of shortlist) {
+        const img = await meeraImages.getByIndex(idx);
+        if (img) shortlistCaptions.push({ index: idx, caption: img.caption });
+      }
+      if (shortlistCaptions.length > 0) {
+        const ollamaIndex = await selectMeeraImage(
+          ollamaConfig, userText, mood, tier, shortlistCaptions, history, user.ollamaKeys,
+        );
+        console.log(`[MeeraImg] Ollama fallback selected image ${ollamaIndex} from ${shortlistCaptions.length} shortlisted`);
+        return ollamaIndex;
+      }
+    } catch (fallbackErr) {
+      console.error("[MeeraImg] Ollama fallback also failed:", fallbackErr);
+    }
+    // Final fallback: first shortlisted
     return shortlist[0];
   }
 }
@@ -1761,6 +1778,21 @@ function getReplyContext(ctx: Context, userId: number): string {
   const isFromBot = replyMsg.from?.id === botId;
   const sender = isFromBot ? "you" : "the user";
 
+  // Check if this is a reply to a photo sent by the bot
+  if (replyMsg.photo && isFromBot) {
+    const targetMsgId = replyMsg.message_id;
+    const imageInfo = getSentImageInfo(userId, targetMsgId);
+    if (imageInfo) {
+      // We have tracked metadata — mark for async Gemini analysis
+      return `__REPLY_TO_BOT_IMAGE__:${targetMsgId}:${replyText || ""}`;
+    }
+    // Photo from bot but not tracked — use caption if available
+    if (replyText) {
+      return `(The user is replying to a photo that you sent earlier with caption: "${replyText.slice(0, 200)}")\n\n`;
+    }
+    return `(The user is replying to a photo you sent earlier)\n\n`;
+  }
+
   if (replyText) {
     return `(The user is replying to a specific message that ${sender} sent earlier: "${replyText.slice(0, 300)}")\n\n`;
   }
@@ -1792,6 +1824,60 @@ function getReplyContext(ctx: Context, userId: number): string {
 
 // ── RAPID-FIRE MESSAGE BATCHING ─────────────────────────────────────
 // When user sends multiple messages quickly, batch them into one reply.
+
+/**
+ * Resolve a reply-to-image marker into actual context.
+ * Tries Gemini vision first (to "see" the image), falls back to caption.
+ */
+async function resolveImageReplyContext(
+  marker: string,
+  userId: number,
+): Promise<string> {
+  // Parse marker: __REPLY_TO_BOT_IMAGE__:<msgId>:<captionText>
+  const parts = marker.split(":");
+  const msgId = parseInt(parts[1]);
+  const captionText = parts.slice(2).join(":"); // Rejoin in case caption has colons
+  const imageInfo = getSentImageInfo(userId, msgId);
+
+  if (!imageInfo) {
+    // Shouldn't happen but handle gracefully
+    return captionText
+      ? `(The user is replying to a photo you sent with caption: "${captionText.slice(0, 200)}")\n\n`
+      : `(The user is replying to a photo you sent earlier)\n\n`;
+  }
+
+  // Try Gemini vision analysis if we have a fileId
+  if (imageInfo.fileId) {
+    try {
+      const buffer = await downloadFileBuffer(imageInfo.fileId);
+      const base64 = buffer.toString("base64");
+      const analysis = await analyzeImageWithGemini(
+        GEMINI_API_KEY!,
+        base64,
+        "Briefly describe what's in this photo — the person, their expression, pose, setting, outfit, and vibe. Keep it to 2-3 sentences, natural and concise.",
+      );
+
+      if (analysis) {
+        const typeLabel = imageInfo.type === "meera" ? "a selfie/photo of yourself" : "a generated image";
+        console.log(`[ReplyCtx] Gemini analyzed replied-to image for user ${userId}`);
+        return `(The user is replying to ${typeLabel} you sent earlier. What's in the photo: ${analysis.slice(0, 300)}${captionText ? `. Your caption was: "${captionText}"` : ""})\n\n`;
+      }
+    } catch (err) {
+      console.error(`[ReplyCtx] Gemini image analysis failed for user ${userId}:`, err);
+    }
+  }
+
+  // Fallback: use the stored caption/description (or generation prompt for Stability AI)
+  const typeLabel = imageInfo.type === "meera" ? "a selfie/photo of yourself" : "an image you generated";
+  const descPart = imageInfo.caption
+    ? (imageInfo.type === "generated"
+        ? `You generated it with the idea: ${imageInfo.caption.slice(0, 200)}.`
+        : `The photo was: ${imageInfo.caption.slice(0, 200)}.`)
+    : "";
+  const captionPart = captionText ? ` Your caption was: "${captionText}".` : "";
+  console.log(`[ReplyCtx] Using ${imageInfo.type === "generated" ? "prompt" : "caption"} fallback for replied-to image, user ${userId}`);
+  return `(The user is replying to ${typeLabel} you sent earlier. ${descPart}${captionPart})\n\n`;
+}
 
 interface PendingBatch {
   messages: Array<{ text: string; msgId: number; ctx: Context & { message: { text: string } } }>;
@@ -1957,6 +2043,27 @@ function trackSentMessage(userId: number, msgId: number) {
   if (!ids) { ids = []; recentSentMsgIds.set(userId, ids); }
   ids.push(msgId);
   if (ids.length > 5) ids.shift();
+}
+
+/** Track sent image message IDs → metadata so we can handle reply-to-image */
+interface SentImageInfo {
+  msgId: number;
+  caption: string;        // Internal caption/description of the image
+  fileId?: string;        // Telegram file_id (for Meera community images)
+  type: "meera" | "generated";
+}
+
+const sentImageMap = new Map<number, SentImageInfo[]>();
+
+function trackSentImage(userId: number, info: SentImageInfo) {
+  let images = sentImageMap.get(userId);
+  if (!images) { images = []; sentImageMap.set(userId, images); }
+  images.push(info);
+  if (images.length > 10) images.shift(); // Keep last 10
+}
+
+function getSentImageInfo(userId: number, msgId: number): SentImageInfo | undefined {
+  return sentImageMap.get(userId)?.find((i) => i.msgId === msgId);
 }
 
 // Feature 2: "Change mind" editing — edits a sent message to revise what she said
@@ -2697,9 +2804,18 @@ async function sendMeeraImage(
     const photoOpts: Record<string, unknown> = { caption };
     if (shouldUseSpoiler(tier, reason)) photoOpts.has_spoiler = true;
     if (shouldProtectContent(tier)) photoOpts.protect_content = true;
-    await (ctx as any).telegram.sendPhoto(ctx.chat!.id, image.fileId, photoOpts);
+    const sentMsg = await (ctx as any).telegram.sendPhoto(ctx.chat!.id, image.fileId, photoOpts);
 
-    store.addMessage(userId, "assistant", caption);
+    const sentMsgId = sentMsg?.message_id;
+    store.addMessage(userId, "assistant", caption, sentMsgId);
+    if (sentMsgId) {
+      trackSentImage(userId, {
+        msgId: sentMsgId,
+        caption: image.caption,
+        fileId: image.fileId,
+        type: "meera",
+      });
+    }
     store.updateUser(userId, {
       lastSelfieSent: now,
       selfiesSent: (user.selfiesSent ?? 0) + 1,
@@ -2750,9 +2866,22 @@ async function sendGeneratedImage(
     const genPhotoOpts: Record<string, unknown> = { caption };
     if (shouldUseSpoiler(tier, "asked")) genPhotoOpts.has_spoiler = true;
     if (shouldProtectContent(tier)) genPhotoOpts.protect_content = true;
-    await (ctx as any).telegram.sendPhoto(ctx.chat!.id, { source: result.imageBuffer }, genPhotoOpts);
+    const sentMsg = await (ctx as any).telegram.sendPhoto(ctx.chat!.id, { source: result.imageBuffer }, genPhotoOpts);
 
-    store.addMessage(userId, "assistant", caption);
+    const sentMsgId = sentMsg?.message_id;
+    // Extract the Telegram file_id from the sent photo for later retrieval
+    const sentFileId = sentMsg?.photo?.length
+      ? sentMsg.photo[sentMsg.photo.length - 1].file_id
+      : undefined;
+    store.addMessage(userId, "assistant", caption, sentMsgId);
+    if (sentMsgId) {
+      trackSentImage(userId, {
+        msgId: sentMsgId,
+        caption: prompt,  // Store the generation prompt as fallback context
+        fileId: sentFileId,
+        type: "generated",
+      });
+    }
     console.log(`[ImageGen] Sent generated image to user ${userId}`);
     return true;
   } catch (err) {
@@ -2797,7 +2926,12 @@ async function handleTextMessage(
   const paceMult = paceMultiplier(userId);
 
   // ── Reply context: what message is the user replying to?
-  const replyContext = getReplyContext(ctx, userId);
+  let replyContext = getReplyContext(ctx, userId);
+
+  // If replying to a bot-sent image, resolve via Gemini vision (async)
+  if (replyContext.startsWith("__REPLY_TO_BOT_IMAGE__")) {
+    replyContext = await resolveImageReplyContext(replyContext, userId);
+  }
 
   // ── Status-aware: detect gap since last interaction
   const gapMs = Date.now() - prevLastInteraction;
@@ -3344,7 +3478,10 @@ async function handleMediaMessage(
   const mediaHint = getMediaReactionHint(mediaType, tier);
 
   // ── Reply context: what message is the user replying to with this media?
-  const replyContext = getReplyContext(ctx, userId);
+  let replyContext = getReplyContext(ctx, userId);
+  if (replyContext.startsWith("__REPLY_TO_BOT_IMAGE__")) {
+    replyContext = await resolveImageReplyContext(replyContext, userId);
+  }
   if (replyContext) {
     // Prepend the reply context as a text part so Gemini/Ollama sees it
     parts.unshift({ text: replyContext });
