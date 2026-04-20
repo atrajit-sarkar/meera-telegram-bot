@@ -145,6 +145,10 @@ export interface MeeraBehavior {
   vibeContext: string;
   /** Gap context — how she feels about time since last message */
   gapContext: string;
+  /** What she's specifically doing right now (e.g. "watching reels", "eating maggi", "studying for exam") */
+  currentActivity: string;
+  /** Whether to simulate typing hesitation (start typing → pause → resume) */
+  typingHesitation: boolean;
 }
 
 const BEHAVIOR_DEFAULTS: MeeraBehavior = {
@@ -158,6 +162,8 @@ const BEHAVIOR_DEFAULTS: MeeraBehavior = {
   reactEmoji: "",
   vibeContext: "",
   gapContext: "",
+  currentActivity: "",
+  typingHesitation: false,
 };
 
 // ── Meera's Base Lifestyle Schedule (IST) ────────────────────────
@@ -302,7 +308,9 @@ RESPOND WITH ONLY THIS JSON (no markdown, no explanation):
   "shouldQuote": <true|false, whether to quote-reply their specific message>,
   "sendSilently": <true|false, send without notification — late night consideration>,
   "reactEmoji": "<emoji to react with, or empty string — pick from 😂💀🙄😭👀🤷‍♀️😐🫠👍❤🔥😴, empty for no reaction>",
-  "vibeContext": "<1-2 sentences describing her current state for the reply generator — like 'just woke up, still groggy, phone brightness hurting eyes' or 'chilling in bed watching reels, very relaxed' or 'in a great mood because of the rain'>",
+  "currentActivity": "<what she's specifically doing RIGHT NOW — be concrete and relatable: 'scrolling instagram reels in bed', 'making maggi', 'studying organic chem but actually on phone', 'lying in bed doing nothing', 'brushing teeth', 'in auto coming back from college'>",
+  "typingHesitation": <true|false, whether she'd start typing, pause/reconsider, then type again — happens when unsure what to say, or crafting a careful response, or when the message is emotional>,
+  "vibeContext": "<1-2 sentences describing her current state for the reply generator — incorporate currentActivity naturally, like 'eating maggi while watching reels, very chill' or 'just woke up, still groggy, phone brightness hurting eyes'>",
   "gapContext": "<if they were gone for a while, how she feels — like 'a little annoyed they disappeared' or 'dramatic about being ignored' or empty if no gap>"
 }
 
@@ -346,6 +354,8 @@ RULES:
     const reactEmoji = typeof parsed.reactEmoji === "string" ? parsed.reactEmoji.slice(0, 4) : "";
     const vibeContext = String(parsed.vibeContext || "").slice(0, 300);
     const gapContext = String(parsed.gapContext || "").slice(0, 300);
+    const currentActivity = String(parsed.currentActivity || "").slice(0, 200);
+    const typingHesitation = !!parsed.typingHesitation;
 
     // Force sleeping → delay if AI said sleeping but didn't set delay
     if (availability === "sleeping" && responseMode !== "delay" && delayMinutes === 0) {
@@ -360,6 +370,8 @@ RULES:
         reactEmoji: "",
         vibeContext: vibeContext || "just woke up, still half asleep",
         gapContext,
+        currentActivity: currentActivity || "sleeping",
+        typingHesitation: false,
       };
     }
 
@@ -376,6 +388,8 @@ RULES:
         reactEmoji: "",
         vibeContext,
         gapContext,
+        currentActivity,
+        typingHesitation: false,
       };
     }
 
@@ -390,6 +404,8 @@ RULES:
       reactEmoji,
       vibeContext,
       gapContext,
+      currentActivity,
+      typingHesitation,
     };
   } catch (err) {
     console.error("[AI] decideMeeraBehavior failed:", err);

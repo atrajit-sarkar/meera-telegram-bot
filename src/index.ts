@@ -133,20 +133,27 @@ function typingIndicator(ctx: Context, action: "typing" | "record_voice" = "typi
 }
 
 /** Simulate typing delay based on message length */
-function typingDelay(text: string): number {
+/** Simulate typing time — mood-aware: tired/drowsy = slower, excited = faster */
+function typingDelay(text: string, mood?: string): number {
   const words = text.split(/\s+/).length;
   // Base: 1.5-3.5s + ~80ms per word, capped at 6s
-  const base = 1500 + Math.random() * 2000;
+  let base = 1500 + Math.random() * 2000;
+  // Mood adjustments to base delay
+  if (mood === "tired" || mood === "bored") base *= 1.3;
+  else if (mood === "excited" || mood === "happy") base *= 0.7;
+  else if (mood === "annoyed") base *= 0.85; // short patience, types fast
   return Math.min(base + words * 80, 6000);
 }
 
-/** Simulate "reading" the message before typing — real girls don't start typing instantly */
-function readDelay(userMessage: string): number {
+/** Simulate "reading" the message before typing — mood-aware */
+function readDelay(userMessage: string, mood?: string): number {
   const len = userMessage.length;
-  // Short messages: 0.5-1.5s read time
-  // Longer messages: up to 3s
-  const base = 500 + Math.random() * 1000;
+  let base = 500 + Math.random() * 1000;
   const extra = Math.min(len * 15, 1500);
+  // Mood adjustments
+  if (mood === "tired" || mood === "bored") base *= 1.4; // reads slower when tired
+  else if (mood === "excited" || mood === "clingy") base *= 0.6; // grabs phone fast when excited/clingy
+  else if (mood === "annoyed") base *= 0.8; // reads quick, unimpressed
   return base + extra;
 }
 
@@ -256,7 +263,10 @@ async function getMeeraBehavior(
   );
 
   // Store behavior decision for this user (for consistency across calls)
-  store.setLastBehavior(userId, behavior.responseMode, behavior.vibeContext || behavior.availability);
+  const vibeDesc = behavior.currentActivity
+    ? `${behavior.currentActivity} — ${behavior.vibeContext || behavior.availability}`
+    : behavior.vibeContext || behavior.availability;
+  store.setLastBehavior(userId, behavior.responseMode, vibeDesc);
 
   // Boost engagement on interaction (more for active convos, less for delayed)
   if (behavior.responseMode !== "delay" && behavior.responseMode !== "leave_on_read") {
@@ -463,17 +473,20 @@ function addDeliberateTypos(text: string, mood: string): string {
 // ── TYPING FAKE-OUTS ───────────────────────────────────────────────
 
 /** Sometimes start typing, stop, then resume — like she started a reply and deleted it */
-async function maybeTypingFakeout(ctx: Context, tier: string): Promise<void> {
-  // Only for comfortable+ and 10% of the time
+/** Typing hesitation — she starts typing, pauses (reconsidering), then types again.
+ *  Controlled by behavior.typingHesitation (AI-decided) with fallback to random 10%. */
+async function maybeTypingFakeout(ctx: Context, tier: string, hesitate?: boolean): Promise<void> {
+  // Only for comfortable+ tiers
   if (tier === "stranger" || tier === "acquaintance") return;
-  if (Math.random() > 0.10) return;
+  // AI says hesitate, or 10% random chance
+  if (!hesitate && Math.random() > 0.10) return;
 
   // Start typing
   await ctx.sendChatAction("typing").catch(() => {});
   // Type for 1-3 seconds
   await new Promise((r) => setTimeout(r, 1000 + Math.random() * 2000));
   // Stop (just don't send any more typing actions)
-  // Pause for 2-5 seconds (she deleted what she was typing)
+  // Pause for 2-5 seconds (she deleted what she was typing / is reconsidering)
   await new Promise((r) => setTimeout(r, 2000 + Math.random() * 3000));
   // Resume typing (handled by caller after this returns)
 }
@@ -978,9 +991,15 @@ async function sendText(ctx: Context, text: string, replyToMsgId?: number, extra
 /** Try to set a reaction emoji on the user's message */
 async function maybeReact(ctx: Context, userId: number, userMessage: string) {
   const msgCount = store.getMessageCount(userId);
-  // Reaction probability scales with relationship
-  const prob =
+  const mood = store.getMood(userId);
+  // Base probability scales with relationship
+  let prob =
     msgCount < 5 ? 0.1 : msgCount < 15 ? 0.3 : msgCount < 30 ? 0.5 : 0.7;
+  // Mood adjustments — sassy/excited react more, tired/bored react less
+  if (mood === "sassy" || mood === "excited") prob = Math.min(prob * 1.4, 0.85);
+  else if (mood === "happy" || mood === "clingy") prob = Math.min(prob * 1.2, 0.8);
+  else if (mood === "tired" || mood === "bored") prob *= 0.5;
+  else if (mood === "annoyed") prob *= 0.7;
   if (Math.random() > prob) return;
 
   const tier = store.getComfortTier(userId);
@@ -1008,19 +1027,25 @@ async function maybeSendSticker(
 ) {
   const msgCount = store.getMessageCount(userId);
   const user = store.getUser(userId);
+  const mood = user.mood || "chill";
   // No global sticker packs? Skip
   const globalPacks = store.getGlobalStickerPackNames();
   if (!globalPacks.length) return;
-  // Probability by tier
-  const shouldSend =
+  // Base probability by tier
+  let baseProbability =
     msgCount < 8
-      ? false
+      ? 0
       : msgCount < 25
-        ? Math.random() < 0.04
+        ? 0.04
         : msgCount < 60
-          ? Math.random() < 0.12
-          : Math.random() < 0.22;
-  if (!shouldSend) return;
+          ? 0.12
+          : 0.22;
+  // Mood adjustments — happy/clingy/excited send more stickers, tired/annoyed send fewer
+  if (mood === "happy" || mood === "clingy" || mood === "excited") baseProbability *= 1.5;
+  else if (mood === "sassy") baseProbability *= 1.3;
+  else if (mood === "tired" || mood === "annoyed") baseProbability *= 0.4;
+  else if (mood === "bored") baseProbability *= 0.6;
+  if (baseProbability === 0 || Math.random() >= baseProbability) return;
 
   const history = store.getRecentHistory(userId);
   const personaHint = user.customPersona ? user.customPersona.slice(0, 500) : undefined;
@@ -3359,9 +3384,11 @@ async function handleTextMessage(
   const gapContext = behavior.gapContext
     ? `(${behavior.gapContext})`
     : buildGapAwareContext(gapMs, tier);
+  // Build rich vibe context — includes what she's doing and her state
+  const activityHint = behavior.currentActivity ? `Currently: ${behavior.currentActivity}. ` : "";
   const vibeContext = behavior.vibeContext
-    ? `(Current vibe: ${behavior.vibeContext})`
-    : "";
+    ? `(${activityHint}Vibe: ${behavior.vibeContext})`
+    : activityHint ? `(${activityHint.trim()})` : "";
 
   // ── Handle delay/sleeping/leave-on-read from AI behavior
   if (behavior.responseMode === "delay" && behavior.delayMinutes > 0) {
@@ -3392,7 +3419,7 @@ async function handleTextMessage(
   if (behavior.responseMode === "emoji_only" && behavior.reactEmoji) {
     store.addMessage(userId, "user", text);
     store.addMessage(userId, "assistant", behavior.reactEmoji);
-    const readTime = readDelay(text) * behavior.delayMultiplier;
+    const readTime = readDelay(text, mood) * behavior.delayMultiplier;
     await new Promise((r) => setTimeout(r, readTime));
     await ctx.reply(behavior.reactEmoji);
     console.log(`[Behavior] Emoji-only (${behavior.reactEmoji}): user ${userId}`);
@@ -3419,7 +3446,7 @@ async function handleTextMessage(
 
   // ── Typing fake-out? (start typing, stop, resume) — skip in rapid-fire
   if (todMultiplier >= 0.7) {
-    await maybeTypingFakeout(ctx, tier);
+    await maybeTypingFakeout(ctx, tier, behavior.typingHesitation);
   }
 
   // ── Voice note tease? (show record_voice then switch to text) — skip in rapid-fire
@@ -3548,7 +3575,7 @@ async function handleTextMessage(
     // Voice reply via Gemini Live
     let stopTyping = () => {};
     try {
-      const readTime = readDelay(text) * todMultiplier;
+      const readTime = readDelay(text, mood) * todMultiplier;
       await new Promise((r) => setTimeout(r, readTime));
 
       // If user is asking for content and we're actually sending it, hint Gemini
@@ -3600,7 +3627,7 @@ async function handleTextMessage(
         }
         store.addMessage(userId, "assistant", reply);
 
-        const delay = typingDelay(reply) * todMultiplier;
+        const delay = typingDelay(reply, mood) * todMultiplier;
         await new Promise((r) => setTimeout(r, Math.min(delay, 6000)));
         stopTyping();
         await sendAsBubbles(ctx, reply, quoteReplyId);
@@ -3639,7 +3666,7 @@ async function handleTextMessage(
     // Text reply via Ollama
     let stopTyping = () => {};
     try {
-      const readTime = readDelay(text) * todMultiplier;
+      const readTime = readDelay(text, mood) * todMultiplier;
       await new Promise((r) => setTimeout(r, readTime));
 
       stopTyping = typingIndicator(ctx, "typing");
@@ -3955,7 +3982,7 @@ async function handleMediaMessage(
 
   // Typing fake-out before processing
   if (mediaBehavior.delayMultiplier >= 0.7) {
-    await maybeTypingFakeout(ctx, tier);
+    await maybeTypingFakeout(ctx, tier, mediaBehavior.typingHesitation);
   }
 
   // ── Quote-reply from AI behavior
@@ -4024,7 +4051,7 @@ async function handleMediaMessage(
       store.addMessage(userId, "user", userSaid ? `[voice message] ${userSaid}` : "[sent voice message]", incomingMsgId);
       store.addMessage(userId, "assistant", reply);
 
-      const delay = typingDelay(reply) * mediaBehavior.delayMultiplier;
+      const delay = typingDelay(reply, mood) * mediaBehavior.delayMultiplier;
       await new Promise((r) => setTimeout(r, Math.min(delay, 6000)));
       await sendAsBubbles(ctx, reply, quoteReplyId);
 
@@ -4636,20 +4663,42 @@ async function proactiveLoop() {
     if (!threshold) continue;
 
     const elapsed = now - user.lastInteraction;
-    if (elapsed < threshold) continue;
+    const mood = store.getMood(userId);
+    const engagement = store.getEngagement(userId);
+
+    // ── Mood + engagement adjusted thresholds ──
+    // Clingy/bored mood → she reaches out sooner. Tired/annoyed → later or skips.
+    // High engagement → reaches out sooner (she's invested).
+    let adjustedThreshold = threshold;
+    if (mood === "clingy") adjustedThreshold *= 0.6;         // reaches out 40% sooner
+    else if (mood === "bored") adjustedThreshold *= 0.7;     // bored, looking for convo
+    else if (mood === "excited") adjustedThreshold *= 0.8;    // wants to share excitement
+    else if (mood === "tired" || mood === "annoyed") adjustedThreshold *= 1.5; // not in the mood
+    // Engagement factor: high engagement (80+) → reach out sooner, low (<30) → much later
+    if (engagement >= 80) adjustedThreshold *= 0.7;
+    else if (engagement >= 60) adjustedThreshold *= 0.85;
+    else if (engagement < 30) adjustedThreshold *= 1.4;
+
+    if (elapsed < adjustedThreshold) continue;
 
     // Add some randomness — don't always ping exactly at threshold
     // 30% chance to skip this cycle (makes timing feel less robotic)
     if (Math.random() < 0.3) continue;
 
-    // Don't send proactive pings at weird hours (2-7 AM IST)
+    // Don't send proactive pings at weird hours — use lifestyle schedule
     const hour = getISTHour();
-    if (hour >= 2 && hour < 7) continue;
+    if (hour >= 1 && hour < 7) continue; // 1-7 AM: she's asleep
+    if (hour >= 23) { // 11 PM+: only for close friends with high engagement
+      if (tier !== "close" || engagement < 60) continue;
+    }
 
-    const mood = store.getMood(userId);
-
-    // ── Content sharing: 20% chance to share random content instead of a ping (comfortable+)
-    const shareContent = (tier === "comfortable" || tier === "close") && Math.random() < 0.20;
+    // ── Content sharing: mood-influenced chance
+    // Happy/bored → more likely to share random stuff. Tired → less likely.
+    let shareChance = 0.20;
+    if (mood === "bored" || mood === "happy") shareChance = 0.35;
+    else if (mood === "excited") shareChance = 0.30;
+    else if (mood === "tired") shareChance = 0.08;
+    const shareContent = (tier === "comfortable" || tier === "close") && Math.random() < shareChance;
     let prompt = shareContent
       ? (CONTENT_SHARE_PROMPTS[tier] ?? INITIATE_PROMPTS[tier])
       : INITIATE_PROMPTS[tier];

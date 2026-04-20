@@ -63,6 +63,46 @@ export function defaultUserData(): UserData {
 }
 
 /**
+ * Pick a mood weighted by time of day (IST hour).
+ * A real person's emotional baseline follows circadian patterns:
+ * - Late night / early morning → tired, chill
+ * - Morning → chill, happy, sometimes annoyed (not a morning person)
+ * - Afternoon → bored, tired (post-lunch slump), chill
+ * - Evening → happy, excited, sassy (prime social time)
+ * - Night → clingy, chill, tired (winding down)
+ */
+function pickTimeWeightedMood(hourIST: number): string {
+  // Weights for each mood by time bracket: [happy, bored, clingy, sassy, tired, excited, chill, annoyed]
+  type MoodWeights = Record<string, number>;
+
+  const timeWeights: MoodWeights =
+    (hourIST >= 1 && hourIST < 7) ? // 1-7 AM: sleeping/groggy
+      { happy: 1, bored: 1, clingy: 1, sassy: 0, tired: 10, excited: 0, chill: 3, annoyed: 2 } :
+    (hourIST >= 7 && hourIST < 10) ? // 7-10 AM: waking up
+      { happy: 3, bored: 2, clingy: 1, sassy: 1, tired: 4, excited: 1, chill: 5, annoyed: 3 } :
+    (hourIST >= 10 && hourIST < 13) ? // 10 AM-1 PM: morning / class
+      { happy: 4, bored: 4, clingy: 1, sassy: 2, tired: 1, excited: 2, chill: 4, annoyed: 2 } :
+    (hourIST >= 13 && hourIST < 16) ? // 1-4 PM: post-lunch
+      { happy: 2, bored: 5, clingy: 1, sassy: 1, tired: 5, excited: 1, chill: 4, annoyed: 1 } :
+    (hourIST >= 16 && hourIST < 19) ? // 4-7 PM: evening / free time
+      { happy: 4, bored: 2, clingy: 2, sassy: 3, tired: 1, excited: 3, chill: 3, annoyed: 2 } :
+    (hourIST >= 19 && hourIST < 22) ? // 7-10 PM: prime time
+      { happy: 4, bored: 1, clingy: 3, sassy: 4, tired: 1, excited: 4, chill: 3, annoyed: 1 } :
+    // 10 PM-1 AM: winding down
+      { happy: 2, bored: 2, clingy: 4, sassy: 2, tired: 4, excited: 1, chill: 4, annoyed: 1 };
+
+  // Weighted random selection
+  const entries = Object.entries(timeWeights);
+  const totalWeight = entries.reduce((sum, [, w]) => sum + w, 0);
+  let roll = Math.random() * totalWeight;
+  for (const [mood, weight] of entries) {
+    roll -= weight;
+    if (roll <= 0) return mood;
+  }
+  return "chill";
+}
+
+/**
  * Manages per-user chat history and user data.
  * In-memory cache backed by Firestore for persistence.
  */
@@ -234,13 +274,22 @@ export class UserStore {
     return "close";
   }
 
-  /** Get current mood, rotating every 2-6 hours randomly */
+  /**
+   * Get current mood — time-of-day weighted, not purely random.
+   * A real girl is tired late at night, not randomly "excited" at 3 AM.
+   * Mood still rotates every 2-6 hours, but the pool is weighted by IST hour.
+   */
   getMood(userId: number): string {
     const user = this.getUser(userId);
     const now = Date.now();
     const moodDuration = 2 * 3600 * 1000 + Math.random() * 4 * 3600 * 1000; // 2-6h
     if (now - user.lastMoodChange > moodDuration) {
-      const newMood = MOODS[Math.floor(Math.random() * MOODS.length)];
+      // Get IST hour for time-weighted mood selection
+      const istOffset = 5.5 * 60 * 60 * 1000;
+      const ist = new Date(now + istOffset + new Date().getTimezoneOffset() * 60000);
+      const hour = ist.getHours();
+
+      const newMood = pickTimeWeightedMood(hour);
       user.mood = newMood;
       user.lastMoodChange = now;
       this.saveQueue.add(userId);
