@@ -259,6 +259,8 @@ function stripInternalArtifacts(text: string): string {
   cleaned = cleaned.replace(/\[shared:[^\]]*\]/gi, "");
   // Remove (prompt: ...) or (image prompt: ...) leaked generation prompts
   cleaned = cleaned.replace(/\((?:image )?prompt:\s*[^)]+\)/gi, "");
+  // Remove internal markers that might leak
+  cleaned = cleaned.replace(/__REPLY_TO_BOT_IMAGE__[^\n]*/gi, "");
   // Remove standalone file-ID-like UUIDs (v followed by hex-UUID pattern)
   cleaned = cleaned.replace(/v[0-9a-f]{8,}-[0-9a-f-]+\.(jpg|jpeg|png|webp|mp4)/gi, "");
   // Collapse multiple newlines and trim
@@ -497,6 +499,7 @@ function scheduleDelayedReply(
       );
       let reply = await ollamaChat(messages, user.ollamaKeys);
       reply = stripInternalArtifacts(reply);
+      if (!reply) reply = ["hmm", "haha", "sorry was sleeping 😴"][Math.floor(Math.random() * 3)];
       reply = addDeliberateTypos(reply, mood);
 
       store.addMessage(userId, "user", userText);
@@ -2051,16 +2054,30 @@ interface SentImageInfo {
   caption: string;        // Internal caption/description of the image
   fileId?: string;        // Telegram file_id (for Meera community images)
   type: "meera" | "generated";
+  ts: number;             // Timestamp of when image was sent
 }
 
 const sentImageMap = new Map<number, SentImageInfo[]>();
 
-function trackSentImage(userId: number, info: SentImageInfo) {
+function trackSentImage(userId: number, info: Omit<SentImageInfo, "ts">) {
   let images = sentImageMap.get(userId);
   if (!images) { images = []; sentImageMap.set(userId, images); }
-  images.push(info);
-  if (images.length > 10) images.shift(); // Keep last 10
+  images.push({ ...info, ts: Date.now() });
+  if (images.length > 20) images.splice(0, images.length - 20); // Keep last 20
 }
+
+/** Periodic cleanup: remove stale entries older than 24h */
+setInterval(() => {
+  const cutoff = Date.now() - 86400000;
+  for (const [userId, images] of sentImageMap) {
+    const fresh = images.filter((i) => i.ts > cutoff);
+    if (fresh.length === 0) {
+      sentImageMap.delete(userId);
+    } else if (fresh.length < images.length) {
+      sentImageMap.set(userId, fresh);
+    }
+  }
+}, 3600000); // Check every hour
 
 function getSentImageInfo(userId: number, msgId: number): SentImageInfo | undefined {
   return sentImageMap.get(userId)?.find((i) => i.msgId === msgId);
@@ -3284,6 +3301,11 @@ async function handleTextMessage(
       // Strip any leaked internal metadata from the reply
       reply = stripInternalArtifacts(reply);
 
+      // Guard: if stripping emptied the reply, use a natural fallback
+      if (!reply) {
+        reply = ["hmm", "haha", "🤔", "tell me more", "achaa"][Math.floor(Math.random() * 5)];
+      }
+
       // Add deliberate typos
       const cleanReply = reply; // Save pre-typo version
       reply = addDeliberateTypos(reply, mood);
@@ -3365,6 +3387,7 @@ async function handleTextMessage(
           );
           let retryReply = await ollamaChat(retryMessages, store.getUser(userId).ollamaKeys);
           retryReply = stripInternalArtifacts(retryReply);
+          if (!retryReply) retryReply = "hmm";
           retryReply = addDeliberateTypos(retryReply, mood);
           if (isBatched) {
             for (const t of batchedTexts!) store.addMessage(userId, "user", t);

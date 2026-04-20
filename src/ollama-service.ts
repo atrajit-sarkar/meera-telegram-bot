@@ -553,8 +553,9 @@ export async function selectMeeraImage(
   if (captions.length === 0) return -1;
   if (captions.length === 1) return captions[0].index;
 
+  // Use sequential 1-based numbering for the prompt (not raw indices)
   const captionList = captions
-    .map((c) => `${c.index + 1}. ${c.caption}`)
+    .map((c, i) => `${i + 1}. ${c.caption}`)
     .join("\n");
 
   const systemPrompt = `You are helping Meera (a real girl) pick which photo of herself to send in a Telegram chat.
@@ -615,8 +616,9 @@ export async function shortlistMeeraImages(
   if (captions.length === 0) return [];
   if (captions.length <= maxCandidates) return captions.map((c) => c.index);
 
+  // Use sequential 1-based numbering for the prompt (not raw indices)
   const captionList = captions
-    .map((c) => `${c.index + 1}. ${c.caption}`)
+    .map((c, i) => `${i + 1}. ${c.caption}`)
     .join("\n");
 
   const systemPrompt = `You are helping Meera pick which photos of herself to consider sending in a Telegram chat.
@@ -652,9 +654,16 @@ Reply with ONLY the photo numbers separated by commas (e.g. "2,5,3,1,4"). Nothin
 
     if (nums.length === 1 && nums[0] === 0) return [];
 
+    // Deduplicate while preserving order
+    const seen = new Set<number>();
     const validIndices = nums
       .filter((n) => n >= 1 && n <= captions.length)
-      .map((n) => captions[n - 1].index);
+      .map((n) => captions[n - 1].index)
+      .filter((idx) => {
+        if (seen.has(idx)) return false;
+        seen.add(idx);
+        return true;
+      });
 
     if (validIndices.length === 0) {
       // Fallback: return first maxCandidates
