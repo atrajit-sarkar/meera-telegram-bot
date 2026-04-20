@@ -43,12 +43,14 @@ export function executeToolCall(
 
     case "getCurrentTime": {
       const now = new Date();
+      const istOptions: Intl.DateTimeFormatOptions = { timeZone: "Asia/Kolkata" };
       return {
         success: true,
-        time: now.toLocaleTimeString(),
-        date: now.toLocaleDateString(),
+        time: now.toLocaleTimeString("en-IN", { ...istOptions, hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true }),
+        date: now.toLocaleDateString("en-IN", { ...istOptions, weekday: "long", year: "numeric", month: "long", day: "numeric" }),
+        day: now.toLocaleDateString("en-IN", { ...istOptions, weekday: "long" }),
         iso: now.toISOString(),
-        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        timezone: "Asia/Kolkata (IST)",
       };
     }
 

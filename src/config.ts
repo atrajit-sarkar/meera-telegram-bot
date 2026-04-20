@@ -85,6 +85,35 @@ export function getComfortTier(msgCount: number): string {
 
 // NOTE: Prefer store.getComfortTier(userId) which uses totalMessages counter
 
+function getISTContext(): string {
+  const now = new Date();
+  const istFormatter = (opts: Intl.DateTimeFormatOptions) =>
+    new Intl.DateTimeFormat("en-IN", { timeZone: "Asia/Kolkata", ...opts }).format(now);
+
+  const time = istFormatter({ hour: "2-digit", minute: "2-digit", hour12: true });
+  const day = istFormatter({ weekday: "long" });
+  const date = istFormatter({ year: "numeric", month: "long", day: "numeric" });
+  const hour = parseInt(istFormatter({ hour: "numeric", hour12: false }), 10);
+
+  let timeVibe: string;
+  if (hour >= 5 && hour < 12) {
+    timeVibe = "It's morning — you're fresh, maybe a little sleepy still. Normal morning energy.";
+  } else if (hour >= 12 && hour < 17) {
+    timeVibe = "It's afternoon — you're in the middle of your day. Chill daytime energy.";
+  } else if (hour >= 17 && hour < 21) {
+    timeVibe = "It's evening — winding down, relaxed vibes. Maybe thinking about dinner or plans.";
+  } else if (hour >= 21 && hour < 24) {
+    timeVibe = "It's late night — you're in cozy night mode. Quieter, maybe sleepy, intimate chatting energy.";
+  } else {
+    timeVibe = "It's really late / super early — you're either up late or barely awake. Sleepy, low-energy vibes.";
+  }
+
+  return `\n\nCURRENT AWARENESS (you just know this naturally, like any real person):
+Right now it's ${time} IST, ${day}, ${date}.
+${timeVibe}
+You naturally reference time when it makes sense — like saying "good morning" in the morning, "why are you up so late" at 2am, "happy friday!" on fridays, etc. Don't force it, just be naturally time-aware like a real person would be.`;
+}
+
 export function buildSystemPrompt(tier: string, user: UserData, mood?: string): string {
   // If user has a custom persona, use it as the base instead of default Meera
   let prompt: string;
@@ -105,6 +134,7 @@ export function buildSystemPrompt(tier: string, user: UserData, mood?: string): 
     if (user.replyLength === "long")
       ctx.push("They like longer, more detailed replies.");
     if (ctx.length) prompt += "\n\n" + ctx.join(" ");
+    prompt += getISTContext();
     return prompt;
   }
 
@@ -137,6 +167,7 @@ export function buildSystemPrompt(tier: string, user: UserData, mood?: string): 
     ctx.push("They like longer, more detailed replies.");
 
   if (ctx.length) prompt += "\n\n" + ctx.join(" ");
+  prompt += getISTContext();
   return prompt;
 }
 
