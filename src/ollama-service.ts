@@ -122,6 +122,209 @@ export type ResponseAction =
   | { action: "emoji_only"; emoji: string }
   | { action: "sticker_only" };
 
+// ── Meera Behavior Decision (comprehensive, replaces all hardcoded behavior) ──
+
+export interface MeeraBehavior {
+  /** What she's doing right now — affects everything */
+  availability: "free" | "busy" | "sleeping" | "drowsy" | "distracted";
+  /** How to respond */
+  responseMode: "text" | "voice" | "emoji_only" | "sticker_only" | "leave_on_read" | "delay";
+  /** If delay — how many minutes (1-480) */
+  delayMinutes: number;
+  /** If delay — why (natural language, e.g. "was napping", "in class") */
+  delayReason: string;
+  /** Typing/read delay multiplier (0.3 = very fast, 1.0 = normal, 3.0 = very slow) */
+  delayMultiplier: number;
+  /** Whether to quote-reply the user's message */
+  shouldQuote: boolean;
+  /** Whether to send silently (no notification sound) */
+  sendSilently: boolean;
+  /** Emoji to react with, or empty string for no reaction */
+  reactEmoji: string;
+  /** Context hint for the AI generating the actual reply (e.g. "just woke up", "in a rush") */
+  vibeContext: string;
+  /** Gap context — how she feels about time since last message */
+  gapContext: string;
+}
+
+const BEHAVIOR_DEFAULTS: MeeraBehavior = {
+  availability: "free",
+  responseMode: "text",
+  delayMinutes: 0,
+  delayReason: "",
+  delayMultiplier: 1.0,
+  shouldQuote: false,
+  sendSilently: false,
+  reactEmoji: "",
+  vibeContext: "",
+  gapContext: "",
+};
+
+/**
+ * Single comprehensive AI call that decides ALL of Meera's behavioral aspects.
+ * Replaces: offlineScheduleDelay, shouldSendVoice, shouldQuoteReply,
+ *           timeOfDayMultiplier, voiceTimeModifier, shouldSendSilently,
+ *           buildGapAwareContext, and decideResponseBehavior.
+ *
+ * The AI considers: time, weather, comfort tier, mood, conversation pace,
+ * message content, gap since last interaction — like a real person would.
+ */
+export async function decideMeeraBehavior(
+  config: OllamaConfig,
+  userMessage: string,
+  chatHistory: OllamaMessage[],
+  opts: {
+    tier: string;
+    mood: string;
+    timeContext: string;      // e.g. "2:30 AM IST, Sunday"
+    weatherContext: string;   // e.g. "Rainy, 24°C, humid"
+    gapHours: number;         // hours since last interaction
+    isRapidFire: boolean;     // are they messaging fast back-and-forth?
+    avgGapMs: number;         // average gap between recent messages
+    messageLength: number;    // length of user's message
+    isMedia: boolean;         // user sent photo/video/audio
+    personaHint?: string;
+  },
+  userKeys: string[] = [],
+  communityKeys: string[] = [],
+): Promise<MeeraBehavior> {
+  const personaLine = opts.personaHint
+    ? `Your personality: ${opts.personaHint}`
+    : "You're a young Indian girl (college-age, casual, expressive).";
+
+  const systemPrompt = `You are simulating the REAL-TIME internal state and behavior decisions of a girl named Meera who's chatting on Telegram. You're not writing her reply — you're deciding HOW she would behave right now, like a real person with a real life.
+
+${personaLine}
+
+CURRENT CONTEXT:
+- Time: ${opts.timeContext}
+- Weather: ${opts.weatherContext || "Unknown"}
+- Relationship: ${opts.tier} (stranger → acquaintance → comfortable → close)
+- Her mood: ${opts.mood}
+- Hours since they last texted: ${opts.gapHours.toFixed(1)}
+- Conversation pace: ${opts.isRapidFire ? `rapid-fire (avg gap ${Math.round(opts.avgGapMs / 1000)}s)` : "normal"}
+- Their message length: ${opts.messageLength} chars${opts.isMedia ? "\n- They sent media (photo/video/audio)" : ""}
+
+THINK LIKE A REAL PERSON — what would she actually be doing right now?
+- Late night (12-6 AM): Probably sleeping, unless she's a night owl or was already in a conversation
+- Early morning (6-8 AM): Maybe just woke up, groggy, checking phone half-asleep
+- Morning (8-11 AM): Getting ready, college prep, breakfast — might be busy or distracted
+- Afternoon (12-4 PM): Could be in class, studying, napping, or free
+- Evening (4-8 PM): Usually free — hanging out, browsing phone, chatting
+- Night (8-12 AM): Prime chatting time — relaxed, free, maybe watching something
+- Rainy weather → cozy mood, more likely to chat and send voice notes
+- Hot weather → irritable, shorter replies, less effort
+- Cold weather → lazy, bundled up, might be sleepy
+- If they haven't texted in a long time → she might be dramatic about it (close) or unbothered (stranger)
+- If rapid-fire conversation → she's engaged, fast replies, might do voice
+- Strangers/acquaintances: ALWAYS reply, never leave on read, be polite, text only, no delays
+- Close friends: she can be real — leave on read, delay, voice notes, stickers, dramatic about gaps
+
+RESPOND WITH ONLY THIS JSON (no markdown, no explanation):
+{
+  "availability": "free|busy|sleeping|drowsy|distracted",
+  "responseMode": "text|voice|emoji_only|sticker_only|leave_on_read|delay",
+  "delayMinutes": <0-480, how long before she replies, 0 for immediate>,
+  "delayReason": "<why she's delayed, empty if immediate — like 'was napping', 'in class', 'phone was charging in other room'>",
+  "delayMultiplier": <0.3-3.0, how fast she types/reads — 0.3=excited rapid, 1.0=normal, 2.0=lazy/sleepy, 3.0=barely awake>,
+  "shouldQuote": <true|false, whether to quote-reply their specific message>,
+  "sendSilently": <true|false, send without notification — late night consideration>,
+  "reactEmoji": "<emoji to react with, or empty string — pick from 😂💀🙄😭👀🤷‍♀️😐🫠👍❤🔥😴, empty for no reaction>",
+  "vibeContext": "<1-2 sentences describing her current state for the reply generator — like 'just woke up, still groggy, phone brightness hurting eyes' or 'chilling in bed watching reels, very relaxed' or 'in a great mood because of the rain'>",
+  "gapContext": "<if they were gone for a while, how she feels — like 'a little annoyed they disappeared' or 'dramatic about being ignored' or empty if no gap>"
+}
+
+RULES:
+- Strangers/acquaintances: availability=free, responseMode=text, delayMultiplier=1.0, sendSilently=false, shouldQuote=false, reactEmoji="", no delays. Keep it simple.
+- Sleeping: responseMode MUST be "delay" with appropriate delayMinutes until she'd naturally wake up.
+- Don't leave on read too often — most messages (75%+) should get a real reply.
+- Voice messages: only for comfortable/close, more likely during cozy/intimate/lazy moments (rain, late night, lying in bed), and when she has longer thoughts.
+- emoji_only: only for low-effort messages like "ok", "hmm", "k" from comfortable/close friends.
+- sticker_only: very rare, only for playful moments.
+- shouldQuote: more likely when answering a specific question or referencing something they said.
+- sendSilently: consider during late night (11 PM - 6 AM) to not wake them.
+- reactEmoji: don't overuse — maybe 30% of messages, pick contextually appropriate emoji.
+- delayMultiplier during rapid-fire: should be LOW (0.3-0.5) — she's actively chatting.
+- Be CONSISTENT with availability — if it's 3 AM, she's probably sleeping unless the conversation was already going.
+- The gapContext should reflect real emotions based on tier — close friends get dramatic reactions for long gaps.`;
+
+  try {
+    const messages: OllamaMessage[] = [
+      { role: "system", content: systemPrompt },
+      ...chatHistory.slice(-8).filter((m) => m.role !== "system"),
+      { role: "user", content: userMessage },
+    ];
+    const raw = await callOllamaWithRotation(config, messages, userKeys, communityKeys);
+
+    // Parse JSON from response
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return { ...BEHAVIOR_DEFAULTS };
+
+    const parsed = JSON.parse(jsonMatch[0]);
+
+    const availability = ["free", "busy", "sleeping", "drowsy", "distracted"].includes(parsed.availability)
+      ? parsed.availability : "free";
+    const responseMode = ["text", "voice", "emoji_only", "sticker_only", "leave_on_read", "delay"].includes(parsed.responseMode)
+      ? parsed.responseMode : "text";
+    const delayMinutes = Math.max(0, Math.min(480, Number(parsed.delayMinutes) || 0));
+    const delayReason = String(parsed.delayReason || "").slice(0, 200);
+    const delayMultiplier = Math.max(0.2, Math.min(4.0, Number(parsed.delayMultiplier) || 1.0));
+    const shouldQuote = !!parsed.shouldQuote;
+    const sendSilently = !!parsed.sendSilently;
+    const reactEmoji = typeof parsed.reactEmoji === "string" ? parsed.reactEmoji.slice(0, 4) : "";
+    const vibeContext = String(parsed.vibeContext || "").slice(0, 300);
+    const gapContext = String(parsed.gapContext || "").slice(0, 300);
+
+    // Force sleeping → delay if AI said sleeping but didn't set delay
+    if (availability === "sleeping" && responseMode !== "delay" && delayMinutes === 0) {
+      return {
+        availability: "sleeping",
+        responseMode: "delay",
+        delayMinutes: 30 + Math.floor(Math.random() * 120),
+        delayReason: delayReason || "was sleeping",
+        delayMultiplier: 2.5,
+        shouldQuote: false,
+        sendSilently: true,
+        reactEmoji: "",
+        vibeContext: vibeContext || "just woke up, still half asleep",
+        gapContext,
+      };
+    }
+
+    // Force strangers/acquaintances to always reply normally
+    if (opts.tier === "stranger" || opts.tier === "acquaintance") {
+      return {
+        availability: "free",
+        responseMode: "text",
+        delayMinutes: 0,
+        delayReason: "",
+        delayMultiplier: Math.max(0.7, Math.min(1.3, delayMultiplier)),
+        shouldQuote: false,
+        sendSilently: false,
+        reactEmoji: "",
+        vibeContext,
+        gapContext,
+      };
+    }
+
+    return {
+      availability,
+      responseMode,
+      delayMinutes,
+      delayReason,
+      delayMultiplier,
+      shouldQuote,
+      sendSilently,
+      reactEmoji,
+      vibeContext,
+      gapContext,
+    };
+  } catch (err) {
+    console.error("[AI] decideMeeraBehavior failed:", err);
+    return { ...BEHAVIOR_DEFAULTS };
+  }
+}
+
 /**
  * Ask the AI to decide how to respond to a message — like a real person would.
  * Should she reply immediately? Delay? Leave on read? Just react with an emoji?

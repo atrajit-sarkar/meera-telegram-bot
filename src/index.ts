@@ -13,6 +13,7 @@ import {
   INACTIVITY_THRESHOLDS,
   CONTENT_SHARE_PROMPTS,
   buildGapAwareContext,
+  getWeatherSummary,
 } from "./config.js";
 import {
   callOllama,
@@ -26,8 +27,10 @@ import {
   selectMeeraImage,
   shortlistMeeraImages,
   selectMeeraVideo,
+  decideMeeraBehavior,
   type OllamaConfig,
   type OllamaMessage,
+  type MeeraBehavior,
 } from "./ollama-service.js";
 import { UserStore } from "./user-store.js";
 import { getRandomContentAny, getContentByAIQuery, shouldShareContentMidChat, type ContentPost } from "./reddit-memes.js";
@@ -157,14 +160,86 @@ function getISTHour(): number {
   return ist.getHours();
 }
 
-/** Extra delay multiplier based on time of day — slower at night, normal during day */
+/** Get full IST date for rich time context */
+function getISTTimeContext(): string {
+  const now = new Date();
+  const istOffset = 5.5 * 60 * 60 * 1000;
+  const ist = new Date(now.getTime() + istOffset + now.getTimezoneOffset() * 60000);
+  const hour = ist.getHours();
+  const minute = ist.getMinutes();
+  const days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  const day = days[ist.getDay()];
+  const ampm = hour >= 12 ? "PM" : "AM";
+  const h12 = hour === 0 ? 12 : hour > 12 ? hour - 12 : hour;
+  return `${h12}:${minute.toString().padStart(2, "0")} ${ampm} IST, ${day}`;
+}
+
+/** Lightweight fallback multiplier — only used when AI behavior call fails */
 function timeOfDayMultiplier(): number {
   const hour = getISTHour();
-  if (hour >= 1 && hour < 6) return 3.0;    // 1-6 AM: very slow (sleeping)
-  if (hour >= 6 && hour < 8) return 1.8;     // 6-8 AM: groggy/waking up
-  if (hour >= 23 || hour < 1) return 2.0;    // 11 PM - 1 AM: sleepy
-  if (hour >= 8 && hour < 10) return 1.2;    // morning routine
-  return 1.0;                                 // normal hours
+  if (hour >= 1 && hour < 6) return 3.0;
+  if (hour >= 6 && hour < 8) return 1.8;
+  if (hour >= 23 || hour < 1) return 2.0;
+  if (hour >= 8 && hour < 10) return 1.2;
+  return 1.0;
+}
+
+// ── BEHAVIOR CACHE ──────────────────────────────────────────────────
+// Caches the AI's behavior decision for a short window so multiple calls
+// for the same user in quick succession don't spam Ollama.
+const behaviorCache = new Map<number, { behavior: MeeraBehavior; ts: number }>();
+const BEHAVIOR_CACHE_TTL = 60_000; // 1 minute — stale after
+
+function getCachedBehavior(userId: number): MeeraBehavior | null {
+  const cached = behaviorCache.get(userId);
+  if (cached && Date.now() - cached.ts < BEHAVIOR_CACHE_TTL) return cached.behavior;
+  return null;
+}
+
+function cacheBehavior(userId: number, behavior: MeeraBehavior): void {
+  behaviorCache.set(userId, { behavior, ts: Date.now() });
+}
+
+/** Get Meera's behavior decision — uses cache if fresh, otherwise calls AI */
+async function getMeeraBehavior(
+  userId: number,
+  userMessage: string,
+  tier: string,
+  mood: string,
+  gapMs: number,
+  isMedia: boolean = false,
+): Promise<MeeraBehavior> {
+  // Check cache first
+  const cached = getCachedBehavior(userId);
+  if (cached) return cached;
+
+  const { isRapidFire, avgGapMs } = recordMessagePace(userId);
+  const user = store.getUser(userId);
+  const history = store.getRecentHistory(userId);
+
+  const behavior = await decideMeeraBehavior(
+    ollamaConfig,
+    userMessage,
+    history,
+    {
+      tier,
+      mood,
+      timeContext: getISTTimeContext(),
+      weatherContext: getWeatherSummary(),
+      gapHours: gapMs / (3600 * 1000),
+      isRapidFire,
+      avgGapMs,
+      messageLength: userMessage.length,
+      isMedia,
+      personaHint: user.customPersona?.slice(0, 500),
+    },
+    user.ollamaKeys,
+    store.getCommunityKeyStrings(),
+  );
+
+  cacheBehavior(userId, behavior);
+  console.log(`[Behavior] User ${userId}: ${behavior.availability}/${behavior.responseMode}, delay=${behavior.delayMinutes}min, mult=${behavior.delayMultiplier}, quote=${behavior.shouldQuote}, vibe="${behavior.vibeContext.slice(0, 60)}"`);
+  return behavior;
 }
 
 // ── MESSAGE SPLITTING ───────────────────────────────────────────────
@@ -477,7 +552,8 @@ function scheduleDelayedReply(
   ctx: Context & { message: { text: string } },
   userId: number,
   delayMs: number,
-  reason: DelayReason = "busy"
+  reason: DelayReason = "busy",
+  vibeHint?: string,
 ) {
   // Cancel any existing delayed reply
   const existing = delayedReplies.get(userId);
@@ -494,8 +570,10 @@ function scheduleDelayedReply(
       const history = store.getRecentHistory(userId);
       const mood = store.getMood(userId);
 
-      // Add context so the AI knows WHY she's replying late
-      const lateContext = getDelayContext(reason);
+      // Use AI-provided vibe context if available, otherwise fall back to hardcoded delay reasons
+      const lateContext = vibeHint
+        ? `(You're replying late because: ${vibeHint}. Be natural about it — mention what you were doing briefly if it fits, or just reply.)`
+        : getDelayContext(reason);
 
       const messages = buildOllamaMessages(
         lateContext + "\n\nTheir message: " + userText,
@@ -3231,9 +3309,6 @@ async function handleTextMessage(
   // ── Feature 13: notice profile photo changes (async, non-blocking)
   maybeNoticeProfileChange(ctx, userId).catch(() => {});
 
-  // ── Conversation pace detection
-  const paceMult = paceMultiplier(userId);
-
   // ── Reply context: what message is the user replying to?
   let replyContext = getReplyContext(ctx, userId);
 
@@ -3248,109 +3323,87 @@ async function handleTextMessage(
 
   // ── Status-aware: detect gap since last interaction
   const gapMs = Date.now() - prevLastInteraction;
-  const gapContext = buildGapAwareContext(gapMs, tier);
 
-  // ── Offline schedule — she might be "sleeping"
-  const offlineDelay = offlineScheduleDelay();
-  if (offlineDelay > 0) {
+  // ── AI-driven behavior decision (replaces all hardcoded offline/delay/voice/quote logic)
+  const behavior = await getMeeraBehavior(userId, text, tier, mood, gapMs);
+  const gapContext = behavior.gapContext
+    ? `(${behavior.gapContext})`
+    : buildGapAwareContext(gapMs, tier);
+  const vibeContext = behavior.vibeContext
+    ? `(Current vibe: ${behavior.vibeContext})`
+    : "";
+
+  // ── Handle delay/sleeping/leave-on-read from AI behavior
+  if (behavior.responseMode === "delay" && behavior.delayMinutes > 0) {
     if (isBatched) {
       for (const t of batchedTexts!) store.addMessage(userId, "user", t);
     } else {
       store.addMessage(userId, "user", text);
     }
-    console.log(`[Offline] User ${userId} messaged while Meera is "sleeping", reply in ${Math.round(offlineDelay / 60000)}min`);
-    scheduleDelayedReply(ctx, userId, offlineDelay, "sleeping");
+    const delayMs = behavior.delayMinutes * 60 * 1000;
+    const reason = behavior.delayReason || "busy";
+    const reasonLower = reason.toLowerCase();
+    const delayReason: DelayReason =
+      reasonLower.includes("sleep") || reasonLower.includes("doz") || reasonLower.includes("nap") || behavior.availability === "sleeping" ? "sleeping" :
+      reasonLower.includes("night") || reasonLower.includes("late") ? "late_night" :
+      reasonLower.includes("wait") || reasonLower.includes("making") || reasonLower.includes("seen") ? "read_receipt" :
+      "busy";
+    console.log(`[Behavior] Delay ${behavior.delayMinutes}min (${reason}): user ${userId}`);
+    scheduleDelayedReply(ctx, userId, delayMs, delayReason, behavior.vibeContext || behavior.delayReason);
     return;
   }
 
-  // ── Leave on read? (comfortable+ only, low-effort messages) — only for single messages
-  // ── Read receipt gaming, late night, random delay, emoji-only, sticker-only
-  // ALL replaced by AI behavior decision below ──
-
-  // Ask the AI how to respond (only for comfortable+ to save API calls)
-  if (!isBatched && (tier === "comfortable" || tier === "close")) {
-    const hour = getISTHour();
-    const timeLabel =
-      hour >= 0 && hour < 6 ? `${hour} AM (late night/early morning)` :
-      hour < 12 ? `${hour} AM` :
-      hour === 12 ? `12 PM (noon)` :
-      hour < 17 ? `${hour - 12} PM (afternoon)` :
-      hour < 21 ? `${hour - 12} PM (evening)` :
-      `${hour - 12} PM (night)`;
-
-    const history = store.getRecentHistory(userId);
-    const user = store.getUser(userId);
-    const behavior = await decideResponseBehavior(ollamaConfig, text, history, {
-      tier,
-      mood,
-      timeOfDay: timeLabel,
-      personaHint: user.customPersona?.slice(0, 500),
-    });
-
-    if (behavior.action === "leave_on_read") {
-      store.addMessage(userId, "user", text);
-      console.log(`[AI-Behavior] Left on read: user ${userId} ("${text.slice(0, 30)}")`);
-      return;
-    }
-
-    if (behavior.action === "delay_reply") {
-      store.addMessage(userId, "user", text);
-      const delayMs = behavior.delayMinutes * 60 * 1000;
-      // Map the AI's reason to a DelayReason category
-      const reasonLower = behavior.reason.toLowerCase();
-      const delayReason: DelayReason =
-        reasonLower.includes("sleep") || reasonLower.includes("doz") || reasonLower.includes("nap") ? "sleeping" :
-        reasonLower.includes("night") || reasonLower.includes("late") ? "late_night" :
-        reasonLower.includes("wait") || reasonLower.includes("making") || reasonLower.includes("seen") ? "read_receipt" :
-        "busy";
-      console.log(`[AI-Behavior] Delay ${behavior.delayMinutes}min (${behavior.reason}): user ${userId}`);
-      scheduleDelayedReply(ctx, userId, delayMs, delayReason);
-      return;
-    }
-
-    if (behavior.action === "emoji_only") {
-      store.addMessage(userId, "user", text);
-      store.addMessage(userId, "assistant", behavior.emoji);
-      const readTime = readDelay(text) * paceMult;
-      await new Promise((r) => setTimeout(r, readTime));
-      await ctx.reply(behavior.emoji);
-      console.log(`[AI-Behavior] Emoji-only (${behavior.emoji}): user ${userId}`);
-      return;
-    }
-
-    if (behavior.action === "sticker_only") {
-      if (await maybeStickerOnlyReply(ctx, userId, text)) {
-        console.log(`[AI-Behavior] Sticker-only: user ${userId}`);
-        return;
-      }
-      // Fall through to normal reply if no sticker pack matched
-    }
+  if (behavior.responseMode === "leave_on_read") {
+    store.addMessage(userId, "user", text);
+    console.log(`[Behavior] Left on read: user ${userId} ("${text.slice(0, 30)}")`);
+    return;
   }
 
-  // React to message (async, don't await)
-  maybeReact(ctx, userId, text).catch(() => {});
+  if (behavior.responseMode === "emoji_only" && behavior.reactEmoji) {
+    store.addMessage(userId, "user", text);
+    store.addMessage(userId, "assistant", behavior.reactEmoji);
+    const readTime = readDelay(text) * behavior.delayMultiplier;
+    await new Promise((r) => setTimeout(r, readTime));
+    await ctx.reply(behavior.reactEmoji);
+    console.log(`[Behavior] Emoji-only (${behavior.reactEmoji}): user ${userId}`);
+    return;
+  }
 
-  // Time-of-day multiplier for delays
-  const todMultiplier = timeOfDayMultiplier();
+  if (behavior.responseMode === "sticker_only") {
+    if (await maybeStickerOnlyReply(ctx, userId, text)) {
+      console.log(`[Behavior] Sticker-only: user ${userId}`);
+      return;
+    }
+    // Fall through to normal reply if no sticker pack matched
+  }
+
+  // React to message (use AI's emoji suggestion if provided)
+  if (behavior.reactEmoji) {
+    try { await ctx.reply(behavior.reactEmoji); } catch {}
+  } else {
+    maybeReact(ctx, userId, text).catch(() => {});
+  }
+
+  // Use AI-decided delay multiplier
+  const todMultiplier = behavior.delayMultiplier;
 
   // ── Typing fake-out? (start typing, stop, resume) — skip in rapid-fire
-  if (paceMult >= 0.7) {
+  if (todMultiplier >= 0.7) {
     await maybeTypingFakeout(ctx, tier);
   }
 
   // ── Voice note tease? (show record_voice then switch to text) — skip in rapid-fire
   let didVoiceTease = false;
-  if (paceMult >= 0.7) {
+  if (todMultiplier >= 0.7) {
     didVoiceTease = await maybeVoiceNoteTease(ctx, tier);
   }
 
-  // ── Voice timing awareness: factor time of day into voice probability
-  const voiceTimeMod = voiceTimeModifier();
-  const useVoice = !didVoiceTease && !isBatched && shouldSendVoice(tier, text, voiceTimeMod);
+  // ── Voice decision — AI-driven via behavior
+  const useVoice = !didVoiceTease && !isBatched && behavior.responseMode === "voice";
 
-  // ── Should Meera quote-reply this message?
+  // ── Should Meera quote-reply this message? (AI-driven)
   const quoteReplyId = batchQuoteId
-    ?? (shouldQuoteReply(tier, text) ? (ctx.message as any).message_id : undefined);
+    ?? (behavior.shouldQuote ? (ctx.message as any).message_id : undefined);
 
   // ── Build enriched context for LLM prompts
   const history = store.getRecentHistory(userId);
@@ -3465,7 +3518,7 @@ async function handleTextMessage(
     // Voice reply via Gemini Live
     let stopTyping = () => {};
     try {
-      const readTime = readDelay(text) * todMultiplier * paceMult;
+      const readTime = readDelay(text) * todMultiplier;
       await new Promise((r) => setTimeout(r, readTime));
 
       // If user is asking for content and we're actually sending it, hint Gemini
@@ -3490,7 +3543,7 @@ async function handleTextMessage(
       sessions.resetSession(userId);
       const session = await sessions.getSession(userId);
       const response = await session.send([{
-        text: replyContext + (gapContext ? gapContext + "\n\n" : "") + batchHint + lengthHint + contentHint + selfieHint + text
+        text: replyContext + (vibeContext ? vibeContext + "\n\n" : "") + (gapContext ? gapContext + "\n\n" : "") + batchHint + lengthHint + contentHint + selfieHint + text
       }]);
 
       stopTyping();
@@ -3502,6 +3555,7 @@ async function handleTextMessage(
         stopTyping = typingIndicator(ctx, "typing");
         const user = store.getUser(userId);
         const userMsg = replyContext
+          + (vibeContext ? vibeContext + "\n\n" : "")
           + (gapContext ? gapContext + "\n\n" : "")
           + batchHint + lengthHint + styleHints + emojiHint
           + "\n\n" + text;
@@ -3516,7 +3570,7 @@ async function handleTextMessage(
         }
         store.addMessage(userId, "assistant", reply);
 
-        const delay = typingDelay(reply) * timeOfDayMultiplier();
+        const delay = typingDelay(reply) * todMultiplier;
         await new Promise((r) => setTimeout(r, Math.min(delay, 6000)));
         stopTyping();
         await sendAsBubbles(ctx, reply, quoteReplyId);
@@ -3555,7 +3609,7 @@ async function handleTextMessage(
     // Text reply via Ollama
     let stopTyping = () => {};
     try {
-      const readTime = readDelay(text) * todMultiplier * paceMult;
+      const readTime = readDelay(text) * todMultiplier;
       await new Promise((r) => setTimeout(r, readTime));
 
       stopTyping = typingIndicator(ctx, "typing");
@@ -3582,6 +3636,7 @@ async function handleTextMessage(
 
       // Build message with all context hints
       const userMsg = replyContext
+        + (vibeContext ? vibeContext + "\n\n" : "")
         + (gapContext ? gapContext + "\n\n" : "")
         + batchHint
         + lengthHint
@@ -3614,8 +3669,8 @@ async function handleTextMessage(
       }
       store.addMessage(userId, "assistant", cleanReply);
 
-      // Simulate typing delay (scaled by time of day and conversation pace)
-      const delay = typingDelay(reply) * todMultiplier * paceMult;
+      // Simulate typing delay (scaled by AI-decided multiplier)
+      const delay = typingDelay(reply) * todMultiplier;
       await new Promise((r) => setTimeout(r, Math.min(delay, 8000)));
 
       stopTyping();
@@ -3623,7 +3678,7 @@ async function handleTextMessage(
       // Send reply as bubbles (may split into multiple messages)
       // Features 6, 10, 16: silent mode, message effects, quote
       const sendExtras: SendExtras = {};
-      if (shouldSendSilently()) sendExtras.disableNotification = true;
+      if (behavior.sendSilently) sendExtras.disableNotification = true;
       const msgEffect = pickMessageEffect(reply, mood);
       if (msgEffect) sendExtras.messageEffectId = msgEffect;
       const quoteStr = getQuoteText(text, tier);
@@ -3676,6 +3731,7 @@ async function handleTextMessage(
         try {
           const retryMessages = buildOllamaMessages(
             replyContext
+              + (vibeContext ? vibeContext + "\n\n" : "")
               + (gapContext ? gapContext + "\n\n" : "")
               + batchHint + lengthHint + styleHints + emojiHint
               + "\n\n" + text,
@@ -3790,6 +3846,7 @@ async function handleMediaMessage(
   parts: Array<Record<string, unknown>>
 ) {
   const userId = ctx.from!.id;
+  const prevLastInteraction = store.getUser(userId).lastInteraction;
   store.updateUser(userId, {
     lastInteraction: Date.now(),
     chatId: ctx.chat!.id,
@@ -3800,7 +3857,11 @@ async function handleMediaMessage(
 
   const tier = store.getComfortTier(userId);
   const mood = store.getMood(userId);
-  const useAudio = shouldSendVoiceForMedia(tier);
+
+  // ── AI-driven behavior for media messages
+  const gapMs = Date.now() - prevLastInteraction;
+  const mediaBehavior = await getMeeraBehavior(userId, "[sent media]", tier, mood, gapMs, true);
+  const useAudio = mediaBehavior.responseMode === "voice";
 
   // ── Photo reaction differentiation: classify what type of media this is
   const mediaType = classifyMedia(ctx);
@@ -3824,38 +3885,51 @@ async function handleMediaMessage(
     parts.unshift({ text: mediaHint });
   }
 
-  // ── Offline schedule — she might be "sleeping"
-  const offlineDelay = offlineScheduleDelay();
-  if (offlineDelay > 0) {
+  // ── AI-driven sleep/busy handling for media
+  if (mediaBehavior.responseMode === "delay" && mediaBehavior.delayMinutes > 0) {
     store.addMessage(userId, "user", "[sent media]");
-    console.log(`[Offline] User ${userId} sent media while Meera is "sleeping"`);
-    // Can't schedule delayed media processing easily, so just delay a text acknowledgment
+    const delayMs = mediaBehavior.delayMinutes * 60 * 1000;
+    const reason = mediaBehavior.delayReason || "busy";
+    console.log(`[Behavior] User ${userId} sent media while Meera is ${mediaBehavior.availability} — delay ${mediaBehavior.delayMinutes}min (${reason})`);
     setTimeout(async () => {
       try {
         const user = store.getUser(userId);
         const history = store.getRecentHistory(userId);
+        const vibeHint = mediaBehavior.vibeContext ? `(${mediaBehavior.vibeContext}) ` : "";
         const messages = buildOllamaMessages(
-          "(You just woke up and saw they sent you a photo/video/audio while you were sleeping. React naturally — maybe 'omg what did i miss' or 'wait let me see what you sent' or just address it casually.)",
+          `${vibeHint}(You were ${mediaBehavior.availability} and just saw they sent you a photo/video/audio. React naturally — mention what you were doing briefly and address their media.)`,
           history, tier, user, mood
         );
         const reply = await ollamaChat(messages, user.ollamaKeys);
         store.addMessage(userId, "assistant", reply);
         await bot.telegram.sendMessage(ctx.chat!.id, reply);
       } catch (err) {
-        console.error(`[Offline] Delayed media reply failed for ${userId}:`, err);
+        console.error(`[Behavior] Delayed media reply failed for ${userId}:`, err);
       }
-    }, offlineDelay);
+    }, delayMs);
     return;
   }
 
-  // React to media message (async, don't block)
-  maybeReact(ctx, userId, "[sent media]").catch(() => {});
+  if (mediaBehavior.responseMode === "leave_on_read") {
+    store.addMessage(userId, "user", "[sent media]");
+    console.log(`[Behavior] Left media on read: user ${userId}`);
+    return;
+  }
+
+  // React to media message
+  if (mediaBehavior.reactEmoji) {
+    try { await ctx.reply(mediaBehavior.reactEmoji); } catch {}
+  } else {
+    maybeReact(ctx, userId, "[sent media]").catch(() => {});
+  }
 
   // Typing fake-out before processing
-  await maybeTypingFakeout(ctx, tier);
+  if (mediaBehavior.delayMultiplier >= 0.7) {
+    await maybeTypingFakeout(ctx, tier);
+  }
 
-  // ── Should Meera quote-reply this media message?
-  const quoteReplyId = shouldQuoteReply(tier, "[sent media]") ? (ctx.message as any).message_id : undefined;
+  // ── Quote-reply from AI behavior
+  const quoteReplyId = mediaBehavior.shouldQuote ? (ctx.message as any).message_id : undefined;
 
   const stopTyping = typingIndicator(ctx, useAudio ? "record_voice" : "typing");
   try {
@@ -3898,7 +3972,9 @@ async function handleMediaMessage(
       // Build Ollama messages with Gemini's observation as context
       const emojiHint = getEmojiEvolutionHint(tier);
       const styleHints = getStyleHints("[sent media]", history);
+      const vibeHint = mediaBehavior.vibeContext ? `(Current vibe: ${mediaBehavior.vibeContext})\n\n` : "";
       const rephrasePrompt =
+        vibeHint +
         `The user sent you a photo/video/audio. Here's what you observed about it: "${geminiRaw}"\n\n` +
         (mediaHint ? mediaHint + "\n\n" : "") +
         `Now respond to the user naturally as yourself about what they sent. ` +
@@ -3918,7 +3994,7 @@ async function handleMediaMessage(
       store.addMessage(userId, "user", userSaid ? `[voice message] ${userSaid}` : "[sent voice message]", incomingMsgId);
       store.addMessage(userId, "assistant", reply);
 
-      const delay = typingDelay(reply) * timeOfDayMultiplier();
+      const delay = typingDelay(reply) * mediaBehavior.delayMultiplier;
       await new Promise((r) => setTimeout(r, Math.min(delay, 6000)));
       await sendAsBubbles(ctx, reply, quoteReplyId);
 

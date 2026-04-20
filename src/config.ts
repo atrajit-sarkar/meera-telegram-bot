@@ -82,6 +82,16 @@ You know the weather naturally like any real person — bring it up when it make
 // Kick off the first fetch immediately on startup
 refreshWeatherCache();
 
+/** Get compact weather summary for behavior decisions. */
+export function getWeatherSummary(): string {
+  if (Date.now() - weatherCache.lastFetch > WEATHER_CACHE_TTL) {
+    refreshWeatherCache();
+  }
+  const w = weatherCache.data;
+  if (!w) return "";
+  return `${w.weather}, ${w.tempC}°C (feels ${w.feelsLikeC}°C), humidity ${w.humidity}%`;
+}
+
 // ── MOOD MODIFIERS ──────────────────────────────────────────────────
 
 export const MOOD_MODIFIERS: Record<string, string> = {
