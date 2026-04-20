@@ -26,6 +26,20 @@ export interface UserData {
   imageSeed?: number;         // Per-user fixed seed for consistent face generation
   selfiesSent?: number;       // Track how many selfies sent (for rate limiting)
   lastSelfieSent?: number;    // Timestamp of last selfie sent
+
+  // ── Per-user relationship dynamics ──
+  /** What behavior she showed this user last (text/voice/delay/sleeping etc.) — for consistency */
+  lastBehaviorMode?: string;
+  /** Her vibe context from last behavior decision — e.g. "was napping", "chilling in bed" */
+  lastBehaviorVibe?: string;
+  /** When the last behavior decision was made — used for consistency window */
+  lastBehaviorAt?: number;
+  /** When the current active conversation started (reset after 30min gap) — for momentum */
+  activeConvoSince?: number;
+  /** 0-100 engagement warmth — how invested she is in this user right now */
+  engagementScore?: number;
+  /** Last time engagement was recalculated */
+  lastEngagementUpdate?: number;
 }
 
 export const MOODS = ["happy", "bored", "clingy", "sassy", "tired", "excited", "chill", "annoyed"] as const;
@@ -232,6 +246,112 @@ export class UserStore {
       this.saveQueue.add(userId);
     }
     return user.mood;
+  }
+
+  // ── Per-user engagement & relationship dynamics ──
+
+  /**
+   * Compute and return the per-user engagement score (0-100).
+   * Engagement rises with recent interactions and decays over time.
+   * Call this before behavior decisions to get fresh engagement.
+   */
+  getEngagement(userId: number): number {
+    const user = this.getUser(userId);
+    const now = Date.now();
+    const lastInteraction = user.lastInteraction || 0;
+    const gapMs = now - lastInteraction;
+    const gapHours = gapMs / (3600 * 1000);
+
+    // Start from stored score (or 50 baseline)
+    let score = user.engagementScore ?? 50;
+
+    // Decay based on time since last interaction
+    const lastUpdate = user.lastEngagementUpdate || lastInteraction;
+    const decayHours = (now - lastUpdate) / (3600 * 1000);
+    if (decayHours > 0.1) {
+      // Lose ~5 points per hour of silence, faster decay after 6h
+      const decayRate = gapHours > 6 ? 8 : 5;
+      score -= decayRate * decayHours;
+    }
+
+    // Clamp
+    score = Math.max(0, Math.min(100, score));
+    user.engagementScore = score;
+    user.lastEngagementUpdate = now;
+    return score;
+  }
+
+  /**
+   * Boost engagement after an interaction (message received or sent).
+   * Amount depends on conversation momentum.
+   */
+  boostEngagement(userId: number, amount: number = 10): void {
+    const user = this.getUser(userId);
+    const current = user.engagementScore ?? 50;
+    user.engagementScore = Math.min(100, current + amount);
+    user.lastEngagementUpdate = Date.now();
+    this.saveQueue.add(userId);
+  }
+
+  /**
+   * Get how long the current active conversation has been going (in minutes).
+   * A conversation is "active" if gaps between messages stay < 30 minutes.
+   * Returns 0 if no active conversation.
+   */
+  getActiveConvoMinutes(userId: number): number {
+    const user = this.getUser(userId);
+    const now = Date.now();
+    const gapMs = now - (user.lastInteraction || 0);
+
+    // If last interaction was > 30 min ago, no active convo
+    if (gapMs > 30 * 60 * 1000) {
+      user.activeConvoSince = undefined;
+      return 0;
+    }
+
+    // If no convo start tracked, start it now
+    if (!user.activeConvoSince) {
+      user.activeConvoSince = user.lastInteraction || now;
+      this.saveQueue.add(userId);
+    }
+
+    return (now - user.activeConvoSince) / (60 * 1000);
+  }
+
+  /**
+   * Store the behavior decision for consistency.
+   * If she told User A she's sleeping 5 min ago, she shouldn't be "free" for User B.
+   */
+  setLastBehavior(userId: number, mode: string, vibe: string): void {
+    const user = this.getUser(userId);
+    user.lastBehaviorMode = mode;
+    user.lastBehaviorVibe = vibe;
+    user.lastBehaviorAt = Date.now();
+    this.saveQueue.add(userId);
+  }
+
+  /**
+   * Get the last behavior that was decided for ANY user within the consistency window.
+   * This ensures global consistency — if she's sleeping for one user, she's sleeping for all.
+   * Returns null if no recent behavior or outside window.
+   */
+  getGlobalBehaviorAnchor(excludeUserId?: number): { mode: string; vibe: string; minutesAgo: number } | null {
+    const now = Date.now();
+    const CONSISTENCY_WINDOW = 20 * 60 * 1000; // 20 minutes — if she said sleeping 20min ago, still sleeping
+
+    let latest: { mode: string; vibe: string; at: number; userId: number } | null = null;
+
+    for (const [uid, user] of this.users) {
+      if (uid === excludeUserId) continue;
+      if (user.lastBehaviorAt && now - user.lastBehaviorAt < CONSISTENCY_WINDOW) {
+        if (!latest || user.lastBehaviorAt > latest.at) {
+          latest = { mode: user.lastBehaviorMode || "text", vibe: user.lastBehaviorVibe || "", at: user.lastBehaviorAt, userId: uid };
+        }
+      }
+    }
+
+    if (!latest) return null;
+    return { mode: latest.mode, vibe: latest.vibe, minutesAgo: (now - latest.at) / 60000 };
   }
 
   /** All user IDs that are loaded in memory */

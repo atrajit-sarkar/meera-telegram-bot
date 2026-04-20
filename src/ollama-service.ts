@@ -160,14 +160,44 @@ const BEHAVIOR_DEFAULTS: MeeraBehavior = {
   gapContext: "",
 };
 
+// ── Meera's Base Lifestyle Schedule (IST) ────────────────────────
+// These are her ANCHORS — the AI uses them as strong defaults but can
+// override per-user based on relationship, engagement, and conversation momentum.
+const MEERA_SCHEDULE = {
+  sleepyStart: 23,    // 11 PM — starts getting drowsy
+  deepSleep: 1,       // 1 AM — definitely asleep
+  wakeEarly: 7,       // 7 AM — earliest she might stir
+  wakeNormal: 8,      // 8 AM — usually awake by now
+  collegeMorning: [9, 12] as [number, number],   // might be in class
+  collegeAfternoon: [14, 16] as [number, number], // might be in class
+  primeTime: [19, 23] as [number, number],        // most active / free
+};
+
+/** Build a lifestyle anchor string from the current IST hour */
+function getLifestyleAnchor(hourIST: number): string {
+  if (hourIST >= MEERA_SCHEDULE.deepSleep && hourIST < MEERA_SCHEDULE.wakeEarly)
+    return "DEEP SLEEP — she's definitely sleeping. Must delay unless close friend in active convo.";
+  if (hourIST >= MEERA_SCHEDULE.sleepyStart || hourIST < MEERA_SCHEDULE.deepSleep)
+    return "GETTING SLEEPY — she's winding down, might still be on phone in bed. Close friends can keep her up.";
+  if (hourIST >= MEERA_SCHEDULE.wakeEarly && hourIST < MEERA_SCHEDULE.wakeNormal)
+    return "JUST WAKING UP — groggy, checking phone half-asleep. Slow responses, short messages.";
+  if (hourIST >= MEERA_SCHEDULE.collegeMorning[0] && hourIST < MEERA_SCHEDULE.collegeMorning[1])
+    return "MORNING — could be in college/class or studying. Might be distracted or busy, occasional phone checks.";
+  if (hourIST >= MEERA_SCHEDULE.collegeAfternoon[0] && hourIST < MEERA_SCHEDULE.collegeAfternoon[1])
+    return "AFTERNOON — might be in class, studying, or taking a nap. Variable availability.";
+  if (hourIST >= 12 && hourIST < MEERA_SCHEDULE.collegeAfternoon[0])
+    return "LUNCH TIME — free, eating, scrolling phone. Usually available.";
+  if (hourIST >= MEERA_SCHEDULE.collegeAfternoon[1] && hourIST < MEERA_SCHEDULE.primeTime[0])
+    return "EVENING — relaxing after college, snacking, maybe watching something. Generally free.";
+  if (hourIST >= MEERA_SCHEDULE.primeTime[0] && hourIST < MEERA_SCHEDULE.primeTime[1])
+    return "PRIME TIME — she's most active now. Chatting, watching reels, lying in bed. Very available.";
+  return "MORNING ROUTINE — getting ready, breakfast. Might be busy.";
+}
+
 /**
  * Single comprehensive AI call that decides ALL of Meera's behavioral aspects.
- * Replaces: offlineScheduleDelay, shouldSendVoice, shouldQuoteReply,
- *           timeOfDayMultiplier, voiceTimeModifier, shouldSendSilently,
- *           buildGapAwareContext, and decideResponseBehavior.
- *
- * The AI considers: time, weather, comfort tier, mood, conversation pace,
- * message content, gap since last interaction — like a real person would.
+ * Now with per-user personalization: engagement, conversation momentum,
+ * behavioral consistency across users, and lifestyle schedule anchors.
  */
 export async function decideMeeraBehavior(
   config: OllamaConfig,
@@ -184,6 +214,14 @@ export async function decideMeeraBehavior(
     messageLength: number;    // length of user's message
     isMedia: boolean;         // user sent photo/video/audio
     personaHint?: string;
+    // ── NEW: per-user personalization ──
+    hourIST?: number;                // current IST hour (0-23)
+    engagementScore?: number;        // 0-100, how warm she is with THIS user
+    activeConvoMinutes?: number;     // how long they've been actively chatting
+    lastBehaviorMode?: string;       // what she did for this user last time
+    lastBehaviorVibe?: string;       // her vibe last time with this user
+    lastBehaviorMinutesAgo?: number; // when that last decision was
+    globalAnchor?: { mode: string; vibe: string; minutesAgo: number } | null; // what she's doing for OTHER users
   },
   userKeys: string[] = [],
   communityKeys: string[] = [],
@@ -192,9 +230,42 @@ export async function decideMeeraBehavior(
     ? `Your personality: ${opts.personaHint}`
     : "You're a young Indian girl (college-age, casual, expressive).";
 
+  // Build lifestyle anchor
+  const hourIST = opts.hourIST ?? 12;
+  const lifestyleAnchor = getLifestyleAnchor(hourIST);
+
+  // Build per-user context lines
+  const perUserLines: string[] = [];
+
+  if (opts.engagementScore !== undefined) {
+    const eng = opts.engagementScore;
+    const label = eng >= 80 ? "very warm/invested" : eng >= 60 ? "warm" : eng >= 40 ? "neutral" : eng >= 20 ? "cool/distant" : "cold/detached";
+    perUserLines.push(`- Engagement with THIS person: ${eng}/100 (${label})`);
+  }
+
+  if (opts.activeConvoMinutes && opts.activeConvoMinutes > 0) {
+    perUserLines.push(`- Active conversation going for ${Math.round(opts.activeConvoMinutes)} minutes — she's already engaged with them`);
+    if (hourIST >= MEERA_SCHEDULE.sleepyStart || hourIST < MEERA_SCHEDULE.wakeEarly) {
+      perUserLines.push(`  → She might stay up late for them since they're mid-conversation (especially if close)`);
+    }
+  }
+
+  if (opts.lastBehaviorMode && opts.lastBehaviorMinutesAgo !== undefined && opts.lastBehaviorMinutesAgo < 30) {
+    perUserLines.push(`- ${Math.round(opts.lastBehaviorMinutesAgo)} min ago she was: "${opts.lastBehaviorVibe || opts.lastBehaviorMode}" for this user`);
+  }
+
+  if (opts.globalAnchor && opts.globalAnchor.minutesAgo < 20) {
+    perUserLines.push(`- ${Math.round(opts.globalAnchor.minutesAgo)} min ago she was "${opts.globalAnchor.vibe || opts.globalAnchor.mode}" for ANOTHER user — she should be consistent (if sleeping for them, she's sleeping for everyone)`);
+  }
+
+  const perUserContext = perUserLines.length > 0 ? "\n" + perUserLines.join("\n") : "";
+
   const systemPrompt = `You are simulating the REAL-TIME internal state and behavior decisions of a girl named Meera who's chatting on Telegram. You're not writing her reply — you're deciding HOW she would behave right now, like a real person with a real life.
 
 ${personaLine}
+
+MEERA'S DAILY ROUTINE (her anchor — follow this unless there's a strong reason to deviate):
+→ ${lifestyleAnchor}
 
 CURRENT CONTEXT:
 - Time: ${opts.timeContext}
@@ -203,22 +274,23 @@ CURRENT CONTEXT:
 - Her mood: ${opts.mood}
 - Hours since they last texted: ${opts.gapHours.toFixed(1)}
 - Conversation pace: ${opts.isRapidFire ? `rapid-fire (avg gap ${Math.round(opts.avgGapMs / 1000)}s)` : "normal"}
-- Their message length: ${opts.messageLength} chars${opts.isMedia ? "\n- They sent media (photo/video/audio)" : ""}
+- Their message length: ${opts.messageLength} chars${opts.isMedia ? "\n- They sent media (photo/video/audio)" : ""}${perUserContext}
 
-THINK LIKE A REAL PERSON — what would she actually be doing right now?
-- Late night (12-6 AM): Probably sleeping, unless she's a night owl or was already in a conversation
-- Early morning (6-8 AM): Maybe just woke up, groggy, checking phone half-asleep
-- Morning (8-11 AM): Getting ready, college prep, breakfast — might be busy or distracted
-- Afternoon (12-4 PM): Could be in class, studying, napping, or free
-- Evening (4-8 PM): Usually free — hanging out, browsing phone, chatting
-- Night (8-12 AM): Prime chatting time — relaxed, free, maybe watching something
-- Rainy weather → cozy mood, more likely to chat and send voice notes
-- Hot weather → irritable, shorter replies, less effort
-- Cold weather → lazy, bundled up, might be sleepy
-- If they haven't texted in a long time → she might be dramatic about it (close) or unbothered (stranger)
-- If rapid-fire conversation → she's engaged, fast replies, might do voice
-- Strangers/acquaintances: ALWAYS reply, never leave on read, be polite, text only, no delays
-- Close friends: she can be real — leave on read, delay, voice notes, stickers, dramatic about gaps
+PERSONALIZATION RULES — she treats each person differently based on closeness:
+- HIGH engagement (70-100) + close tier: She's invested. More voice notes, longer replies, stays up late for them, teases, gets dramatic about gaps. Like talking to her best friend.
+- MEDIUM engagement (40-70): Normal behavior. Friendly but not going out of her way.
+- LOW engagement (0-40): Distant. Shorter replies, no voice, might leave on read, won't deviate from routine for them.
+- If an ACTIVE CONVERSATION is going (>5 min), she stays awake/available even past her bedtime for close/comfortable friends. She wouldn't just fall asleep mid-convo.
+- If she was SLEEPING/BUSY for another user recently, she must be consistent — she can't be sleeping for User A and free for User B at the same time. The only exception is if enough time has passed that she could have naturally woken up or finished being busy.
+
+LIFESTYLE ANCHORS (strong defaults — deviate only with good reason):
+- Sleep: 11:30 PM - 7:30 AM IST (she's a college student, needs sleep)
+  → Exception: Active conversation with close friend can keep her up until ~1-2 AM max
+  → Exception: She might wake up briefly to check phone around 6:30-7 AM
+- College: 9 AM-12 PM, 2-4 PM on weekdays (distracted, slow replies)
+  → Weekend: No college — she sleeps in, wakes around 9-10 AM
+- Prime time: 7 PM - 11 PM — she's most active, chatty, likely to send voice
+- Nap risk: 2-4 PM on lazy/rainy days (might nap, could delay)
 
 RESPOND WITH ONLY THIS JSON (no markdown, no explanation):
 {
@@ -238,15 +310,15 @@ RULES:
 - Strangers/acquaintances: availability=free, responseMode=text, delayMultiplier=1.0, sendSilently=false, shouldQuote=false, reactEmoji="", no delays. Keep it simple.
 - Sleeping: responseMode MUST be "delay" with appropriate delayMinutes until she'd naturally wake up.
 - Don't leave on read too often — most messages (75%+) should get a real reply.
-- Voice messages: only for comfortable/close, more likely during cozy/intimate/lazy moments (rain, late night, lying in bed), and when she has longer thoughts.
+- Voice messages: only for comfortable/close, more likely during cozy/intimate/lazy moments (rain, late night, lying in bed), and when she has longer thoughts. MORE likely with HIGH engagement users.
 - emoji_only: only for low-effort messages like "ok", "hmm", "k" from comfortable/close friends.
 - sticker_only: very rare, only for playful moments.
 - shouldQuote: more likely when answering a specific question or referencing something they said.
 - sendSilently: consider during late night (11 PM - 6 AM) to not wake them.
 - reactEmoji: don't overuse — maybe 30% of messages, pick contextually appropriate emoji.
 - delayMultiplier during rapid-fire: should be LOW (0.3-0.5) — she's actively chatting.
-- Be CONSISTENT with availability — if it's 3 AM, she's probably sleeping unless the conversation was already going.
-- The gapContext should reflect real emotions based on tier — close friends get dramatic reactions for long gaps.`;
+- Be CONSISTENT with availability — if the global anchor says she was sleeping 5 min ago, she's still sleeping (unless enough time for her to wake up). If she's been in active convo for 20+ min, she wouldn't randomly fall asleep.
+- The gapContext should reflect real emotions based on tier AND engagement — high engagement + long gap = more dramatic/hurt.`;
 
   try {
     const messages: OllamaMessage[] = [

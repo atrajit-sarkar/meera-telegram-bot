@@ -217,6 +217,16 @@ async function getMeeraBehavior(
   const user = store.getUser(userId);
   const history = store.getRecentHistory(userId);
 
+  // ── Per-user personalization context ──
+  const engagement = store.getEngagement(userId);
+  const activeConvoMinutes = store.getActiveConvoMinutes(userId);
+  const globalAnchor = store.getGlobalBehaviorAnchor(userId);
+
+  // Last behavior for THIS user (for consistency)
+  const lastBehaviorMinutesAgo = user.lastBehaviorAt
+    ? (Date.now() - user.lastBehaviorAt) / 60000
+    : undefined;
+
   const behavior = await decideMeeraBehavior(
     ollamaConfig,
     userMessage,
@@ -232,13 +242,30 @@ async function getMeeraBehavior(
       messageLength: userMessage.length,
       isMedia,
       personaHint: user.customPersona?.slice(0, 500),
+      // Per-user context
+      hourIST: getISTHour(),
+      engagementScore: engagement,
+      activeConvoMinutes,
+      lastBehaviorMode: user.lastBehaviorMode,
+      lastBehaviorVibe: user.lastBehaviorVibe,
+      lastBehaviorMinutesAgo,
+      globalAnchor,
     },
     user.ollamaKeys,
     store.getCommunityKeyStrings(),
   );
 
+  // Store behavior decision for this user (for consistency across calls)
+  store.setLastBehavior(userId, behavior.responseMode, behavior.vibeContext || behavior.availability);
+
+  // Boost engagement on interaction (more for active convos, less for delayed)
+  if (behavior.responseMode !== "delay" && behavior.responseMode !== "leave_on_read") {
+    const boost = isRapidFire ? 15 : 10;
+    store.boostEngagement(userId, boost);
+  }
+
   cacheBehavior(userId, behavior);
-  console.log(`[Behavior] User ${userId}: ${behavior.availability}/${behavior.responseMode}, delay=${behavior.delayMinutes}min, mult=${behavior.delayMultiplier}, quote=${behavior.shouldQuote}, vibe="${behavior.vibeContext.slice(0, 60)}"`);
+  console.log(`[Behavior] User ${userId}: ${behavior.availability}/${behavior.responseMode}, delay=${behavior.delayMinutes}min, mult=${behavior.delayMultiplier}, engage=${engagement}, activeConvo=${Math.round(activeConvoMinutes)}min, vibe="${behavior.vibeContext.slice(0, 60)}"`);
   return behavior;
 }
 
@@ -595,6 +622,9 @@ function scheduleDelayedReply(
       await new Promise((r) => setTimeout(r, delay));
 
       await bot.telegram.sendMessage(chatId, reply);
+      // She's now engaged — boost warmth and mark her as active
+      store.boostEngagement(userId, 10);
+      store.setLastBehavior(userId, "text", "just replied after being away");
       console.log(`[DelayedReply] Sent to user ${userId} after delay`);
     } catch (err) {
       console.error(`[DelayedReply] Failed for user ${userId}:`, err);
