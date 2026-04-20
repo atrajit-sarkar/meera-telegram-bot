@@ -4219,6 +4219,236 @@ bot.on("poll_answer", async (ctx) => {
   activePolls.delete(pollId);
 });
 
+// ── POLL MESSAGE HANDLER (user sends a poll to Meera) ────────────────
+
+bot.on(message("poll"), async (ctx) => {
+  const userId = ctx.from!.id;
+  const poll = ctx.message.poll;
+
+  store.updateUser(userId, {
+    lastInteraction: Date.now(),
+    chatId: ctx.chat!.id,
+    firstName: ctx.from!.first_name,
+    telegramUsername: (ctx.from as any).username,
+    proactiveSent: false,
+  });
+
+  const tier = store.getComfortTier(userId);
+  const mood = store.getMood(userId);
+  const user = store.getUser(userId);
+  const history = store.getRecentHistory(userId);
+
+  const question = poll.question;
+  const options = poll.options.map((o: any) => o.text);
+
+  // Log poll to history
+  store.addMessage(userId, "user", `[sent poll: "${question}" — options: ${options.join(", ")}]`);
+  console.log(`[Poll] User ${userId} sent poll: "${question}"`);
+
+  // React to the poll message (async)
+  maybeReact(ctx, userId, `[poll: ${question}]`).catch(() => {});
+
+  // Build the prompt for Meera to answer the poll
+  const pollAnswerPrompt = `The user just sent you a poll in the chat.\n\nQuestion: "${question}"\nOptions:\n${options.map((o: string, i: number) => `${i + 1}. ${o}`).join("\n")}\n\nAnswer this poll naturally like a real person would — pick an option and say why (or don't explain, just pick one casually). Be natural, like you're actually voting and telling them your choice. Keep it short (1-2 lines max). Match the chat language.`;
+
+  // Decide voice vs text based on comfort tier
+  const useVoice = shouldSendVoice(tier, question, voiceTimeModifier());
+
+  try {
+    if (useVoice) {
+      // Voice reply via Gemini
+      const readTime = readDelay(question);
+      await new Promise((r) => setTimeout(r, readTime));
+      const stopTyping = typingIndicator(ctx, "record_voice");
+      try {
+        sessions.resetSession(userId);
+        const session = await sessions.getSession(userId);
+        const response = await session.send([{ text: pollAnswerPrompt }]);
+        stopTyping();
+
+        if (await isGeminiBlocked(response, user.ollamaKeys)) {
+          // Fallback to text
+          const messages = buildOllamaMessages(pollAnswerPrompt, history, tier, user, mood);
+          let reply = await ollamaChat(messages, user.ollamaKeys);
+          reply = stripInternalArtifacts(reply);
+          reply = addDeliberateTypos(reply, mood);
+          store.addMessage(userId, "assistant", reply);
+          await sendAsBubbles(ctx, reply);
+        } else {
+          await sendGeminiResponse(ctx, response);
+          if (response.text.trim()) {
+            store.addMessage(userId, "assistant", `[voice reply] ${response.text}`);
+          }
+        }
+      } catch (err) {
+        console.error("[Bot] Poll voice error:", err);
+        stopTyping();
+        sessions.resetSession(userId);
+        // Fallback to text
+        const messages = buildOllamaMessages(pollAnswerPrompt, history, tier, user, mood);
+        let reply = await ollamaChat(messages, user.ollamaKeys);
+        reply = stripInternalArtifacts(reply);
+        reply = addDeliberateTypos(reply, mood);
+        store.addMessage(userId, "assistant", reply);
+        await sendAsBubbles(ctx, reply);
+      }
+    } else {
+      // Text reply
+      const readTime = readDelay(question);
+      await new Promise((r) => setTimeout(r, readTime));
+
+      const stopTyping = typingIndicator(ctx, "typing");
+      const messages = buildOllamaMessages(pollAnswerPrompt, history, tier, user, mood);
+      let reply = await ollamaChat(messages, user.ollamaKeys);
+      reply = stripInternalArtifacts(reply);
+      reply = addDeliberateTypos(reply, mood);
+      store.addMessage(userId, "assistant", reply);
+
+      const delay = typingDelay(reply) * timeOfDayMultiplier();
+      await new Promise((r) => setTimeout(r, Math.min(delay, 6000)));
+      stopTyping();
+
+      await sendAsBubbles(ctx, reply);
+      maybeSendSticker(ctx, userId, reply).catch(() => {});
+    }
+  } catch (err) {
+    console.error("[Bot] Poll answer error:", err);
+  }
+});
+
+// ── MESSAGE REACTION HANDLER (user reacts to Meera's message) ────────
+
+bot.on("message_reaction", async (ctx) => {
+  const update = (ctx as any).update?.message_reaction;
+  if (!update) return;
+
+  const userId = update.user?.id;
+  if (!userId) return;
+
+  // Ignore reactions from the bot itself
+  const botId = (ctx as any).botInfo?.id;
+  if (userId === botId) return;
+
+  const chatId = update.chat.id;
+
+  // Get new reactions (added) — ignore reaction removals
+  const newReactions = update.new_reaction || [];
+  const oldReactions = update.old_reaction || [];
+  if (newReactions.length === 0) return;
+  // If same or fewer reactions, it's a removal/change — still process new ones
+  if (newReactions.length <= oldReactions.length && oldReactions.length > 0) return;
+
+  const reactionEmoji = newReactions[0]?.emoji || "";
+  if (!reactionEmoji) return;
+
+  // Load user data
+  await store.ensureLoaded(userId);
+
+  const tier = store.getComfortTier(userId);
+  const mood = store.getMood(userId);
+  const user = store.getUser(userId);
+  const history = store.getRecentHistory(userId);
+
+  // Find the message that was reacted to from history
+  const reactedMsgId = update.message_id;
+  let reactedMsg = "";
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].msgId === reactedMsgId) {
+      reactedMsg = history[i].content;
+      break;
+    }
+  }
+
+  // Log reaction to history
+  const reactedPreview = reactedMsg ? reactedMsg.slice(0, 100) : "a message";
+  store.addMessage(userId, "user", `[reacted ${reactionEmoji} to: "${reactedPreview}"]`);
+  console.log(`[Reaction] User ${userId} reacted ${reactionEmoji} to msg ${reactedMsgId}`);
+
+  // Probability of responding to a reaction — scales with comfort tier
+  let respondProb: number;
+  switch (tier) {
+    case "stranger": respondProb = 0.05; break;
+    case "acquaintance": respondProb = 0.15; break;
+    case "comfortable": respondProb = 0.35; break;
+    case "close": respondProb = 0.50; break;
+    default: respondProb = 0.10;
+  }
+
+  if (Math.random() > respondProb) {
+    console.log(`[Reaction] Skipping response for user ${userId} (${tier}, prob=${respondProb})`);
+    return;
+  }
+
+  // Build context for Ollama
+  const reactionContext = reactedMsg
+    ? `The user just reacted to your message "${reactedMsg.slice(0, 200)}" with ${reactionEmoji}.`
+    : `The user just reacted to one of your messages with ${reactionEmoji}.`;
+
+  const reactionPrompt = `${reactionContext}\n\nRespond naturally to this reaction like a real person would. Keep it very short (1 line, max 15 words). Sometimes tease them about the reaction, acknowledge it, or just send an emoji back. Match the chat language. If the reaction seems negative (👎🙄😡), maybe act defensive or playful. If positive (❤😂🔥), be happy about it. Don't over-explain, just react naturally.`;
+
+  // Natural delay before responding
+  await new Promise((r) => setTimeout(r, 2000 + Math.random() * 5000));
+
+  // Decide voice vs text based on comfort tier
+  const useVoice = shouldSendVoice(tier, reactionEmoji, voiceTimeModifier());
+
+  try {
+    if (useVoice) {
+      // Voice reply via Gemini
+      try {
+        await bot.telegram.sendChatAction(chatId, "record_voice");
+        sessions.resetSession(userId);
+        const session = await sessions.getSession(userId);
+        const response = await session.send([{ text: reactionPrompt }]);
+
+        if (await isGeminiBlocked(response, user.ollamaKeys)) {
+          // Fallback to text
+          const messages = buildOllamaMessages(reactionPrompt, history, tier, user, mood);
+          let reply = await ollamaChat(messages, user.ollamaKeys);
+          reply = stripInternalArtifacts(reply);
+          reply = addDeliberateTypos(reply, mood);
+          store.addMessage(userId, "assistant", reply);
+          await bot.telegram.sendMessage(chatId, reply);
+        } else {
+          const { audioChunks } = response;
+          if (audioChunks.length > 0) {
+            const wav = pcmToWav(audioChunks);
+            await bot.telegram.sendVoice(chatId, { source: wav, filename: "reaction.wav" });
+          }
+          if (response.text.trim()) {
+            store.addMessage(userId, "assistant", `[voice reply] ${response.text}`);
+          }
+        }
+      } catch (err) {
+        console.error("[Reaction] Gemini voice failed, falling back to text:", err);
+        sessions.resetSession(userId);
+        const messages = buildOllamaMessages(reactionPrompt, history, tier, user, mood);
+        let reply = await ollamaChat(messages, user.ollamaKeys);
+        reply = stripInternalArtifacts(reply);
+        reply = addDeliberateTypos(reply, mood);
+        store.addMessage(userId, "assistant", reply);
+        await bot.telegram.sendMessage(chatId, reply);
+      }
+    } else {
+      // Text reply
+      await bot.telegram.sendChatAction(chatId, "typing");
+      const messages = buildOllamaMessages(reactionPrompt, history, tier, user, mood);
+      let reply = await ollamaChat(messages, user.ollamaKeys);
+      reply = stripInternalArtifacts(reply);
+      reply = addDeliberateTypos(reply, mood);
+      store.addMessage(userId, "assistant", reply);
+
+      const delay = typingDelay(reply) * timeOfDayMultiplier();
+      await new Promise((r) => setTimeout(r, Math.min(delay, 4000)));
+      await bot.telegram.sendMessage(chatId, reply);
+    }
+
+    console.log(`[Reaction] Responded to ${reactionEmoji} from user ${userId} via ${useVoice ? "voice" : "text"}`);
+  } catch (err) {
+    console.error(`[Reaction] Failed for user ${userId}:`, err);
+  }
+});
+
 // ── PROACTIVE MESSAGING ─────────────────────────────────────────────
 
 async function proactiveLoop() {
@@ -4339,7 +4569,7 @@ async function proactiveLoop() {
 
 console.log(`Starting ${botName} Telegram bot...`);
 
-bot.launch().then(async () => {
+bot.launch({ allowedUpdates: ["message", "callback_query", "poll_answer", "message_reaction"] }).then(async () => {
   console.log(`🤖 ${botName} Telegram bot is running!`);
 
   // Register commands so Telegram shows autocomplete suggestions when user types /
