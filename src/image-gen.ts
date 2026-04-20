@@ -458,12 +458,16 @@ export function shouldSendSelfie(
   const selfieRequestPatterns = [
     /\b(send|show|share).{0,10}(pic|photo|selfie|image|face|yourself|apni photo)/i,
     /\b(selfie|photo|pic).{0,10}(bhej|pathao|de na|dena|dikha|dikhao|send|share|show)/i,
-    /\b(tumi|tera|tumhar|apni|apnar).{0,10}(photo|pic|selfie|face|picture)/i,
+    /\b(tumi|tera|tumhar|apni|apnar).{0,10}(photo|pic|selfie|face|picture|video)/i,
     /\b(how do you look|kemon dekht[eai]|kaisi dikhti|kaisa dikhta)\b/i,
     /\b(face reveal|show face|dekha to|chehra dikha)/i,
     /\b(send me a pic|pic pls|photo pls|selfie pls)/i,
     /\b(pic de|photo de|selfie de|picture de|photo dao|pic dao)\b/i,
     /\b(apni chhobi|nij er photo|nijer pic)\b/i,
+    // Video requests — personal videos of Meera (not memes/reels)
+    /\b(send|show|share).{0,10}(video)\b(?!.{0,15}(funny|meme|reel|comedy|hasi|hansi|moja))/i,
+    /\b(video).{0,10}(bhej|pathao|de na|dena|dikha|dikhao|send|share|show)\b(?!.{0,15}(funny|meme|reel|comedy|hasi|hansi|moja))/i,
+    /\b(video de|video dao|video dena|video bhejo)\b/i,
   ];
 
   if (selfieRequestPatterns.some((p) => p.test(text))) {

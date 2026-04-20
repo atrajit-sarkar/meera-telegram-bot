@@ -3857,7 +3857,19 @@ async function handleTextMessage(
         if (imageDecision.type === "meera") {
           // Check if community videos are available — if so, sometimes send video instead
           const hasMeeraVids = await meeraVideos.hasVideos();
+          // Detect if user explicitly asked for a video (not meme/reel/funny)
+          const userAskedForVideo = imgReason === "asked" && /\b(video|vid)\b/i.test(text)
+            && !/\b(funny|meme|reel|comedy|hasi|hansi|moja)\b/i.test(text);
           if (hasMeeraVids && tier !== "stranger" && tier !== "acquaintance") {
+            if (userAskedForVideo) {
+              // User explicitly asked for a video — always send Meera's community video
+              console.log(`[Video] User ${userId} explicitly asked for video in ${tier} tier — sending Meera video`);
+              const sentAsVideoNote = await maybeSendVideoNote(ctx, userId);
+              if (sentAsVideoNote) return;
+              const sentVid = await sendMeeraVideo(ctx, userId, imgReason as "asked" | "vibe" | "spontaneous", text);
+              if (sentVid) return;
+              // fallthrough to image if video send failed
+            }
             // Feature 14: 10% chance to send as video note (close only, from community videos)
             const sentAsVideoNote = await maybeSendVideoNote(ctx, userId);
             if (sentAsVideoNote) return;
