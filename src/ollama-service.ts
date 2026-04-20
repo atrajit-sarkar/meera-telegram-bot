@@ -676,3 +676,62 @@ Reply with ONLY the photo numbers separated by commas (e.g. "2,5,3,1,4"). Nothin
     return captions.slice(0, maxCandidates).map((c) => c.index);
   }
 }
+
+/**
+ * Select the best community video to send based on caption relevance.
+ * Videos are NOT processed by Gemini, so selection is purely caption-based via Ollama.
+ * Returns the index of the chosen video, or -1 if none fit.
+ */
+export async function selectMeeraVideo(
+  config: OllamaConfig,
+  userMessage: string,
+  mood: string,
+  comfortTier: string,
+  captions: Array<{ index: number; caption: string }>,
+  chatHistory: OllamaMessage[],
+  userKeys: string[] = [],
+  communityKeys: string[] = [],
+): Promise<number> {
+  if (captions.length === 0) return -1;
+  if (captions.length === 1) return captions[0].index;
+
+  const captionList = captions
+    .map((c, i) => `${i + 1}. ${c.caption}`)
+    .join("\n");
+
+  const systemPrompt = `You are helping Meera (a real girl) pick which video of herself to send in a Telegram chat.
+
+Available videos:
+${captionList}
+
+Context:
+- Current mood: ${mood}
+- Comfort tier with user: ${comfortTier}
+
+Rules:
+- Pick the video that best matches the conversation context and vibe
+- Consider mood, time of day, and what the user is talking about
+- If the user asked for something specific, pick a video whose caption matches best
+- If no specific request, pick one that matches the conversation energy
+- If NONE of the available videos match, reply "0" — don't force a bad match
+
+Reply with ONLY the number of the video you pick (1-${captions.length}), or "0" if none fit. Nothing else.`;
+
+  try {
+    const messages: OllamaMessage[] = [
+      { role: "system", content: systemPrompt },
+      ...chatHistory.slice(-6).filter((m) => m.role !== "system"),
+      { role: "user", content: userMessage },
+    ];
+    const raw = await callOllamaWithRotation(config, messages, userKeys, communityKeys);
+    const num = parseInt(raw.trim().replace(/[^0-9]/g, ""));
+    if (num === 0) return -1;
+    if (num >= 1 && num <= captions.length) {
+      return captions[num - 1].index;
+    }
+    return captions[Math.floor(Math.random() * captions.length)].index;
+  } catch (err) {
+    console.error("[AI] selectMeeraVideo failed:", err);
+    return captions[Math.floor(Math.random() * captions.length)].index;
+  }
+}

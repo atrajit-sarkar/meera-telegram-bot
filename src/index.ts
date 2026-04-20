@@ -25,6 +25,7 @@ import {
   decideImageType,
   selectMeeraImage,
   shortlistMeeraImages,
+  selectMeeraVideo,
   type OllamaConfig,
   type OllamaMessage,
 } from "./ollama-service.js";
@@ -36,6 +37,7 @@ import {
   shouldSendSelfie,
 } from "./image-gen.js";
 import { MeeraImageStore } from "./meera-image-store.js";
+import { MeeraVideoStore } from "./meera-video-store.js";
 import { DpManager } from "./dp-manager.js";
 import type { Context } from "telegraf";
 import type { GeminiResponse } from "./gemini-session.js";
@@ -79,6 +81,9 @@ const store = new UserStore(50, FIREBASE_DB_ID);
 
 // Community Meera image database (shares Firestore instance via store)
 const meeraImages = new MeeraImageStore(store.getDb());
+
+// Community Meera video database (shares Firestore instance via store)
+const meeraVideos = new MeeraVideoStore(store.getDb());
 
 // Auto-DP manager: changes bot profile photo based on aggregate user mood
 const dpManager = new DpManager({
@@ -255,6 +260,7 @@ function stripInternalArtifacts(text: string): string {
   cleaned = cleaned.replace(/\[meera photo:[^\]]*\]/gi, "");
   cleaned = cleaned.replace(/\[generated image:[^\]]*\]/gi, "");
   cleaned = cleaned.replace(/\[video note[^\]]*\]/gi, "");
+  cleaned = cleaned.replace(/\[meera video:[^\]]*\]/gi, "");
   // Remove [shared: ...] content tags
   cleaned = cleaned.replace(/\[shared:[^\]]*\]/gi, "");
   // Remove (prompt: ...) or (image prompt: ...) leaked generation prompts
@@ -1398,6 +1404,57 @@ bot.command("removeface", async (ctx) => {
   await ctx.reply("Which Meera image to remove? (You can only remove images you contributed)\n\n" + lines.join("\n") + "\n\nSend the number.");
 });
 
+// ── COMMUNITY VIDEO COMMANDS ────────────────────────────────────────
+
+bot.command("uploadvideo", async (ctx) => {
+  store.setFsmState(ctx.from.id, "waiting_for_meera_video");
+  await ctx.reply(
+    "🎬 Send me a video of Meera with a caption describing it.\n\n" +
+    "The caption should describe the context, mood, setting, etc.\n" +
+    "Only video files are accepted (not video notes/circles).\n" +
+    "Send videos ONE AT A TIME with a caption.\n\n" +
+    "When you're done, send /donevideoupload to finish.",
+  );
+});
+
+bot.command("donevideoupload", async (ctx) => {
+  const state = store.getFsmState(ctx.from.id);
+  if (state === "waiting_for_meera_video") {
+    store.clearFsmState(ctx.from.id);
+    await ctx.reply("✅ Done! Thanks for contributing videos. Use /videopool to see all contributed videos.");
+  } else {
+    await ctx.reply("You're not currently uploading videos. Use /uploadvideo to start.");
+  }
+});
+
+bot.command("videopool", async (ctx) => {
+  const count = await meeraVideos.getCount();
+  if (count === 0) {
+    await ctx.reply("No community videos contributed yet. Use /uploadvideo to contribute! 🎬");
+    return;
+  }
+  const info = await meeraVideos.getInfo();
+  const lines = info.map((vid, i) => {
+    const credit = vid.contributorName ? ` — by ${vid.contributorName}` : "";
+    return `${i + 1}. ${vid.caption}${credit}`;
+  });
+  await ctx.reply(`🎬 Meera Video Pool: ${count} video${count > 1 ? "s" : ""}\n\n${lines.join("\n")}\n\nUse /uploadvideo to add more!`);
+});
+
+bot.command("removevideo", async (ctx) => {
+  const count = await meeraVideos.getCount();
+  if (count === 0) {
+    await ctx.reply("No community videos to remove.");
+    return;
+  }
+  const info = await meeraVideos.getInfo();
+  const lines = info.map((vid, i) => {
+    return `${i + 1}. ${vid.caption}`;
+  });
+  store.setFsmState(ctx.from.id, "waiting_for_remove_meera_video");
+  await ctx.reply("Which video to remove? (You can only remove videos you contributed)\n\n" + lines.join("\n") + "\n\nSend the number.");
+});
+
 // ── CUSTOM PERSONA COMMANDS ─────────────────────────────────────────
 
 const PERSONA_TEMPLATE = `🎭 *Custom Persona Template*
@@ -1692,6 +1749,24 @@ async function handleFsmState(
       // User sent text instead of a photo — remind them
       return ctx.reply("📸 Please send a *photo* with a caption describing it. Text alone won't work.\n\nSend /doneupload when you're finished.", { parse_mode: "Markdown" }).then(() => true);
 
+    case "waiting_for_meera_video":
+      // User sent text instead of a video — remind them
+      return ctx.reply("🎬 Please send a *video* with a caption describing it. Text alone won't work.\n\nSend /donevideoupload when you're finished.", { parse_mode: "Markdown" }).then(() => true);
+
+    case "waiting_for_remove_meera_video":
+      store.clearFsmState(userId);
+      {
+        const idx = parseInt(text) - 1;
+        const result = await meeraVideos.removeVideo(idx, userId);
+        if (result.notOwner) {
+          return ctx.reply("You can only remove videos you contributed.").then(() => true);
+        }
+        if (result.removed && result.video) {
+          return ctx.reply(`Removed video: "${result.video.caption.slice(0, 50)}"`).then(() => true);
+        }
+        return ctx.reply("Invalid number.").then(() => true);
+      }
+
     case "waiting_for_persona":
       store.clearFsmState(userId);
       {
@@ -1796,6 +1871,24 @@ function getReplyContext(ctx: Context, userId: number): string {
     return `(The user is replying to a photo you sent earlier)\n\n`;
   }
 
+  // Check if this is a reply to a video or video_note sent by the bot
+  if ((replyMsg.video || replyMsg.video_note) && isFromBot) {
+    const targetMsgId = replyMsg.message_id;
+    const videoInfo = getSentImageInfo(userId, targetMsgId);
+    if (videoInfo && videoInfo.type === "meera_video") {
+      // Use the stored caption since videos can't be analyzed by Gemini
+      const descPart = videoInfo.caption
+        ? `The video was: ${videoInfo.caption.slice(0, 200)}.`
+        : "";
+      const captionPart = replyText ? ` Your caption was: "${replyText.slice(0, 200)}".` : "";
+      return `(The user is replying to a video you sent earlier. ${descPart}${captionPart})\n\n`;
+    }
+    if (replyText) {
+      return `(The user is replying to a video that you sent earlier with caption: "${replyText.slice(0, 200)}")\n\n`;
+    }
+    return `(The user is replying to a video you sent earlier)\n\n`;
+  }
+
   if (replyText) {
     return `(The user is replying to a specific message that ${sender} sent earlier: "${replyText.slice(0, 300)}")\n\n`;
   }
@@ -1847,6 +1940,16 @@ async function resolveImageReplyContext(
     return captionText
       ? `(The user is replying to a photo you sent with caption: "${captionText.slice(0, 200)}")\n\n`
       : `(The user is replying to a photo you sent earlier)\n\n`;
+  }
+
+  // If this is a video, use caption directly (no Gemini vision for videos)
+  if (imageInfo.type === "meera_video") {
+    const descPart = imageInfo.caption
+      ? `The video was: ${imageInfo.caption.slice(0, 200)}.`
+      : "";
+    const captionPart = captionText ? ` Your caption was: "${captionText}".` : "";
+    console.log(`[ReplyCtx] Using caption for replied-to video, user ${userId}`);
+    return `(The user is replying to a video you sent earlier. ${descPart}${captionPart})\n\n`;
   }
 
   // Try Gemini vision analysis if we have a fileId
@@ -2048,13 +2151,13 @@ function trackSentMessage(userId: number, msgId: number) {
   if (ids.length > 5) ids.shift();
 }
 
-/** Track sent image message IDs → metadata so we can handle reply-to-image */
+/** Track sent image/video message IDs → metadata so we can handle reply-to-image/video */
 interface SentImageInfo {
   msgId: number;
-  caption: string;        // Internal caption/description of the image
-  fileId?: string;        // Telegram file_id (for Meera community images)
-  type: "meera" | "generated";
-  ts: number;             // Timestamp of when image was sent
+  caption: string;        // Internal caption/description of the image/video
+  fileId?: string;        // Telegram file_id (for Meera community images/videos)
+  type: "meera" | "generated" | "meera_video";
+  ts: number;             // Timestamp of when image/video was sent
 }
 
 const sentImageMap = new Map<number, SentImageInfo[]>();
@@ -2399,24 +2502,25 @@ async function maybeNoticeProfileChange(
   } catch {}
 }
 
-// Feature 14: Send video note (circle video) from community image
-function imageToVideoNote(imageBuffer: Buffer): Promise<Buffer> {
+// Feature 14: Send video note (circle video) from community videos
+// Now uses actual community videos instead of converting images to video notes
+function videoToVideoNote(videoBuf: Buffer): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const proc = execFile(
       ffmpegPath as unknown as string,
       [
-        "-f", "image2pipe", "-i", "pipe:0",
-        "-vf", "scale=640:640:force_original_aspect_ratio=increase,crop=640:640,zoompan=z='min(zoom+0.002,1.3)':d=90:s=640x640:fps=30",
-        "-t", "3", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-i", "pipe:0",
+        "-vf", "scale=640:640:force_original_aspect_ratio=increase,crop=640:640",
+        "-t", "10", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an",
         "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", "pipe:1"
       ],
-      { encoding: "buffer" as const, maxBuffer: 20 * 1024 * 1024 },
+      { encoding: "buffer" as const, maxBuffer: 30 * 1024 * 1024 },
       (err, stdout) => {
         if (err) return reject(err);
         resolve(Buffer.from(stdout));
       }
     );
-    proc.stdin!.write(imageBuffer);
+    proc.stdin!.write(videoBuf);
     proc.stdin!.end();
   });
 }
@@ -2429,30 +2533,133 @@ async function maybeSendVideoNote(
   if (tier !== "close") return false;
   if (Math.random() > 0.10) return false; // 10% chance
 
-  const hasMeeraImgs = await meeraImages.hasImages();
-  if (!hasMeeraImgs) return false;
+  const hasMeeraVids = await meeraVideos.hasVideos();
+  if (!hasMeeraVids) return false;
 
   try {
-    const chosenIndex = await selectBestMeeraImageIndex("(quick video note selfie)", userId);
-    const image = await meeraImages.getByIndex(chosenIndex);
-    if (!image) return false;
+    const user = store.getUser(userId);
+    const mood = store.getMood(userId);
+    const history = store.getRecentHistory(userId);
+    const captions = await meeraVideos.getCaptionsWithIndices();
 
-    const fileLink = await (ctx as any).telegram.getFileLink(image.fileId);
+    const chosenIndex = await selectMeeraVideo(
+      ollamaConfig,
+      "(quick video note)",
+      mood,
+      tier,
+      captions,
+      history,
+      user.ollamaKeys,
+      store.getCommunityKeyStrings(),
+    );
+    if (chosenIndex === -1) return false;
+
+    const video = await meeraVideos.getByIndex(chosenIndex);
+    if (!video) return false;
+
+    const fileLink = await (ctx as any).telegram.getFileLink(video.fileId);
     const response = await fetch(fileLink.href);
-    const imageBuffer = Buffer.from(await response.arrayBuffer());
+    const videoBuffer = Buffer.from(await response.arrayBuffer());
 
-    const videoBuffer = await imageToVideoNote(imageBuffer);
+    const vnoteBuffer = await videoToVideoNote(videoBuffer);
     await ctx.sendChatAction("record_video_note").catch(() => {});
     await new Promise(r => setTimeout(r, 1500 + Math.random() * 2000));
 
-    await (ctx as any).telegram.sendVideoNote(ctx.chat!.id, { source: videoBuffer, filename: "vnote.mp4" }, { length: 640, duration: 3 });
-    store.addMessage(userId, "assistant", "sent a quick selfie video");
-    const user = store.getUser(userId);
-    store.updateUser(userId, { lastSelfieSent: Date.now(), selfiesSent: (user.selfiesSent ?? 0) + 1 });
-    console.log(`[VideoNote] Sent video note to user ${userId}`);
+    const sentMsg = await (ctx as any).telegram.sendVideoNote(ctx.chat!.id, { source: vnoteBuffer, filename: "vnote.mp4" }, { length: 640, duration: 10 });
+    store.addMessage(userId, "assistant", `[video note] ${video.caption}`, sentMsg?.message_id);
+    if (sentMsg?.message_id) {
+      trackSentImage(userId, {
+        msgId: sentMsg.message_id,
+        caption: video.caption,
+        fileId: video.fileId,
+        type: "meera_video",
+      });
+    }
+    console.log(`[VideoNote] Sent community video note to user ${userId}`);
     return true;
   } catch (err) {
     console.error(`[VideoNote] Failed for user ${userId}:`, err);
+    return false;
+  }
+}
+
+/**
+ * Select and send a community Meera video.
+ * Uses Ollama caption-based selection (no Gemini since videos can't be processed).
+ */
+async function sendMeeraVideo(
+  ctx: Context,
+  userId: number,
+  reason: "asked" | "vibe" | "spontaneous",
+  userText: string = "",
+): Promise<boolean> {
+  const user = store.getUser(userId);
+  const mood = store.getMood(userId);
+  const tier = store.getComfortTier(userId);
+
+  const hasVids = await meeraVideos.hasVideos();
+  if (!hasVids) return false;
+
+  const captions = await meeraVideos.getCaptionsWithIndices();
+  const history = store.getRecentHistory(userId);
+
+  const chosenIndex = await selectMeeraVideo(
+    ollamaConfig,
+    userText || "(spontaneous video share)",
+    mood,
+    tier,
+    captions,
+    history,
+    user.ollamaKeys,
+    store.getCommunityKeyStrings(),
+  );
+
+  if (chosenIndex === -1) return false;
+  const video = await meeraVideos.getByIndex(chosenIndex);
+  if (!video) return false;
+
+  // Generate a natural caption via Ollama
+  let caption: string;
+  try {
+    const gender = parseGenderFromPersona(user.customPersona);
+    const botName = getBotName();
+    const captionPrompt = reason === "asked"
+      ? `You're a ${gender === "girl" ? "girl" : "guy"} sending a video of yourself that was requested. The video is: ${video.caption.slice(0, 100)}. Write a very short casual caption (1 line, max 10 words) in your style. Be natural like real texting.`
+      : `You're a ${gender === "girl" ? "girl" : "guy"} spontaneously sending a video. The video is: ${video.caption.slice(0, 100)}. Write a super short casual caption (1 line, max 8 words) — natural and low effort. Don't explain why you're sending it.`;
+
+    const messages: OllamaMessage[] = [
+      { role: "system", content: user.customPersona || `You are ${botName}. Reply with just the caption, nothing else.` },
+      { role: "user", content: captionPrompt },
+    ];
+    caption = await ollamaChat(messages, user.ollamaKeys);
+    caption = caption.replace(/^["']|["']$/g, "").trim();
+    caption = stripInternalArtifacts(caption);
+    if (caption.length > 100) caption = caption.slice(0, 100);
+  } catch {
+    const fallbacks = reason === "asked"
+      ? ["here u go 🎬", "for u", "le 😊", "👀✨"]
+      : ["me rn", "vibes", "👋", "hi lol", "🎬", "bored hehe"];
+    caption = fallbacks[Math.floor(Math.random() * fallbacks.length)];
+  }
+
+  try {
+    await ctx.sendChatAction("upload_video").catch(() => {});
+    const sentMsg = await (ctx as any).telegram.sendVideo(ctx.chat!.id, video.fileId, { caption });
+
+    const sentMsgId = sentMsg?.message_id;
+    store.addMessage(userId, "assistant", caption, sentMsgId);
+    if (sentMsgId) {
+      trackSentImage(userId, {
+        msgId: sentMsgId,
+        caption: video.caption,
+        fileId: video.fileId,
+        type: "meera_video",
+      });
+    }
+    console.log(`[MeeraVid] Sent community video to user ${userId} (${reason}), caption="${video.caption.slice(0, 40)}"`);
+    return true;
+  } catch (err) {
+    console.error(`[MeeraVid] Failed to send to ${userId}:`, err);
     return false;
   }
 }
@@ -3446,14 +3653,24 @@ async function handleTextMessage(
     setTimeout(async () => {
       try {
         if (imageDecision.type === "meera") {
-          // Feature 14: 10% chance to send as video note instead of photo (close only)
-          const sentAsVideo = await maybeSendVideoNote(ctx, userId);
-          if (!sentAsVideo) {
-            const sent = await sendMeeraImage(ctx, userId, imgReason as "asked" | "vibe" | "spontaneous", text);
-            if (!sent && imgReason === "asked") {
-              await ctx.reply("ugh my camera's being weird rn 😩 later ok?");
-              store.addMessage(userId, "assistant", "ugh my camera's being weird rn 😩 later ok?");
+          // Check if community videos are available — if so, sometimes send video instead
+          const hasMeeraVids = await meeraVideos.hasVideos();
+          if (hasMeeraVids && tier !== "stranger" && tier !== "acquaintance") {
+            // Feature 14: 10% chance to send as video note (close only, from community videos)
+            const sentAsVideoNote = await maybeSendVideoNote(ctx, userId);
+            if (sentAsVideoNote) return;
+
+            // 20% chance to send a regular video instead of image
+            if (Math.random() < 0.20) {
+              const sentVid = await sendMeeraVideo(ctx, userId, imgReason as "asked" | "vibe" | "spontaneous", text);
+              if (sentVid) return;
             }
+          }
+
+          const sent = await sendMeeraImage(ctx, userId, imgReason as "asked" | "vibe" | "spontaneous", text);
+          if (!sent && imgReason === "asked") {
+            await ctx.reply("ugh my camera's being weird rn 😩 later ok?");
+            store.addMessage(userId, "assistant", "ugh my camera's being weird rn 😩 later ok?");
           }
         } else if (imageDecision.type === "generate" && imageDecision.prompt) {
           const sent = await sendGeneratedImage(ctx, userId, imageDecision.prompt);
@@ -3734,6 +3951,36 @@ bot.on(message("audio"), async (ctx) => {
 
 // Videos — extract frame + audio since Gemini Live can't handle raw video inline
 bot.on(message("video"), async (ctx) => {
+  const userId = ctx.from.id;
+
+  // Check if user is contributing community videos
+  const fsmState = store.getFsmState(userId);
+  if (fsmState === "waiting_for_meera_video") {
+    const caption = ctx.message.caption?.trim();
+
+    if (!caption || caption.length < 5) {
+      await ctx.reply(
+        "⚠️ Please include a caption describing this video (context, mood, setting, etc.)\n\n" +
+        "Example: \"Meera waving hello at a park, sunny afternoon, playful mood\"\n\n" +
+        "Send the video again with a caption.",
+      );
+      return;
+    }
+
+    const name = ctx.from.first_name + (ctx.from.last_name ? " " + ctx.from.last_name : "");
+    const contributor = ctx.from.username ? `@${ctx.from.username}` : name;
+
+    await meeraVideos.addVideo(ctx.message.video.file_id, caption, userId, contributor);
+    const count = await meeraVideos.getCount();
+
+    await ctx.reply(
+      `✅ Video added! (${count} total in the pool)\n` +
+      `📝 Caption: "${caption}"\n\n` +
+      "Send another video with caption, or /donevideoupload when finished.",
+    );
+    return;
+  }
+
   const fileSize = ctx.message.video.file_size ?? 0;
   if (fileSize > 15 * 1024 * 1024) {
     await ctx.reply("⚠️ Video is too large (max 15 MB). Send a shorter clip.");
