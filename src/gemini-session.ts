@@ -347,3 +347,104 @@ export class GeminiSession {
     return this.ready;
   }
 }
+
+// ── Gemini Vision: Image Selection via REST API ──────────────────────
+
+export interface ImageCandidate {
+  index: number;
+  caption: string;
+  imageBase64: string;
+}
+
+/**
+ * Use Gemini's vision capability to pick the best Meera image from a set of candidates.
+ * This is called AFTER Ollama shortlists images by caption — Gemini actually looks at the
+ * images and chooses the one that best fits the context visually.
+ */
+export async function selectBestImageWithGemini(
+  apiKey: string,
+  candidates: ImageCandidate[],
+  context: { userMessage: string; mood: string; comfortTier: string },
+  model: string = "gemini-2.5-flash",
+): Promise<number> {
+  if (candidates.length === 0) return -1;
+  if (candidates.length === 1) return candidates[0].index;
+
+  const parts: Array<Record<string, unknown>> = [];
+
+  // Add instruction
+  parts.push({
+    text: `You are Meera, a real girl picking which of YOUR photos to send in a Telegram chat right now.\n\nHere are ${candidates.length} candidate photos. Look at each one carefully:\n`,
+  });
+
+  // Add each candidate image with its number and caption
+  for (let i = 0; i < candidates.length; i++) {
+    parts.push({ text: `\nPhoto ${i + 1} (described as: "${candidates[i].caption}"):` });
+    parts.push({
+      inlineData: {
+        data: candidates[i].imageBase64,
+        mimeType: "image/jpeg",
+      },
+    });
+  }
+
+  // Add the selection prompt
+  parts.push({
+    text: `\nNow pick the BEST photo to send based on this context:
+- The user said: "${context.userMessage}"
+- Your current mood: ${context.mood}
+- Your relationship with this person: ${context.comfortTier}
+
+Pick the photo that:
+1. Best matches what was asked for or the conversation vibe
+2. Looks most natural and appealing for this specific context
+3. Has the right energy/expression for your current mood
+4. Would feel most human-like and appropriate to send right now
+
+Reply with ONLY the photo number (1-${candidates.length}). Nothing else.`,
+  });
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30_000);
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts }],
+        generationConfig: {
+          temperature: 0.3,
+          maxOutputTokens: 10,
+        },
+      }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`Gemini vision API error: ${res.status} ${errText.slice(0, 200)}`);
+    }
+
+    const json = await res.json();
+    const text = json.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    const num = parseInt(text.trim().replace(/[^0-9]/g, ""));
+
+    if (num >= 1 && num <= candidates.length) {
+      console.log(`[GeminiVision] Selected photo ${num} out of ${candidates.length} candidates`);
+      return candidates[num - 1].index;
+    }
+
+    // Fallback: return first candidate
+    console.log(`[GeminiVision] Could not parse selection "${text}", falling back to first candidate`);
+    return candidates[0].index;
+  } catch (err) {
+    console.error("[GeminiVision] selectBestImageWithGemini failed:", err);
+    // Fallback: return first candidate
+    return candidates[0].index;
+  } finally {
+    clearTimeout(timeout);
+  }
+}

@@ -595,3 +595,75 @@ Reply with ONLY the number of the photo you pick (1-${captions.length}), or "0" 
     return captions[Math.floor(Math.random() * captions.length)].index;
   }
 }
+
+/**
+ * Shortlist the top N candidate Meera images by caption using Ollama.
+ * Returns an array of image indices (0-based) that are the best matches.
+ * Used as the first step before Gemini visual selection.
+ */
+export async function shortlistMeeraImages(
+  config: OllamaConfig,
+  userMessage: string,
+  mood: string,
+  comfortTier: string,
+  captions: Array<{ index: number; caption: string }>,
+  chatHistory: OllamaMessage[],
+  userKeys: string[] = [],
+  communityKeys: string[] = [],
+  maxCandidates: number = 5,
+): Promise<number[]> {
+  if (captions.length === 0) return [];
+  if (captions.length <= maxCandidates) return captions.map((c) => c.index);
+
+  const captionList = captions
+    .map((c) => `${c.index + 1}. ${c.caption}`)
+    .join("\n");
+
+  const systemPrompt = `You are helping Meera pick which photos of herself to consider sending in a Telegram chat.
+
+Available photos:
+${captionList}
+
+Context:
+- Current mood: ${mood}
+- Comfort tier with user: ${comfortTier}
+
+Rules:
+- Select the top ${maxCandidates} photos that best match the conversation context and what the user asked for
+- Consider mood, time of day, setting, and the user's request
+- If fewer photos match, list only the relevant ones
+- If NONE match at all, reply "0"
+
+Reply with ONLY the photo numbers separated by commas (e.g. "2,5,3,1,4"). Nothing else. No explanation.`;
+
+  try {
+    const messages: OllamaMessage[] = [
+      { role: "system", content: systemPrompt },
+      ...chatHistory.slice(-6).filter((m) => m.role !== "system"),
+      { role: "user", content: userMessage },
+    ];
+    const raw = await callOllamaWithRotation(config, messages, userKeys, communityKeys);
+    const nums = raw
+      .trim()
+      .replace(/[^0-9,]/g, "")
+      .split(",")
+      .map((n) => parseInt(n))
+      .filter((n) => !isNaN(n));
+
+    if (nums.length === 1 && nums[0] === 0) return [];
+
+    const validIndices = nums
+      .filter((n) => n >= 1 && n <= captions.length)
+      .map((n) => captions[n - 1].index);
+
+    if (validIndices.length === 0) {
+      // Fallback: return first maxCandidates
+      return captions.slice(0, maxCandidates).map((c) => c.index);
+    }
+
+    return validIndices;
+  } catch (err) {
+    console.error("[AI] shortlistMeeraImages failed:", err);
+    return captions.slice(0, maxCandidates).map((c) => c.index);
+  }
+}

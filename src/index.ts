@@ -24,6 +24,7 @@ import {
   decideSelfieVsContent,
   decideImageType,
   selectMeeraImage,
+  shortlistMeeraImages,
   type OllamaConfig,
   type OllamaMessage,
 } from "./ollama-service.js";
@@ -38,6 +39,7 @@ import { MeeraImageStore } from "./meera-image-store.js";
 import { DpManager } from "./dp-manager.js";
 import type { Context } from "telegraf";
 import type { GeminiResponse } from "./gemini-session.js";
+import { selectBestImageWithGemini } from "./gemini-session.js";
 
 // Catch unhandled errors so the bot doesn't crash
 process.on("unhandledRejection", (err) => console.error("[Unhandled]", err));
@@ -503,6 +505,76 @@ async function downloadFileBuffer(fileId: string): Promise<Buffer> {
 async function downloadFile(fileId: string): Promise<string> {
   const buf = await downloadFileBuffer(fileId);
   return buf.toString("base64");
+}
+
+/**
+ * Two-step Meera image selection:
+ * 1. Ollama shortlists candidates by caption relevance
+ * 2. Gemini visually analyzes the shortlisted images and picks the best one
+ * Falls back to Ollama-only selection if Gemini fails.
+ */
+async function selectBestMeeraImageIndex(
+  userText: string,
+  userId: number,
+): Promise<number> {
+  const user = store.getUser(userId);
+  const mood = store.getMood(userId);
+  const tier = store.getComfortTier(userId);
+  const history = store.getRecentHistory(userId);
+  const captions = await meeraImages.getCaptionsWithIndices();
+
+  if (captions.length === 0) return -1;
+  if (captions.length === 1) return captions[0].index;
+
+  // Step 1: Ollama shortlists candidates by caption
+  const shortlist = await shortlistMeeraImages(
+    ollamaConfig,
+    userText,
+    mood,
+    tier,
+    captions,
+    history,
+    user.ollamaKeys,
+    store.getCommunityKeyStrings(),
+  );
+
+  if (shortlist.length === 0) return -1;
+  if (shortlist.length === 1) return shortlist[0];
+
+  // Step 2: Download shortlisted images and let Gemini pick visually
+  try {
+    const candidates = [];
+    for (const idx of shortlist) {
+      const image = await meeraImages.getByIndex(idx);
+      if (!image) continue;
+      try {
+        const buffer = await downloadFileBuffer(image.fileId);
+        candidates.push({
+          index: idx,
+          caption: image.caption,
+          imageBase64: buffer.toString("base64"),
+        });
+      } catch (err) {
+        console.error(`[MeeraImg] Failed to download candidate image ${idx}:`, err);
+      }
+    }
+
+    if (candidates.length === 0) return shortlist[0];
+    if (candidates.length === 1) return candidates[0].index;
+
+    const bestIndex = await selectBestImageWithGemini(
+      GEMINI_API_KEY!,
+      candidates,
+      { userMessage: userText, mood, comfortTier: tier },
+    );
+
+    console.log(`[MeeraImg] Gemini selected image ${bestIndex} from ${candidates.length} candidates (shortlisted from ${captions.length} total)`);
+    return bestIndex;
+  } catch (err) {
+    console.error("[MeeraImg] Gemini visual selection failed, falling back to Ollama pick:", err);
+    // Fallback: use the first Ollama shortlist pick
+    return shortlist[0];
+  }
 }
 
 /** Convert any audio buffer to raw PCM16 16kHz mono via ffmpeg, returned as base64 */
@@ -2214,14 +2286,7 @@ async function maybeSendVideoNote(
   if (!hasMeeraImgs) return false;
 
   try {
-    const captions = await meeraImages.getCaptionsWithIndices();
-    const mood = store.getMood(userId);
-    const history = store.getRecentHistory(userId);
-    const user = store.getUser(userId);
-
-    const chosenIndex = await selectMeeraImage(
-      ollamaConfig, "(quick video note selfie)", mood, tier, captions, history, user.ollamaKeys,
-    );
+    const chosenIndex = await selectBestMeeraImageIndex("(quick video note selfie)", userId);
     const image = await meeraImages.getByIndex(chosenIndex);
     if (!image) return false;
 
@@ -2235,6 +2300,7 @@ async function maybeSendVideoNote(
 
     await (ctx as any).telegram.sendVideoNote(ctx.chat!.id, { source: videoBuffer, filename: "vnote.mp4" }, { length: 640, duration: 3 });
     store.addMessage(userId, "assistant", "[video note selfie]");
+    const user = store.getUser(userId);
     store.updateUser(userId, { lastSelfieSent: Date.now(), selfiesSent: (user.selfiesSent ?? 0) + 1 });
     console.log(`[VideoNote] Sent video note to user ${userId}`);
     return true;
@@ -2528,7 +2594,7 @@ async function sendContentToChat(
 
 /**
  * Send a community-contributed Meera image to a user.
- * Ollama picks the best matching image from the pool based on conversation context.
+ * Two-step selection: Ollama shortlists by caption, then Gemini visually picks the best match.
  */
 async function sendMeeraImage(
   ctx: Context,
@@ -2539,7 +2605,6 @@ async function sendMeeraImage(
   const user = store.getUser(userId);
   const mood = store.getMood(userId);
   const tier = store.getComfortTier(userId);
-  const history = store.getRecentHistory(userId);
   const now = Date.now();
 
   // Check if we have community images
@@ -2549,16 +2614,10 @@ async function sendMeeraImage(
     return false;
   }
 
-  // Get all captions and let Ollama pick the best one
-  const captions = await meeraImages.getCaptionsWithIndices();
-  const chosenIndex = await selectMeeraImage(
-    ollamaConfig,
+  // Two-step selection: Ollama shortlists by caption → Gemini picks visually
+  const chosenIndex = await selectBestMeeraImageIndex(
     userText || "(spontaneous photo share)",
-    mood,
-    tier,
-    captions,
-    history,
-    user.ollamaKeys,
+    userId,
   );
 
   const image = await meeraImages.getByIndex(chosenIndex);
