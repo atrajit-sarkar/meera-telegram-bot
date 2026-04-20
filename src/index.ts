@@ -244,6 +244,28 @@ function shouldSendEmojiOnly(tier: string, userText: string): string | null {
   return null;
 }
 
+// ── STRIP INTERNAL ARTIFACTS ────────────────────────────────────────
+
+/** Remove leaked internal metadata from AI replies (prompts, file refs, bracketed tags) */
+function stripInternalArtifacts(text: string): string {
+  let cleaned = text;
+  // Remove <attachment: ...> references (Gemini/Stability file IDs leaking)
+  cleaned = cleaned.replace(/<attachment:\s*[^>]+>/gi, "");
+  // Remove [meera photo: ...] or [generated image: ...] or [video note ...] tags
+  cleaned = cleaned.replace(/\[meera photo:[^\]]*\]/gi, "");
+  cleaned = cleaned.replace(/\[generated image:[^\]]*\]/gi, "");
+  cleaned = cleaned.replace(/\[video note[^\]]*\]/gi, "");
+  // Remove [shared: ...] content tags
+  cleaned = cleaned.replace(/\[shared:[^\]]*\]/gi, "");
+  // Remove (prompt: ...) or (image prompt: ...) leaked generation prompts
+  cleaned = cleaned.replace(/\((?:image )?prompt:\s*[^)]+\)/gi, "");
+  // Remove standalone file-ID-like UUIDs (v followed by hex-UUID pattern)
+  cleaned = cleaned.replace(/v[0-9a-f]{8,}-[0-9a-f-]+\.(jpg|jpeg|png|webp|mp4)/gi, "");
+  // Collapse multiple newlines and trim
+  cleaned = cleaned.replace(/\n{3,}/g, "\n\n").trim();
+  return cleaned;
+}
+
 // ── SELF-CORRECTIONS ────────────────────────────────────────────────
 
 /** Sometimes add a follow-up "correction" message to seem more human */
@@ -474,6 +496,7 @@ function scheduleDelayedReply(
         mood
       );
       let reply = await ollamaChat(messages, user.ollamaKeys);
+      reply = stripInternalArtifacts(reply);
       reply = addDeliberateTypos(reply, mood);
 
       store.addMessage(userId, "user", userText);
@@ -2299,7 +2322,7 @@ async function maybeSendVideoNote(
     await new Promise(r => setTimeout(r, 1500 + Math.random() * 2000));
 
     await (ctx as any).telegram.sendVideoNote(ctx.chat!.id, { source: videoBuffer, filename: "vnote.mp4" }, { length: 640, duration: 3 });
-    store.addMessage(userId, "assistant", "[video note selfie]");
+    store.addMessage(userId, "assistant", "sent a quick selfie video");
     const user = store.getUser(userId);
     store.updateUser(userId, { lastSelfieSent: Date.now(), selfiesSent: (user.selfiesSent ?? 0) + 1 });
     console.log(`[VideoNote] Sent video note to user ${userId}`);
@@ -2660,6 +2683,7 @@ async function sendMeeraImage(
     ];
     caption = await ollamaChat(messages, user.ollamaKeys);
     caption = caption.replace(/^["']|["']$/g, "").trim();
+    caption = stripInternalArtifacts(caption);
     if (caption.length > 100) caption = caption.slice(0, 100);
   } catch {
     const fallbacks = reason === "asked"
@@ -2675,7 +2699,7 @@ async function sendMeeraImage(
     if (shouldProtectContent(tier)) photoOpts.protect_content = true;
     await (ctx as any).telegram.sendPhoto(ctx.chat!.id, image.fileId, photoOpts);
 
-    store.addMessage(userId, "assistant", `[meera photo: ${image.caption.slice(0, 50)}] ${caption}`);
+    store.addMessage(userId, "assistant", caption);
     store.updateUser(userId, {
       lastSelfieSent: now,
       selfiesSent: (user.selfiesSent ?? 0) + 1,
@@ -2714,6 +2738,7 @@ async function sendGeneratedImage(
     ];
     caption = await ollamaChat(messages, user.ollamaKeys);
     caption = caption.replace(/^["']|["']$/g, "").trim();
+    caption = stripInternalArtifacts(caption);
     if (caption.length > 100) caption = caption.slice(0, 100);
   } catch {
     caption = ["here! 🎨", "tadaa ✨", "made this for u", "here u go"][Math.floor(Math.random() * 4)];
@@ -2727,7 +2752,7 @@ async function sendGeneratedImage(
     if (shouldProtectContent(tier)) genPhotoOpts.protect_content = true;
     await (ctx as any).telegram.sendPhoto(ctx.chat!.id, { source: result.imageBuffer }, genPhotoOpts);
 
-    store.addMessage(userId, "assistant", `[generated image: ${prompt.slice(0, 50)}] ${caption}`);
+    store.addMessage(userId, "assistant", caption);
     console.log(`[ImageGen] Sent generated image to user ${userId}`);
     return true;
   } catch (err) {
@@ -3122,6 +3147,9 @@ async function handleTextMessage(
 
       let reply = await ollamaChat(messages, user.ollamaKeys);
 
+      // Strip any leaked internal metadata from the reply
+      reply = stripInternalArtifacts(reply);
+
       // Add deliberate typos
       const cleanReply = reply; // Save pre-typo version
       reply = addDeliberateTypos(reply, mood);
@@ -3202,6 +3230,7 @@ async function handleTextMessage(
             store.getRecentHistory(userId), tier, store.getUser(userId), mood
           );
           let retryReply = await ollamaChat(retryMessages, store.getUser(userId).ollamaKeys);
+          retryReply = stripInternalArtifacts(retryReply);
           retryReply = addDeliberateTypos(retryReply, mood);
           if (isBatched) {
             for (const t of batchedTexts!) store.addMessage(userId, "user", t);
