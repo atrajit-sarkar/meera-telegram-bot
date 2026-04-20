@@ -699,11 +699,13 @@ export class UserStore {
       return false; // duplicate
     }
     const entry = { packName, addedBy, addedByName, addedAt: Date.now() };
-    this.globalStickerPacks.push(entry);
     try {
       await this.db.collection("global_sticker_packs").add(entry);
+      this.globalStickerPacks.push(entry);
+      console.log(`[UserStore] Saved global sticker pack to Firestore: ${packName}`);
     } catch (err) {
       console.error("[UserStore] Failed to save global sticker pack:", err);
+      return false;
     }
     return true;
   }
