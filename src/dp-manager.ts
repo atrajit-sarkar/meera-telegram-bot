@@ -53,14 +53,15 @@ export class DpManager {
     this.ollamaConfig = opts.ollamaConfig;
     this.getCommunityKeys = opts.getCommunityKeys;
 
-    // First change: random 30min–2h after startup
-    this.nextChangeDelay = this.randomDelay(30 * 60_000, 2 * 3600_000);
+    // First change: random 20–90 min after startup (a bit sooner so it actually fires)
+    this.nextChangeDelay = this.randomDelay(20 * 60_000, 90 * 60_000);
     this.lastDpChange = Date.now();
 
-    // Name changes less often than DP (6–24h), bio more often (3–12h), description rare (24–48h)
-    this.nextNameDelay = this.randomDelay(6 * 3600_000, 24 * 3600_000);
-    this.nextBioDelay = this.randomDelay(1 * 3600_000, 6 * 3600_000);
-    this.nextDescDelay = this.randomDelay(24 * 3600_000, 48 * 3600_000);
+    // First-time delays are kept short so the bot actually does *something* visible
+    // soon after startup. Subsequent intervals (set in tick()) follow the real-girl cadence.
+    this.nextNameDelay = this.randomDelay(45 * 60_000, 3 * 3600_000);
+    this.nextBioDelay = this.randomDelay(20 * 60_000, 90 * 60_000);
+    this.nextDescDelay = this.randomDelay(2 * 3600_000, 6 * 3600_000);
     this.lastNameChange = Date.now();
     this.lastBioChange = Date.now();
     this.lastDescChange = Date.now();
@@ -69,8 +70,15 @@ export class DpManager {
   /** Start the periodic check (every 10 minutes) */
   start(): void {
     if (this.timer) return;
-    console.log(`[DpManager] Started — first DP change in ~${Math.round(this.nextChangeDelay / 60_000)}min`);
-    this.timer = setInterval(() => this.tick().catch(console.error), 10 * 60_000);
+    console.log(
+      `[DpManager] Started — first DP in ~${Math.round(this.nextChangeDelay / 60_000)}min, ` +
+      `bio in ~${Math.round(this.nextBioDelay / 60_000)}min, ` +
+      `name in ~${Math.round(this.nextNameDelay / 60_000)}min, ` +
+      `desc in ~${Math.round(this.nextDescDelay / 60_000)}min`,
+    );
+    this.timer = setInterval(() => this.tick().catch((e) => console.error("[DpManager] tick error:", e)), 10 * 60_000);
+    // Run a tick immediately so we don't have to wait 10min for the first check
+    setTimeout(() => this.tick().catch((e) => console.error("[DpManager] initial tick error:", e)), 5_000);
   }
 
   /** Stop the scheduler */
@@ -290,8 +298,26 @@ Reply with ONLY the number. Nothing else.`;
     }
   }
 
+  /** Public wrapper to force-change the name now (used by admin /changedp). */
+  async changeName(): Promise<string> {
+    const mood = this.getAverageMood();
+    return this.maybeChangeName(mood);
+  }
+
+  /** Public wrapper to force-change the bio now. */
+  async changeBio(): Promise<string> {
+    const mood = this.getAverageMood();
+    return this.maybeChangeBio(mood);
+  }
+
+  /** Public wrapper to force-change the description now. */
+  async changeDescription(): Promise<string> {
+    const mood = this.getAverageMood();
+    return this.maybeChangeDescription(mood);
+  }
+
   /** Ask Ollama to generate a name variation and set it */
-  private async maybeChangeName(mood: string): Promise<void> {
+  private async maybeChangeName(mood: string): Promise<string> {
     const hour = new Date().getHours();
     const timeOfDay = this.getTimeOfDay(hour);
 
@@ -331,19 +357,22 @@ Rules:
       // Validate: not empty, not too long, not the same
       if (!name || name.length > 64 || name.toLowerCase() === this.currentName.toLowerCase()) {
         console.log(`[DpManager] Name unchanged (generated: "${name}")`);
-        return;
+        return `Name unchanged (mood: ${mood})`;
       }
 
       await this.setBotName(name);
       this.currentName = name;
-      console.log(`[DpManager] Name updated to "${name}" (mood: ${mood})`);
+      const msg = `Name updated to "${name}" (mood: ${mood})`;
+      console.log(`[DpManager] ${msg}`);
+      return msg;
     } catch (err) {
       console.error("[DpManager] Name change failed:", err);
+      return `Name change failed: ${(err as Error).message}`;
     }
   }
 
   /** Ask Ollama to generate a bio and set it */
-  private async maybeChangeBio(mood: string): Promise<void> {
+  private async maybeChangeBio(mood: string): Promise<string> {
     const hour = new Date().getHours();
     const timeOfDay = this.getTimeOfDay(hour);
 
@@ -353,8 +382,9 @@ Rules:
         await this.setBotBio("");
         this.currentBio = "";
         console.log("[DpManager] Bio cleared (real girl moment)");
+        return "Bio cleared";
       }
-      return;
+      return "Bio already empty";
     }
 
     const systemPrompt = `You are Meera — a 20-year-old Indian girl. You're updating your Telegram bio.
@@ -396,21 +426,28 @@ Rules:
 
       // Validate
       if (bio.length > 70) bio = bio.slice(0, 70);
+      if (!bio) {
+        console.log("[DpManager] Bio generation produced empty string");
+        return "Bio generation empty";
+      }
       if (bio.toLowerCase() === this.currentBio.toLowerCase()) {
         console.log(`[DpManager] Bio unchanged`);
-        return;
+        return `Bio unchanged (mood: ${mood})`;
       }
 
       await this.setBotBio(bio);
       this.currentBio = bio;
-      console.log(`[DpManager] Bio updated to "${bio}" (mood: ${mood})`);
+      const msg = `Bio updated to "${bio}" (mood: ${mood})`;
+      console.log(`[DpManager] ${msg}`);
+      return msg;
     } catch (err) {
       console.error("[DpManager] Bio change failed:", err);
+      return `Bio change failed: ${(err as Error).message}`;
     }
   }
 
   /** Ask Ollama to generate a bot description and set it via setMyDescription */
-  private async maybeChangeDescription(mood: string): Promise<void> {
+  private async maybeChangeDescription(mood: string): Promise<string> {
     const hour = new Date().getHours();
     const timeOfDay = this.getTimeOfDay(hour);
 
@@ -420,8 +457,9 @@ Rules:
         await this.setBotDescription("");
         this.currentDesc = "";
         console.log("[DpManager] Description cleared");
+        return "Description cleared";
       }
-      return;
+      return "Description already empty";
     }
 
     const systemPrompt = `You are Meera — a 20-year-old Indian girl. You're updating your Telegram bot profile description (the longer "About" text that people see when they open your profile).
@@ -461,16 +499,23 @@ Rules:
       desc = desc.trim().replace(/^["']|["']$/g, "").trim();
 
       if (desc.length > 512) desc = desc.slice(0, 512);
+      if (!desc) {
+        console.log("[DpManager] Description generation produced empty string");
+        return "Description generation empty";
+      }
       if (desc.toLowerCase() === this.currentDesc.toLowerCase()) {
         console.log(`[DpManager] Description unchanged`);
-        return;
+        return `Description unchanged (mood: ${mood})`;
       }
 
       await this.setBotDescription(desc);
       this.currentDesc = desc;
-      console.log(`[DpManager] Description updated to "${desc}" (mood: ${mood})`);
+      const msg = `Description updated to "${desc}" (mood: ${mood})`;
+      console.log(`[DpManager] ${msg}`);
+      return msg;
     } catch (err) {
       console.error("[DpManager] Description change failed:", err);
+      return `Description change failed: ${(err as Error).message}`;
     }
   }
 

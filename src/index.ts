@@ -1541,9 +1541,27 @@ bot.command("changedp", async (ctx) => {
       await ctx.reply("❌ No community images available. Upload some with /uploadface first.");
       return;
     }
-    await ctx.reply("🔄 Changing DP...");
-    const result = await dpManager.changeDp();
-    await ctx.reply(`✅ ${result}`);
+    await ctx.reply("🔄 Refreshing profile (DP, name, bio, about)...");
+
+    // Run all four in parallel — based on aggregated mood/time/persona
+    const [dpRes, nameRes, bioRes, descRes] = await Promise.allSettled([
+      dpManager.changeDp(),
+      dpManager.changeName(),
+      dpManager.changeBio(),
+      dpManager.changeDescription(),
+    ]);
+
+    const fmt = (label: string, r: PromiseSettledResult<string>) =>
+      r.status === "fulfilled" ? `✅ ${label}: ${r.value}` : `❌ ${label}: ${(r.reason as Error)?.message || "failed"}`;
+
+    await ctx.reply(
+      [
+        fmt("DP", dpRes),
+        fmt("Name", nameRes),
+        fmt("Bio", bioRes),
+        fmt("About", descRes),
+      ].join("\n"),
+    );
   } catch (err: any) {
     console.error("[ChangeDp] Error:", err);
     await ctx.reply(`❌ Failed: ${err.message || "unknown error"}`);
