@@ -2938,16 +2938,57 @@ Reply with ONLY a JSON object, no markdown:
   }
 }
 
-/** Detect if the user's message is talking about a profile picture / DP. */
-function detectsDpMention(text: string): boolean {
-  if (!text) return false;
-  const t = text.toLowerCase();
-  // English / Hinglish / Bengali common forms
-  return /\b(dp|d\.p\.|pfp|profile\s*(pic|picture|photo)|display\s*pic(?:ture)?|profile\s*pic|propic)\b/i.test(t)
-    || /(tera|tomar|tomar|teri|aapka|apka|aapki|apki|tor|tomader)\s+(dp|pfp|profile|pic|photo|picture)/i.test(t)
-    || /(mera|mera|meri|amar|amader|tumhara|tumhari)\s+(dp|pfp|profile|pic|photo|picture)/i.test(t)
-    || /\bdp\s*(change|changed|update|new|cute|nice|hot|kya|kemon|kaisa|kaisi|how|looks)/i.test(t)
-    || /\b(change|changed|new)\s+(dp|pfp|profile\s*(pic|photo))/i.test(t);
+/**
+ * Use Ollama to decide if the user's message is talking about a profile picture
+ * (their DP, the bot's DP, or DPs in general). Replaces a brittle regex —
+ * catches phrasings like "tor profile pic ta kemon", "send your photo na",
+ * "kalker ta cute chilo", etc., across English/Hindi/Bengali/Hinglish.
+ *
+ * Cached briefly per-text so repeated messages don't trigger duplicate calls.
+ */
+const dpMentionCache = new Map<string, { value: boolean; ts: number }>();
+const DP_MENTION_CACHE_TTL = 60_000;
+
+async function detectsDpMention(text: string, userKeys: string[] = []): Promise<boolean> {
+  if (!text || text.trim().length < 2) return false;
+  const key = text.trim().toLowerCase().slice(0, 200);
+
+  const cached = dpMentionCache.get(key);
+  if (cached && Date.now() - cached.ts < DP_MENTION_CACHE_TTL) return cached.value;
+
+  const systemPrompt = `You are a classifier. Decide if the user's message is talking about a profile picture / DP / display picture / pfp.
+
+This includes:
+- Asking about their own DP, the bot's DP, or someone else's DP
+- Commenting on a DP ("nice dp", "cute pfp", "tor profile pic ta")
+- Mentioning a DP change ("new dp", "changed your photo", "did you update your pfp")
+- Asking the bot to send/show its own profile picture / "your pic" specifically as the displayed profile photo
+- Same in Hinglish / Bengali / Hindi (e.g. "tomar dp", "tera pfp", "profile picture", "propic", "display pic", "tor pic ta")
+
+It does NOT include:
+- General photo/selfie requests ("send me a pic", "selfie bhej") — those are about new photos, not the displayed DP
+- Random images or stickers
+
+Respond with ONLY "yes" or "no". Nothing else.`;
+
+  try {
+    const messages: OllamaMessage[] = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: text.slice(0, 500) },
+    ];
+    const raw = await ollamaChat(messages, userKeys);
+    const verdict = raw.trim().toLowerCase().startsWith("yes");
+    dpMentionCache.set(key, { value: verdict, ts: Date.now() });
+    if (dpMentionCache.size > 200) {
+      // Trim oldest to keep map bounded
+      const cutoff = Date.now() - DP_MENTION_CACHE_TTL;
+      for (const [k, v] of dpMentionCache) if (v.ts < cutoff) dpMentionCache.delete(k);
+    }
+    return verdict;
+  } catch (err) {
+    console.error("[DpDetect] Ollama failed, defaulting to false:", err);
+    return false;
+  }
 }
 
 /**
@@ -3636,7 +3677,7 @@ async function handleTextMessage(
   // Cache the user's DP description (Gemini vision) so the bot can talk about it
   // naturally. If they JUST mentioned DPs, we await a fresh refresh so the
   // context block (added below) reflects the current photo.
-  const userMentionedDp = detectsDpMention(text);
+  const userMentionedDp = await detectsDpMention(text, store.getUser(userId).ollamaKeys).catch(() => false);
   if (userMentionedDp) {
     await refreshUserDp(ctx, userId, true).catch(() => {});
   } else {

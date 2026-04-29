@@ -98,6 +98,48 @@ export class DpManager {
     this.timer = setInterval(() => this.tick().catch((e) => console.error("[DpManager] tick error:", e)), 10 * 60_000);
     // Run a tick immediately so we don't have to wait 10min for the first check
     setTimeout(() => this.tick().catch((e) => console.error("[DpManager] initial tick error:", e)), 5_000);
+    // Initialize self-DP description in the background so the bot can talk about
+    // its own profile picture from the very first message — without waiting for
+    // the first scheduled DP change.
+    this.initializeCurrentDp().catch((err) =>
+      console.error("[DpManager] initializeCurrentDp failed:", err),
+    );
+  }
+
+  /**
+   * On startup, fetch whatever profile picture the bot already has on Telegram
+   * and ask Gemini to describe it. This way the bot can naturally answer
+   * "what's your dp?" / "send me your pic" right after boot, instead of having
+   * to wait 20–90 minutes for the first scheduled DP change.
+   */
+  private async initializeCurrentDp(): Promise<void> {
+    if (!this.geminiApiKey) return;
+    try {
+      const me = await this.telegram.getMe();
+      const photos = await this.telegram.getUserProfilePhotos(me.id, 0, 1);
+      const sizes = photos?.photos?.[0];
+      if (!sizes || sizes.length === 0) {
+        console.log("[DpManager] No existing DP on startup — nothing to describe");
+        return;
+      }
+      const largest = sizes[sizes.length - 1];
+      const fileLink = await this.telegram.getFileLink(largest.file_id);
+      const response = await fetch(fileLink.href);
+      const buffer = Buffer.from(await response.arrayBuffer());
+      const desc = await analyzeImageWithGemini(
+        this.geminiApiKey,
+        buffer.toString("base64"),
+        "This is the profile picture (DP) the girl currently has set. Describe what's actually visible — her expression, pose, outfit, hair, mood, setting, vibe, lighting. 2-3 short sentences. Concise, natural.",
+      );
+      this.currentDpFileId = largest.file_id;
+      this.currentDpSetAt = Date.now();
+      if (desc) {
+        this.currentDpDescription = desc.slice(0, 500);
+        console.log(`[DpManager] Initialized self-DP description: "${this.currentDpDescription.slice(0, 80)}"`);
+      }
+    } catch (err) {
+      console.error("[DpManager] initializeCurrentDp error:", err);
+    }
   }
 
   /** Stop the scheduler */
