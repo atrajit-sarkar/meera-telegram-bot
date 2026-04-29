@@ -17,6 +17,8 @@ export interface UserData {
   chatId: number;
   stickerPacks: string[];
   proactiveSent: boolean;
+  /** Timestamp of the last proactive (bot-initiated) message sent to this user. */
+  lastProactiveSentAt?: number;
   totalMessages: number;
   ollamaKeys: string[];
   stabilityKeys: string[];    // Per-user Stability AI API keys
@@ -191,6 +193,33 @@ export class UserStore {
   /** Ensure user is loaded before access (call from handlers) */
   async ensureLoaded(userId: number): Promise<void> {
     await this.loadUser(userId);
+  }
+
+  /**
+   * Load every user document from Firestore into memory.
+   * Required for the proactive-messaging loop to see users who haven't
+   * texted since the bot was last restarted. User data only is loaded —
+   * full message history is fetched lazily per user via `loadUser`.
+   */
+  async loadAllUsers(): Promise<number> {
+    try {
+      const snap = await this.db.collection("users").get();
+      let loaded = 0;
+      for (const doc of snap.docs) {
+        const userId = Number(doc.id);
+        if (!Number.isFinite(userId)) continue;
+        if (this.loadedUsers.has(userId)) continue;
+        const user = { ...defaultUserData(), ...doc.data() } as UserData;
+        this.users.set(userId, user);
+        this.loadedUsers.add(userId);
+        loaded++;
+      }
+      console.log(`[UserStore] Bulk-loaded ${loaded} users from Firestore (proactive-ready)`);
+      return loaded;
+    } catch (err) {
+      console.error("[UserStore] loadAllUsers failed:", err);
+      return 0;
+    }
   }
 
   getUser(userId: number): UserData {

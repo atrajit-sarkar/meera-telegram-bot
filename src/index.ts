@@ -4684,17 +4684,28 @@ bot.on("message_reaction", async (ctx) => {
 
 async function proactiveLoop() {
   const now = Date.now();
+  let candidates = 0;
+  let totalSent = 0;
   for (const userId of store.allUserIds()) {
     const user = store.getUser(userId);
-    if (!user.chatId || user.proactiveSent) continue;
+    if (!user.chatId) continue;
 
     const tier = store.getComfortTier(userId);
     const threshold = INACTIVITY_THRESHOLDS[tier];
     if (!threshold) continue;
 
+    // If we already pinged this user and they haven't replied, throttle:
+    // don't re-ping until at least `threshold` has passed since the last ping.
+    // This prevents spamming but also prevents the bot from going *permanently* silent.
+    if (user.proactiveSent) {
+      const sinceLastPing = now - (user.lastProactiveSentAt || 0);
+      if (sinceLastPing < threshold) continue;
+    }
+
     const elapsed = now - user.lastInteraction;
     const mood = store.getMood(userId);
     const engagement = store.getEngagement(userId);
+    candidates++;
 
     // ── Mood + engagement adjusted thresholds ──
     // Clingy/bored mood → she reaches out sooner. Tired/annoyed → later or skips.
@@ -4742,7 +4753,8 @@ async function proactiveLoop() {
     try {
       // Feature 15: Sometimes forward own previous message instead of new one (close only)
       if (await maybeForwardOwnMessage(user.chatId, userId)) {
-        store.updateUser(userId, { proactiveSent: true });
+        store.updateUser(userId, { proactiveSent: true, lastProactiveSentAt: Date.now() });
+        totalSent++;
         console.log(`[Proactive] Forwarded own msg to user ${userId} (${tier})`);
         continue;
       }
@@ -4760,7 +4772,8 @@ async function proactiveLoop() {
 
           const sent = await sendContentToChat(fakeCtx, userId, post, "random");
           if (sent) {
-            store.updateUser(userId, { proactiveSent: true });
+            store.updateUser(userId, { proactiveSent: true, lastProactiveSentAt: Date.now() });
+            totalSent++;
 
             // Double-text after meme: 30% chance
             if (Math.random() < 0.30) {
@@ -4810,12 +4823,14 @@ async function proactiveLoop() {
         store.addMessage(userId, "assistant", followUp);
       }
 
-      store.updateUser(userId, { proactiveSent: true });
+      store.updateUser(userId, { proactiveSent: true, lastProactiveSentAt: Date.now() });
+      totalSent++;
       console.log(`[Proactive] Sent to user ${userId} (${tier}, mood=${mood}${shareContent ? ", content-share" : ""})`);
     } catch (err) {
       console.error(`[Proactive] Failed for user ${userId}:`, err);
     }
   }
+  console.log(`[Proactive] Loop done — ${candidates} candidate(s), ${totalSent} message(s) sent`);
 }
 
 // ── LAUNCH ──────────────────────────────────────────────────────────
@@ -4869,7 +4884,12 @@ bot.launch({ allowedUpdates: ["message", "callback_query", "poll_answer", "messa
   await store.loadCommunityKeys();
   await store.loadGlobalStickerPacks();
 
-  // Check for proactive messages every 5 minutes
+  // Bulk-load every known user so the proactive loop can see users who
+  // haven't messaged since the last restart.
+  await store.loadAllUsers();
+
+  // Check for proactive messages every 5 minutes — and run once shortly after startup
+  setTimeout(() => proactiveLoop().catch(console.error), 30 * 1000);
   setInterval(() => proactiveLoop().catch(console.error), 5 * 60 * 1000);
 
   // Start auto-DP manager (changes bot profile photo like a real girl)
