@@ -163,6 +163,14 @@ export class UserStore {
 
     const app = initializeApp({ credential: cert(creds) });
     this.db = getFirestore(app, databaseId || "(default)");
+    // Allow `undefined` field values in payloads — we set fields to `undefined`
+    // to "clear" them (e.g. when a user removes their profile photo). Without
+    // this, Firestore rejects the entire document write.
+    try {
+      this.db.settings({ ignoreUndefinedProperties: true });
+    } catch (err) {
+      // settings() can only be called once and throws if already initialized — safe to ignore.
+    }
 
     // Flush dirty users to Firestore every 10 seconds
     this.saveTimer = setInterval(() => this.flushAll(), 10_000);
