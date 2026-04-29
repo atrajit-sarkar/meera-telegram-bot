@@ -28,6 +28,7 @@ import {
   shortlistMeeraImages,
   selectMeeraVideo,
   decideMeeraBehavior,
+  TELEGRAM_REACTION_EMOJIS,
   type OllamaConfig,
   type OllamaMessage,
   type MeeraBehavior,
@@ -96,6 +97,7 @@ const dpManager = new DpManager({
   meeraImages,
   ollamaConfig,
   getCommunityKeys: () => store.getCommunityKeyStrings(),
+  geminiApiKey: GEMINI_API_KEY,
 });
 
 // Gemini Live sessions — for image/audio/video (uses per-user persona)
@@ -986,6 +988,40 @@ async function sendText(ctx: Context, text: string, replyToMsgId?: number, extra
     }
   }
   return lastSent;
+}
+
+// Set of valid Telegram reaction emojis for fast lookup.
+const VALID_REACTION_SET = new Set(TELEGRAM_REACTION_EMOJIS);
+
+/**
+ * Apply the AI-suggested emoji as an actual Telegram message reaction
+ * (NOT as a text reply). Falls back silently if the emoji isn't in the
+ * Telegram-allowed reaction set, or if reactions are disabled in this chat.
+ *
+ * Returns true if a reaction was set, false otherwise.
+ */
+async function applyAiReaction(ctx: Context, rawEmoji: string): Promise<boolean> {
+  if (!rawEmoji) return false;
+  // Strip ZWJ/variation-selector noise so e.g. "🤷‍♀️" matches "🤷‍♀".
+  const trimmed = rawEmoji.trim().replace(/\uFE0F/g, "");
+  // Telegram only accepts a fixed reaction set — try the exact emoji, then a
+  // variation-selector-stripped version, then bail out (do NOT send as text).
+  const candidate = VALID_REACTION_SET.has(rawEmoji)
+    ? rawEmoji
+    : VALID_REACTION_SET.has(trimmed)
+      ? trimmed
+      : null;
+  if (!candidate) return false;
+  try {
+    await (ctx as any).telegram.setMessageReaction(
+      ctx.chat!.id,
+      (ctx.message as any).message_id,
+      [{ type: "emoji", emoji: candidate }],
+    );
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Try to set a reaction emoji on the user's message */
@@ -2697,45 +2733,262 @@ function shouldProtectContent(tier: string): boolean {
   return Math.random() < 0.12;
 }
 
-// Feature 13: Detect user DP changes
-const userProfilePhotoCounts = new Map<number, number>();
+// Feature 13: Detect user DP changes (file_unique_id-based, with Gemini vision).
+// Cached so we don't hit the Telegram API on every message.
 
-async function maybeNoticeProfileChange(
+const DP_CHECK_INTERVAL_MS = 30 * 60 * 1000;     // Re-check DP at most every 30 min per user
+const DP_NOTICE_COOLDOWN_MS = 6 * 60 * 60 * 1000; // Don't comment on DP changes more than once / 6h
+
+interface UserDpSnapshot {
+  fileUniqueId?: string;
+  fileId?: string;
+  description?: string;
+  hasDp: boolean;
+}
+
+/**
+ * Refresh the cached info we have on this user's profile photo.
+ * - Compares file_unique_id to detect changes
+ * - If changed (or first-seen), runs Gemini vision to "see" what the new DP looks like
+ * Returns details about what (if anything) changed.
+ *
+ * `force=true` skips the throttle check (used when the user mentions DPs explicitly).
+ */
+async function refreshUserDp(
   ctx: Context,
-  userId: number
-): Promise<void> {
-  const tier = store.getComfortTier(userId);
-  if (tier === "stranger") return;
-  if (Math.random() > 0.10) return; // Only check 10% of the time
+  userId: number,
+  force = false,
+): Promise<{ snapshot: UserDpSnapshot; changed: boolean; isFirstSeen: boolean }> {
+  const user = store.getUser(userId);
+  const now = Date.now();
+  const lastChecked = user.dpUpdatedAt || 0;
+  const stale = now - lastChecked > DP_CHECK_INTERVAL_MS;
+
+  // Throttle: return cached info unless forced or stale.
+  if (!force && !stale) {
+    return {
+      snapshot: {
+        fileUniqueId: user.dpFileUniqueId,
+        fileId: user.dpFileId,
+        description: user.dpDescription,
+        hasDp: !!user.dpFileUniqueId,
+      },
+      changed: false,
+      isFirstSeen: false,
+    };
+  }
 
   try {
     const photos = await (ctx as any).telegram.getUserProfilePhotos(userId, 0, 1);
-    const currentCount = photos.total_count;
-    const previousCount = userProfilePhotoCounts.get(userId);
-    userProfilePhotoCounts.set(userId, currentCount);
+    const photoSizes = photos?.photos?.[0];
 
-    if (previousCount === undefined) return;
-    if (currentCount <= previousCount) return;
-    if (Math.random() > 0.70) return; // 70% chance to comment
+    // No DP set
+    if (!photoSizes || photoSizes.length === 0) {
+      const hadDp = !!user.dpFileUniqueId;
+      store.updateUser(userId, {
+        dpFileUniqueId: undefined,
+        dpFileId: undefined,
+        dpDescription: undefined,
+        dpUpdatedAt: now,
+        dpChangedAt: hadDp ? now : user.dpChangedAt,
+        dpChangePending: hadDp ? true : user.dpChangePending,
+      });
+      return {
+        snapshot: { hasDp: false },
+        changed: hadDp,
+        isFirstSeen: false,
+      };
+    }
 
-    const user = store.getUser(userId);
-    const mood = store.getMood(userId);
-    const history = store.getRecentHistory(userId);
-    const gender = parseGenderFromPersona(user.customPersona);
+    // Largest size of the most-recent photo
+    const largest = photoSizes[photoSizes.length - 1];
+    const newUniqueId: string = largest.file_unique_id;
+    const newFileId: string = largest.file_id;
 
-    const dpPrompt = `You just noticed your friend changed their Telegram profile picture/DP. Comment on it naturally like a real ${gender === "girl" ? "girl" : "person"} would. Keep it SHORT (1 line, max 15 words). Examples: "wait did you change your dp?? 👀", "new dp who dis", "ooh someone changed their profile pic 😏", "cute dp btw". Match the chat language.`;
-    const dpMessages: OllamaMessage[] = [
-      { role: "system", content: user.customPersona || `You are ${getBotName()}.` },
-      { role: "user", content: dpPrompt },
+    const isFirstSeen = !user.dpFileUniqueId;
+    const changed = !isFirstSeen && user.dpFileUniqueId !== newUniqueId;
+
+    // Same DP as before — just refresh the timestamp.
+    if (!changed && !isFirstSeen) {
+      store.updateUser(userId, { dpUpdatedAt: now });
+      return {
+        snapshot: {
+          fileUniqueId: user.dpFileUniqueId,
+          fileId: user.dpFileId,
+          description: user.dpDescription,
+          hasDp: true,
+        },
+        changed: false,
+        isFirstSeen: false,
+      };
+    }
+
+    // New or changed DP — try to analyze it with Gemini so the bot actually "sees" it.
+    let description: string | undefined;
+    try {
+      const buffer = await downloadFileBuffer(newFileId);
+      const analysis = await analyzeImageWithGemini(
+        GEMINI_API_KEY!,
+        buffer.toString("base64"),
+        "This is someone's Telegram profile picture (DP). Describe what's actually visible — the person, their expression/pose, outfit, setting, mood, vibe — concisely in 2-3 sentences. If it's not a person (e.g. a meme, aesthetic photo, anime, scenery, pet), describe that instead. Keep it natural and short.",
+      );
+      if (analysis) description = analysis.slice(0, 500);
+    } catch (err) {
+      console.error(`[DpNotice] Failed to analyze user ${userId} DP:`, err);
+    }
+
+    store.updateUser(userId, {
+      dpFileUniqueId: newUniqueId,
+      dpFileId: newFileId,
+      dpDescription: description,
+      dpUpdatedAt: now,
+      dpChangedAt: changed ? now : user.dpChangedAt,
+      dpChangePending: changed ? true : user.dpChangePending,
+    });
+
+    if (changed) {
+      console.log(`[DpNotice] User ${userId} changed DP. Description: "${(description || "n/a").slice(0, 80)}"`);
+    } else if (isFirstSeen) {
+      console.log(`[DpNotice] First-time DP seen for user ${userId}. Description: "${(description || "n/a").slice(0, 80)}"`);
+    }
+
+    return {
+      snapshot: { fileUniqueId: newUniqueId, fileId: newFileId, description, hasDp: true },
+      changed,
+      isFirstSeen,
+    };
+  } catch (err) {
+    // Privacy settings or transient API failures — silently keep the cache.
+    return {
+      snapshot: {
+        fileUniqueId: user.dpFileUniqueId,
+        fileId: user.dpFileId,
+        description: user.dpDescription,
+        hasDp: !!user.dpFileUniqueId,
+      },
+      changed: false,
+      isFirstSeen: false,
+    };
+  }
+}
+
+/**
+ * If the user just changed their DP, let Ollama decide whether to drop a casual
+ * "wait did you change your dp??" reaction — like a real girl would notice.
+ * Runs as a fire-and-forget background job after the main reply.
+ */
+async function maybeReactToUserDpChange(ctx: Context, userId: number): Promise<void> {
+  const tier = store.getComfortTier(userId);
+  if (tier === "stranger") return;
+
+  const { changed, isFirstSeen, snapshot } = await refreshUserDp(ctx, userId, false);
+
+  // Don't react on the first time we ever see their DP (we have no "before" to compare).
+  if (!changed || isFirstSeen) return;
+
+  const user = store.getUser(userId);
+  const now = Date.now();
+  if (user.dpNoticedAt && now - user.dpNoticedAt < DP_NOTICE_COOLDOWN_MS) return;
+
+  // AI decides: should she even comment? + what to say.
+  const mood = store.getMood(userId);
+  const personaHint = user.customPersona?.slice(0, 500) || `You are ${getBotName()}.`;
+  const dpDesc = snapshot.description || "(couldn't quite see it clearly)";
+
+  const decisionPrompt = `Your friend just changed their Telegram profile picture (DP). You noticed.
+
+Here's what their new DP looks like: ${dpDesc}
+
+Your relationship: ${tier}
+Your mood: ${mood}
+
+Decide: would a real girl with your vibe ACTUALLY comment on this DP change right now? Real girls don't always comment — sometimes they notice silently, sometimes they bring it up later, sometimes they tease about it.
+
+Reply with ONLY a JSON object, no markdown:
+{
+  "comment": <true|false>,
+  "message": "<the actual text to send if comment=true, like 'wait new dp 👀' or 'cute dp btw' or 'ooh someone changed their dp' — keep SHORT, max 15 words, casual, match the chat language. If comment=false, leave empty>"
+}`;
+
+  try {
+    const decisionMessages: OllamaMessage[] = [
+      { role: "system", content: personaHint },
+      { role: "user", content: decisionPrompt },
     ];
-    let comment = await ollamaChat(dpMessages, user.ollamaKeys);
-    comment = comment.replace(/^["']|["']$/g, "").trim();
+    const raw = await ollamaChat(decisionMessages, user.ollamaKeys);
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return;
+    const parsed = JSON.parse(jsonMatch[0]);
+    if (!parsed.comment || typeof parsed.message !== "string" || !parsed.message.trim()) {
+      // She decided to stay quiet — but mark it noticed so she doesn't second-guess later.
+      store.updateUser(userId, { dpNoticedAt: now, dpChangePending: false });
+      return;
+    }
+    const message = String(parsed.message).slice(0, 200).trim();
 
-    await new Promise(r => setTimeout(r, 3000 + Math.random() * 5000));
-    await (ctx as any).telegram.sendMessage(ctx.chat!.id, comment.slice(0, 200));
-    store.addMessage(userId, "assistant", comment.slice(0, 200));
-    console.log(`[DPNotice] Noticed DP change for user ${userId}`);
-  } catch {}
+    // Wait a natural beat before commenting (3-12s)
+    await new Promise((r) => setTimeout(r, 3000 + Math.random() * 9000));
+
+    await (ctx as any).telegram.sendMessage(ctx.chat!.id, message);
+    store.addMessage(userId, "assistant", message);
+    store.updateUser(userId, { dpNoticedAt: now, dpChangePending: false });
+    console.log(`[DpNotice] Reacted to user ${userId} DP change: "${message}"`);
+  } catch (err) {
+    console.error(`[DpNotice] AI decision failed for user ${userId}:`, err);
+  }
+}
+
+/** Detect if the user's message is talking about a profile picture / DP. */
+function detectsDpMention(text: string): boolean {
+  if (!text) return false;
+  const t = text.toLowerCase();
+  // English / Hinglish / Bengali common forms
+  return /\b(dp|d\.p\.|pfp|profile\s*(pic|picture|photo)|display\s*pic(?:ture)?|profile\s*pic|propic)\b/i.test(t)
+    || /(tera|tomar|tomar|teri|aapka|apka|aapki|apki|tor|tomader)\s+(dp|pfp|profile|pic|photo|picture)/i.test(t)
+    || /(mera|mera|meri|amar|amader|tumhara|tumhari)\s+(dp|pfp|profile|pic|photo|picture)/i.test(t)
+    || /\bdp\s*(change|changed|update|new|cute|nice|hot|kya|kemon|kaisa|kaisi|how|looks)/i.test(t)
+    || /\b(change|changed|new)\s+(dp|pfp|profile\s*(pic|photo))/i.test(t);
+}
+
+/**
+ * Build a context hint about both DPs to inject into the prompt when relevant.
+ * Returns "" if there's nothing useful to add.
+ */
+function buildDpContextHint(userId: number, opts?: { force?: boolean }): string {
+  const user = store.getUser(userId);
+  const myDp = dpManager.getCurrentDp();
+
+  const lines: string[] = [];
+
+  const hasOwnInfo = !!(myDp.description || myDp.caption);
+  const hasUserInfo = !!user.dpDescription;
+
+  if (!opts?.force && !hasOwnInfo && !hasUserInfo) return "";
+
+  lines.push("(DP CONTEXT — you naturally know this without being told:");
+
+  if (hasOwnInfo) {
+    const ownDesc = myDp.description || myDp.caption || "";
+    lines.push(`- YOUR OWN current profile picture (DP) right now: ${ownDesc}`);
+  } else {
+    lines.push("- You don't currently have a profile picture set, or you can't quite picture it.");
+  }
+
+  if (hasUserInfo) {
+    const userChanged = user.dpChangePending || (user.dpChangedAt && Date.now() - user.dpChangedAt < 24 * 3600 * 1000);
+    lines.push(
+      `- THEIR current DP: ${user.dpDescription}` +
+        (userChanged ? " (they recently changed it — feel free to acknowledge naturally if relevant)" : "")
+    );
+  } else {
+    lines.push("- You haven't seen their profile picture (they might not have one set, or it's hidden).");
+  }
+
+  lines.push(
+    "Refer to either DP naturally if the conversation calls for it — like a real girl who can see profile pics. Don't force it; just be aware.)"
+  );
+
+  return "\n\n" + lines.join("\n");
 }
 
 // Feature 14: Send video note (circle video) from community videos
@@ -3379,8 +3632,35 @@ async function handleTextMessage(
   const tier = store.getComfortTier(userId);
   const mood = store.getMood(userId);
 
-  // ── Feature 13: notice profile photo changes (async, non-blocking)
-  maybeNoticeProfileChange(ctx, userId).catch(() => {});
+  // ── Feature 13: notice profile photo changes.
+  // Cache the user's DP description (Gemini vision) so the bot can talk about it
+  // naturally. If they JUST mentioned DPs, we await a fresh refresh so the
+  // context block (added below) reflects the current photo.
+  const userMentionedDp = detectsDpMention(text);
+  if (userMentionedDp) {
+    await refreshUserDp(ctx, userId, true).catch(() => {});
+  } else {
+    refreshUserDp(ctx, userId, false).catch(() => {});
+  }
+  const dpChangePending = !!store.getUser(userId).dpChangePending;
+  const dpHint = userMentionedDp || dpChangePending
+    ? buildDpContextHint(userId)
+    : "";
+  // If the hint was used because of a recent change, consider the change
+  // "addressed" so we don't keep injecting it on every following message.
+  if (dpHint && dpChangePending) {
+    store.updateUser(userId, { dpChangePending: false, dpNoticedAt: Date.now() });
+  }
+
+  // If user didn't bring up DPs themselves, separately decide (in the background,
+  // after the main reply lands) whether to drop a "wait did you change your dp"
+  // comment. When they DID bring it up, the dpHint above already handles it
+  // inside the main reply, so we don't double-comment.
+  if (!userMentionedDp) {
+    setTimeout(() => {
+      maybeReactToUserDpChange(ctx, userId).catch(() => {});
+    }, 12000 + Math.random() * 12000);
+  }
 
   // ── Reply context: what message is the user replying to?
   let replyContext = getReplyContext(ctx, userId);
@@ -3454,7 +3734,8 @@ async function handleTextMessage(
 
   // React to message (use AI's emoji suggestion if provided)
   if (behavior.reactEmoji) {
-    try { await ctx.reply(behavior.reactEmoji); } catch {}
+    const ok = await applyAiReaction(ctx, behavior.reactEmoji);
+    if (!ok) maybeReact(ctx, userId, text).catch(() => {});
   } else {
     maybeReact(ctx, userId, text).catch(() => {});
   }
@@ -3618,7 +3899,7 @@ async function handleTextMessage(
       sessions.resetSession(userId);
       const session = await sessions.getSession(userId);
       const response = await session.send([{
-        text: replyContext + (vibeContext ? vibeContext + "\n\n" : "") + (gapContext ? gapContext + "\n\n" : "") + batchHint + lengthHint + contentHint + selfieHint + text
+        text: replyContext + (vibeContext ? vibeContext + "\n\n" : "") + (gapContext ? gapContext + "\n\n" : "") + dpHint + batchHint + lengthHint + contentHint + selfieHint + text
       }]);
 
       stopTyping();
@@ -3632,6 +3913,7 @@ async function handleTextMessage(
         const userMsg = replyContext
           + (vibeContext ? vibeContext + "\n\n" : "")
           + (gapContext ? gapContext + "\n\n" : "")
+          + dpHint
           + batchHint + lengthHint + styleHints + emojiHint
           + "\n\n" + text;
         const messages = buildOllamaMessages(userMsg, history, tier, user, mood);
@@ -3713,6 +3995,7 @@ async function handleTextMessage(
       const userMsg = replyContext
         + (vibeContext ? vibeContext + "\n\n" : "")
         + (gapContext ? gapContext + "\n\n" : "")
+        + dpHint
         + batchHint
         + lengthHint
         + styleHints
@@ -3808,6 +4091,7 @@ async function handleTextMessage(
             replyContext
               + (vibeContext ? vibeContext + "\n\n" : "")
               + (gapContext ? gapContext + "\n\n" : "")
+              + dpHint
               + batchHint + lengthHint + styleHints + emojiHint
               + "\n\n" + text,
             store.getRecentHistory(userId), tier, store.getUser(userId), mood
@@ -4005,7 +4289,8 @@ async function handleMediaMessage(
 
   // React to media message
   if (mediaBehavior.reactEmoji) {
-    try { await ctx.reply(mediaBehavior.reactEmoji); } catch {}
+    const ok = await applyAiReaction(ctx, mediaBehavior.reactEmoji);
+    if (!ok) maybeReact(ctx, userId, "[sent media]").catch(() => {});
   } else {
     maybeReact(ctx, userId, "[sent media]").catch(() => {});
   }

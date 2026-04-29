@@ -42,6 +42,22 @@ export interface UserData {
   engagementScore?: number;
   /** Last time engagement was recalculated */
   lastEngagementUpdate?: number;
+
+  // ── User profile-photo (DP) tracking ──
+  /** Telegram file_unique_id of the user's current DP — used to detect changes */
+  dpFileUniqueId?: string;
+  /** Telegram file_id of the user's current DP — used to download & analyze */
+  dpFileId?: string;
+  /** Gemini-generated natural description of the user's current DP */
+  dpDescription?: string;
+  /** When the bot last fetched/analyzed this user's DP */
+  dpUpdatedAt?: number;
+  /** When the bot last detected the user changed their DP */
+  dpChangedAt?: number;
+  /** When the bot last commented on a DP change (so it doesn't spam) */
+  dpNoticedAt?: number;
+  /** True if a DP change was detected but the bot hasn't reacted to it yet */
+  dpChangePending?: boolean;
 }
 
 export const MOODS = ["happy", "bored", "clingy", "sassy", "tired", "excited", "chill", "annoyed"] as const;

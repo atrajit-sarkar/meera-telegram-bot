@@ -11,6 +11,7 @@ import type { MeeraImageStore } from "./meera-image-store.js";
 import type { OllamaConfig, OllamaMessage } from "./ollama-service.js";
 import { callOllamaWithRotation } from "./ollama-service.js";
 import { MOODS } from "./user-store.js";
+import { analyzeImageWithGemini } from "./gemini-session.js";
 
 interface DpManagerOptions {
   telegram: Telegram;
@@ -19,6 +20,16 @@ interface DpManagerOptions {
   meeraImages: MeeraImageStore;
   ollamaConfig: OllamaConfig;
   getCommunityKeys: () => string[];
+  /** Gemini API key — used for vision analysis of the bot's own DP */
+  geminiApiKey?: string;
+}
+
+/** Public read-only view of the bot's current DP. */
+export interface CurrentDpInfo {
+  fileId?: string;
+  caption?: string;        // The community-image caption (what the contributor wrote)
+  description?: string;    // Gemini-vision natural description (what's actually visible)
+  setAt?: number;
 }
 
 export class DpManager {
@@ -28,11 +39,18 @@ export class DpManager {
   private meeraImages: MeeraImageStore;
   private ollamaConfig: OllamaConfig;
   private getCommunityKeys: () => string[];
+  private geminiApiKey?: string;
 
   private timer: ReturnType<typeof setInterval> | null = null;
   private lastDpChange = 0;
   private nextChangeDelay = 0;
   private currentImageId: string | null = null; // track which image is currently set
+
+  // Public-facing info about the current DP — what the bot "sees" when it looks at its own profile pic.
+  private currentDpFileId: string | null = null;
+  private currentDpCaption = "";
+  private currentDpDescription = "";   // Gemini-vision natural description
+  private currentDpSetAt = 0;
 
   // Name/bio/description change tracking (separate timers — real girls don't change everything at once)
   private lastNameChange = 0;
@@ -52,6 +70,7 @@ export class DpManager {
     this.meeraImages = opts.meeraImages;
     this.ollamaConfig = opts.ollamaConfig;
     this.getCommunityKeys = opts.getCommunityKeys;
+    this.geminiApiKey = opts.geminiApiKey;
 
     // First change: random 20–90 min after startup (a bit sooner so it actually fires)
     this.nextChangeDelay = this.randomDelay(20 * 60_000, 90 * 60_000);
@@ -190,9 +209,38 @@ export class DpManager {
     // Set as bot's profile photo via raw API call
     await this.setProfilePhoto(buffer);
     this.currentImageId = image.id;
+    this.currentDpFileId = image.fileId;
+    this.currentDpCaption = image.caption || "";
+    this.currentDpSetAt = Date.now();
+
+    // Ask Gemini to actually "see" the new DP so the bot can talk about it later.
+    this.currentDpDescription = "";
+    if (this.geminiApiKey) {
+      try {
+        const desc = await analyzeImageWithGemini(
+          this.geminiApiKey,
+          buffer.toString("base64"),
+          "This is the profile picture (DP) the girl just put up. Describe what's actually visible — her expression, pose, outfit, hair, mood, setting, vibe, lighting. Keep it to 2-3 short sentences. Talk like you're describing yourself in a photo, but in third person and concise.",
+        );
+        if (desc) this.currentDpDescription = desc.slice(0, 500);
+      } catch (err) {
+        console.error("[DpManager] Gemini DP analysis failed:", err);
+      }
+    }
+
     const msg = `DP updated! Mood: ${averageMood}, Image: "${image.caption.slice(0, 60)}"`;
     console.log(`[DpManager] ${msg}`);
     return msg;
+  }
+
+  /** What the bot "sees" when it looks at its own profile photo right now. */
+  getCurrentDp(): CurrentDpInfo {
+    return {
+      fileId: this.currentDpFileId ?? undefined,
+      caption: this.currentDpCaption || undefined,
+      description: this.currentDpDescription || undefined,
+      setAt: this.currentDpSetAt || undefined,
+    };
   }
 
   /** Aggregate moods from all loaded users, return the most common one */
