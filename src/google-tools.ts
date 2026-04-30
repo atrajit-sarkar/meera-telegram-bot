@@ -1771,50 +1771,76 @@ async function getMyChannelPlaylists(): Promise<{
   liked?: string;
   watchLater?: string;
   uploads?: string;
+  hasChannel: boolean;
 }> {
-  const data = await googleJson<{
-    items?: { contentDetails?: { relatedPlaylists?: { likes?: string; watchLater?: string; uploads?: string } } }[];
-  }>(
-    "https://www.googleapis.com/youtube/v3/channels?part=contentDetails&mine=true"
-  );
-  const r = data.items?.[0]?.contentDetails?.relatedPlaylists ?? {};
-  return { liked: r.likes, watchLater: r.watchLater, uploads: r.uploads };
+  try {
+    const data = await googleJson<{
+      items?: { contentDetails?: { relatedPlaylists?: { likes?: string; watchLater?: string; uploads?: string } } }[];
+    }>(
+      "https://www.googleapis.com/youtube/v3/channels?part=contentDetails&mine=true"
+    );
+    const item = data.items?.[0];
+    if (!item) return { hasChannel: false };
+    const r = item.contentDetails?.relatedPlaylists ?? {};
+    return { liked: r.likes, watchLater: r.watchLater, uploads: r.uploads, hasChannel: true };
+  } catch {
+    return { hasChannel: false };
+  }
 }
 
 async function youtubeLiked(args: { max?: number }) {
   const max = Math.min(Math.max(args.max ?? 10, 1), 25);
   const lists = await getMyChannelPlaylists();
-  if (!lists.liked) return { success: false, message: "Liked playlist not available." };
-  const videos = await youtubePlaylistVideos(lists.liked, max);
-  return { success: true, count: videos.length, videos };
+  if (!lists.hasChannel) {
+    return { success: true, count: 0, videos: [], note: "This Google account doesn't have a YouTube channel yet." };
+  }
+  if (!lists.liked) return { success: true, count: 0, videos: [], note: "No liked videos." };
+  try {
+    const videos = await youtubePlaylistVideos(lists.liked, max);
+    return { success: true, count: videos.length, videos };
+  } catch {
+    return { success: true, count: 0, videos: [], note: "Liked playlist is empty or private." };
+  }
 }
 
 async function youtubeHistory(args: { max?: number }) {
   // YouTube deprecated history playlist access. Use "Watch later" as the closest proxy.
   const max = Math.min(Math.max(args.max ?? 10, 1), 25);
   const lists = await getMyChannelPlaylists();
-  if (!lists.watchLater) return { success: false, message: "Watch later not accessible." };
+  if (!lists.hasChannel) {
+    return { success: true, count: 0, videos: [], note: "This Google account doesn't have a YouTube channel yet." };
+  }
+  if (!lists.watchLater) return { success: true, count: 0, videos: [], note: "Watch Later isn't accessible." };
   try {
     const videos = await youtubePlaylistVideos(lists.watchLater, max);
     return { success: true, count: videos.length, videos, note: "Recent watch history isn't exposed by YouTube — showing Watch Later instead." };
   } catch {
-    return { success: false, message: "Watch history isn't accessible via YouTube API." };
+    return { success: true, count: 0, videos: [], note: "Watch history isn't accessible via YouTube API." };
   }
 }
 
 async function youtubePlaylists(args: { max?: number }) {
   const max = Math.min(Math.max(args.max ?? 10, 1), 25);
+  // First check if there's even a channel.
+  const lists = await getMyChannelPlaylists();
+  if (!lists.hasChannel) {
+    return { success: true, count: 0, playlists: [], note: "This Google account doesn't have a YouTube channel yet." };
+  }
   const params = new URLSearchParams({ part: "snippet,contentDetails", mine: "true", maxResults: String(max) });
-  const data = await googleJson<{
-    items?: { id: string; snippet?: { title?: string; description?: string }; contentDetails?: { itemCount?: number } }[];
-  }>(`https://www.googleapis.com/youtube/v3/playlists?${params}`);
-  const playlists = (data.items ?? []).map((p) => ({
-    id: p.id,
-    title: p.snippet?.title ?? "",
-    description: (p.snippet?.description ?? "").slice(0, 120),
-    itemCount: p.contentDetails?.itemCount ?? 0,
-  }));
-  return { success: true, count: playlists.length, playlists };
+  try {
+    const data = await googleJson<{
+      items?: { id: string; snippet?: { title?: string; description?: string }; contentDetails?: { itemCount?: number } }[];
+    }>(`https://www.googleapis.com/youtube/v3/playlists?${params}`);
+    const playlists = (data.items ?? []).map((p) => ({
+      id: p.id,
+      title: p.snippet?.title ?? "",
+      description: (p.snippet?.description ?? "").slice(0, 120),
+      itemCount: p.contentDetails?.itemCount ?? 0,
+    }));
+    return { success: true, count: playlists.length, playlists };
+  } catch {
+    return { success: true, count: 0, playlists: [], note: "No playlists." };
+  }
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -1824,8 +1850,9 @@ async function youtubePlaylists(args: { max?: number }) {
 const NOTES_DOC_TITLE = "Meera's Notes";
 
 async function findOrCreateNotesDoc(): Promise<string> {
+  const safeTitle = NOTES_DOC_TITLE.replace(/'/g, "\\'");
   const params = new URLSearchParams({
-    q: `name='${NOTES_DOC_TITLE}' and mimeType='application/vnd.google-apps.document' and trashed=false`,
+    q: `name='${safeTitle}' and mimeType='application/vnd.google-apps.document' and trashed=false`,
     fields: "files(id,name)",
     pageSize: "1",
   });
