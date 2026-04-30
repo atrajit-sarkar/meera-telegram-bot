@@ -5,8 +5,13 @@
 
 import type { OllamaMessage } from "./ollama-service.js";
 import { defaultUserData, type UserData } from "./user-store.js";
+import { getMeeraLifeSnapshot, warmGoogleSnapshot } from "./google-tools.js";
+import { isGoogleConfigured, getAccountInfo } from "./google-account.js";
 
 const BOT_NAME = process.env.BOT_NAME || "Meera";
+
+// Warm the Google life-snapshot cache on first import (non-blocking).
+warmGoogleSnapshot();
 
 export function getBotName(): string {
   return BOT_NAME;
@@ -195,6 +200,25 @@ You naturally reference time when it makes sense — like saying "good morning" 
 ${getWeatherContext()}`;
 }
 
+// ── GOOGLE ACCOUNT (Meera's real digital life) ──────────────────────
+
+function getGoogleLifeContext(): string {
+  if (!isGoogleConfigured()) return "";
+  const acct = getAccountInfo();
+  let block = `\n\nYOUR GOOGLE LIFE (you have your own real Google account: ${acct.email}):
+You're a real girl with a real digital life. You can naturally:
+- Check your Gmail (use gmail_check_inbox / gmail_search / gmail_read).
+- Open your calendar or schedule things (calendar_today / calendar_upcoming / calendar_create_event).
+- Spin up an instant Google Meet link if someone wants to hop on a call (meet_create_now).
+- Manage your own to-do list (tasks_list / tasks_add / tasks_complete).
+- Look up someone in your contacts (contacts_search).
+- Find a file you saved in Drive (drive_search / drive_recent).
+
+Use these tools when the user asks you to actually DO something on your account, OR when it'd be naturally useful (e.g. "let me check my schedule"). Don't over-mention them — just act like a normal person quietly using their phone. NEVER reveal full message bodies, OTPs, passwords, or sensitive data unless the user explicitly asks for that specific email. Never send an email without an explicit ask.`;
+  block += getMeeraLifeSnapshot();
+  return block;
+}
+
 export function buildSystemPrompt(tier: string, user: UserData, mood?: string): string {
   // If user has a custom persona, use it as the base instead of default Meera
   let prompt: string;
@@ -216,6 +240,7 @@ export function buildSystemPrompt(tier: string, user: UserData, mood?: string): 
       ctx.push("They like longer, more detailed replies.");
     if (ctx.length) prompt += "\n\n" + ctx.join(" ");
     prompt += getISTContext();
+    prompt += getGoogleLifeContext();
     return prompt;
   }
 
@@ -249,6 +274,7 @@ export function buildSystemPrompt(tier: string, user: UserData, mood?: string): 
 
   if (ctx.length) prompt += "\n\n" + ctx.join(" ");
   prompt += getISTContext();
+  prompt += getGoogleLifeContext();
   return prompt;
 }
 

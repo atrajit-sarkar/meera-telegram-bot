@@ -2,3 +2,5 @@ node_modules
 dist
 .env
 *.log
+
+client_secret*.json

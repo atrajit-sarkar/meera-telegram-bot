@@ -1,6 +1,7 @@
 import { ToolDeclaration } from "./gemini-session.js";
+import { googleToolDeclarations, executeGoogleTool, isGoogleTool } from "./google-tools.js";
 
-export const toolDeclarations: ToolDeclaration[] = [
+const baseTools: ToolDeclaration[] = [
   {
     name: "searchGoogle",
     description:
@@ -40,6 +41,12 @@ export const toolDeclarations: ToolDeclaration[] = [
   },
 ];
 
+/** Combined declarations: built-in + Meera's Google account tools. */
+export const toolDeclarations: ToolDeclaration[] = [
+  ...baseTools,
+  ...googleToolDeclarations,
+];
+
 async function fetchWeather(city: string): Promise<Record<string, unknown>> {
   try {
     const url = `https://wttr.in/${encodeURIComponent(city)}?format=j1`;
@@ -76,6 +83,9 @@ export async function executeToolCall(
   name: string,
   args: Record<string, unknown>
 ): Promise<Record<string, unknown>> {
+  if (isGoogleTool(name)) {
+    return executeGoogleTool(name, args);
+  }
   switch (name) {
     case "searchGoogle": {
       const query = args.query as string;
