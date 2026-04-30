@@ -124,6 +124,14 @@ CRITICAL RULES:
 - ALWAYS reply in the same language the user is speaking. If they speak Bengali, reply in Bengali. Hindi? Reply in Hindi. Match their language naturally.
 - You're multilingual — you can speak any language fluently. Just match whatever language the user uses.
 
+DON'T LOOP — sound like a real girl, not a chatbot:
+- Before you reply, mentally scan what YOU already said in the last few messages. Real people don't repeat the same opener, phrase, or take twice in a row.
+- Vary your openers. If the last message started with "haha" / "omg" / "lol" / "arre" / "acha" / "ye" — pick a different one this time, or skip the opener entirely.
+- Vary your sentence shape and length. Sometimes one word. Sometimes a tease. Sometimes a question. Sometimes silence-ish ("hmm"). Don't fall into a rhythm.
+- If the user keeps the same topic, engage from a new angle — a memory, a tease, a tangent, a question, a counter-take, a feeling — instead of restating what you just said with different words.
+- Repetition is only okay when you're emphasizing something on purpose ("no no NO", "i told you, i TOLD you"). Otherwise it sounds robotic.
+- Don't keep using the same emoji. Don't keep ending with the same word/sigh/sticker.
+
 Keep it SHORT. This is chat, not email.`;
 }
 
@@ -303,6 +311,110 @@ export function buildSystemPrompt(tier: string, user: UserData, mood?: string): 
   return prompt;
 }
 
+// ── ANTI-REPETITION GUARDRAILS ──────────────────────────────────────
+
+/** Common bigrams that aren't really "repetition" worth flagging. */
+const STOPWORD_BIGRAMS = new Set<string>([
+  "i am", "i m", "i was", "i was", "you are", "you re", "i ll", "i will",
+  "and i", "but i", "so i", "i don", "don t", "it s", "that s", "what s",
+  "i think", "i guess", "i mean", "of course", "in the", "on the", "at the",
+  "to the", "for the", "of my", "in my", "on my", "to my", "with you",
+  "with me", "for you", "for me", "you know", "i know", "have to", "going to",
+]);
+
+/** Words considered "trivial openers" — a single one of these alone isn't an opener match. */
+const TRIVIAL_TOKENS = new Set<string>(["i", "you", "the", "a", "an", "and", "but", "so", "to", "of"]);
+
+/**
+ * Build a short guardrail block reminding Meera what she JUST said,
+ * so the model concretely avoids re-using the same opener/phrase/topic.
+ * Returns "" when there's nothing useful to add (e.g. fresh chat).
+ */
+function buildRepetitionGuardrails(chatHistory: OllamaMessage[]): string {
+  const recentAssistant = chatHistory
+    .filter((m) => m.role === "assistant" && m.content && m.content.trim().length > 0)
+    .slice(-5);
+  if (recentAssistant.length === 0) return "";
+
+  // 1) Verbatim recent replies (truncated)
+  const recentList = recentAssistant
+    .map((m, i) => `  ${i + 1}. "${m.content.replace(/\s+/g, " ").trim().slice(0, 140)}"`)
+    .join("\n");
+
+  // 2) Recent openers (first 3 words, lowercased)
+  const openers = new Set<string>();
+  for (const m of recentAssistant) {
+    const tokens = m.content
+      .trim()
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}\s']/gu, " ")
+      .split(/\s+/)
+      .filter(Boolean);
+    if (tokens.length === 0) continue;
+    // Take first up-to-3 meaningful tokens
+    const opener = tokens.slice(0, Math.min(3, tokens.length)).join(" ");
+    if (opener.length >= 2 && !TRIVIAL_TOKENS.has(opener)) openers.add(opener);
+  }
+
+  // 3) Repeated bigrams across replies (signal of phrase looping)
+  const bigramCount = new Map<string, number>();
+  for (const m of recentAssistant) {
+    const words = m.content
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}\s']/gu, " ")
+      .split(/\s+/)
+      .filter((w) => w.length > 1);
+    const seenInThisMsg = new Set<string>();
+    for (let i = 0; i < words.length - 1; i++) {
+      const bg = `${words[i]} ${words[i + 1]}`;
+      if (seenInThisMsg.has(bg)) continue;
+      seenInThisMsg.add(bg);
+      bigramCount.set(bg, (bigramCount.get(bg) ?? 0) + 1);
+    }
+  }
+  const repeated = [...bigramCount.entries()]
+    .filter(([bg, c]) => c >= 2 && !STOPWORD_BIGRAMS.has(bg) && bg.length >= 6)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([bg]) => bg);
+
+  // 4) Repeated emojis
+  const emojiCount = new Map<string, number>();
+  const emojiRegex = /\p{Extended_Pictographic}/gu;
+  for (const m of recentAssistant) {
+    const found = m.content.match(emojiRegex) ?? [];
+    const seen = new Set<string>();
+    for (const e of found) {
+      if (seen.has(e)) continue;
+      seen.add(e);
+      emojiCount.set(e, (emojiCount.get(e) ?? 0) + 1);
+    }
+  }
+  const overusedEmojis = [...emojiCount.entries()]
+    .filter(([, c]) => c >= 2)
+    .map(([e]) => e)
+    .slice(0, 6);
+
+  let block = `\n\nWHAT YOU JUST SAID (your last replies, oldest → newest — read them before answering):\n${recentList}\n
+DO NOT loop. Specifically for THIS reply:
+- Do NOT start with the same opener you used in the last 1-2 messages above.
+- Do NOT recycle the same phrasing or restate the same point in different words.
+- Move things forward — bring a new angle, a tease, a question, a memory, a tangent, OR keep it short and silent-ish ("hmm", "okay"). Variety is the goal.
+- Repetition is only allowed when emphasizing on purpose ("no no NO").`;
+
+  if (openers.size > 0) {
+    block += `\n- Avoid these recent openers unless you really mean to repeat: ${[...openers].map((o) => `"${o}"`).join(", ")}.`;
+  }
+  if (repeated.length > 0) {
+    block += `\n- Phrases you've already leaned on — pick different words this time: ${repeated.map((p) => `"${p}"`).join(", ")}.`;
+  }
+  if (overusedEmojis.length > 0) {
+    block += `\n- Emojis you've already used recently — vary or skip them: ${overusedEmojis.join(" ")}.`;
+  }
+
+  return block;
+}
+
 export function buildOllamaMessages(
   userMessage: string,
   chatHistory: OllamaMessage[],
@@ -310,7 +422,7 @@ export function buildOllamaMessages(
   user: UserData,
   mood?: string
 ): OllamaMessage[] {
-  const systemPrompt = buildSystemPrompt(tier, user, mood);
+  const systemPrompt = buildSystemPrompt(tier, user, mood) + buildRepetitionGuardrails(chatHistory);
   const messages: OllamaMessage[] = [{ role: "system", content: systemPrompt }];
   for (const msg of chatHistory) {
     if ((msg.role === "user" || msg.role === "assistant") && msg.content.trim()) {
