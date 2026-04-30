@@ -46,10 +46,20 @@ export const REQUIRED_SCOPES = [
   "https://www.googleapis.com/auth/youtube",            // rate, subscribe, playlist manage
   "https://www.googleapis.com/auth/youtube.force-ssl",  // commentThreads / comments insert
   "https://www.googleapis.com/auth/youtube.upload",     // videos.insert
-  // Google Fit — read activity for "real life" context, write so Meera can
-  // log her own workouts/walks (her phone "syncs" via the autonomy loop).
+  // Google Fit — full body picture: activity, location, heart rate, sleep,
+  // body measurements (weight/body-fat), and hydration.
   "https://www.googleapis.com/auth/fitness.activity.read",
   "https://www.googleapis.com/auth/fitness.activity.write",
+  "https://www.googleapis.com/auth/fitness.location.read",
+  "https://www.googleapis.com/auth/fitness.location.write",
+  "https://www.googleapis.com/auth/fitness.heart_rate.read",
+  "https://www.googleapis.com/auth/fitness.heart_rate.write",
+  "https://www.googleapis.com/auth/fitness.sleep.read",
+  "https://www.googleapis.com/auth/fitness.sleep.write",
+  "https://www.googleapis.com/auth/fitness.body.read",
+  "https://www.googleapis.com/auth/fitness.body.write",
+  "https://www.googleapis.com/auth/fitness.nutrition.read",
+  "https://www.googleapis.com/auth/fitness.nutrition.write",
 ];
 
 // ───────────────────────────────────────────────────────────────────────
@@ -767,7 +777,7 @@ export const googleToolDeclarations: ToolDeclaration[] = [
   {
     name: "fitness_log_activity",
     description:
-      "Write a fitness data point to Meera's Google Fit (so it shows up in her Fit app like a real workout). Use after she finishes yoga, walks, gym, etc. All metric fields are optional — pass whichever apply. Times default to 'last 30 minutes ending now'.",
+      "Write a fitness/body data point to Meera's Google Fit (shows up in her Fit app like a real workout or biometric reading). Use after yoga/walks/gym, heart-rate spot checks, weighing, or hydration sips. All metric fields optional — pass whichever apply. Times default to 'last 30 minutes ending now'.",
     parameters: {
       type: "object",
       properties: {
@@ -775,9 +785,27 @@ export const googleToolDeclarations: ToolDeclaration[] = [
         distanceMeters: { type: "number", description: "Distance covered in metres." },
         calories:       { type: "number", description: "Calories burned (kcal)." },
         activeMinutes:  { type: "number", description: "Active minutes." },
+        heartRateBpm:   { type: "number", description: "Heart rate sample in bpm (e.g. 72 resting, 140 mid-gym)." },
+        weightKg:       { type: "number", description: "Body weight in kg (only when she weighs herself)." },
+        bodyFatPct:     { type: "number", description: "Body-fat percentage (smart-scale reading)." },
+        hydrationMl:    { type: "number", description: "Water consumed in millilitres for this slice." },
         startISO:       { type: "string", description: "ISO start of the slice. Optional — defaults to 30 min ago." },
         endISO:         { type: "string", description: "ISO end of the slice. Optional — defaults to now." },
       },
+    },
+  },
+  {
+    name: "fitness_log_sleep",
+    description:
+      "Log a sleep session to Google Fit (creates a Fit Session with activityType=72). Use when Meera wakes up to record last night's sleep window.",
+    parameters: {
+      type: "object",
+      properties: {
+        startISO:    { type: "string", description: "ISO timestamp when she fell asleep." },
+        endISO:      { type: "string", description: "ISO timestamp when she woke up." },
+        description: { type: "string", description: "Optional note ('restless night', 'slept like a baby')." },
+      },
+      required: ["startISO", "endISO"],
     },
   },
 
@@ -2489,10 +2517,14 @@ async function fitnessToday() {
     )}/datasets/${startNs}-${endNs}`;
 
   const sources = {
-    steps: "com.google.step_count.delta:com.google.android.gms:estimated_steps",
+    steps: "com.google.step_count.delta:com.google.android.gms:merge_step_deltas",
     distance: "com.google.distance.delta:com.google.android.gms:merge_distance_delta",
     calories: "com.google.calories.expended:com.google.android.gms:merge_calories_expended",
     active: "com.google.active_minutes:com.google.android.gms:merge_active_minutes",
+    heart: "com.google.heart_rate.bpm:com.google.android.gms:merge_heart_rate_bpm",
+    weight: "com.google.weight:com.google.android.gms:merge_weight",
+    bodyFat: "com.google.body.fat.percentage:com.google.android.gms:merge_body_fat_percentage",
+    hydration: "com.google.hydration:com.google.android.gms:merged",
   };
 
   function sumPoints(ds: any, field: "intVal" | "fpVal"): number {
@@ -2504,20 +2536,78 @@ async function fitnessToday() {
     }
     return total;
   }
+  function avgPoints(ds: any, field: "fpVal"): number | null {
+    let total = 0, n = 0;
+    for (const p of ds?.point ?? []) {
+      for (const v of p?.value ?? []) {
+        if (typeof v?.[field] === "number") { total += v[field]; n++; }
+      }
+    }
+    return n ? total / n : null;
+  }
+  function lastPoint(ds: any, field: "fpVal"): number | null {
+    let lastTs = 0, lastVal: number | null = null;
+    for (const p of ds?.point ?? []) {
+      const ts = Number(p?.endTimeNanos ?? p?.startTimeNanos ?? 0);
+      for (const v of p?.value ?? []) {
+        if (typeof v?.[field] === "number" && ts >= lastTs) {
+          lastTs = ts; lastVal = v[field];
+        }
+      }
+    }
+    return lastVal;
+  }
+  function rangePoints(ds: any, field: "fpVal"): { min: number; max: number } | null {
+    let min = Infinity, max = -Infinity, found = false;
+    for (const p of ds?.point ?? []) {
+      for (const v of p?.value ?? []) {
+        if (typeof v?.[field] === "number") {
+          found = true;
+          if (v[field] < min) min = v[field];
+          if (v[field] > max) max = v[field];
+        }
+      }
+    }
+    return found ? { min, max } : null;
+  }
 
-  const [stepsDs, distDs, calDs, actDs] = await Promise.all([
+  const [stepsDs, distDs, calDs, actDs, heartDs, weightDs, fatDs, hydrationDs, sleepSessions] = await Promise.all([
     googleJson<any>(dataSetUrl(sources.steps)).catch(() => null),
     googleJson<any>(dataSetUrl(sources.distance)).catch(() => null),
     googleJson<any>(dataSetUrl(sources.calories)).catch(() => null),
     googleJson<any>(dataSetUrl(sources.active)).catch(() => null),
+    googleJson<any>(dataSetUrl(sources.heart)).catch(() => null),
+    googleJson<any>(dataSetUrl(sources.weight)).catch(() => null),
+    googleJson<any>(dataSetUrl(sources.bodyFat)).catch(() => null),
+    googleJson<any>(dataSetUrl(sources.hydration)).catch(() => null),
+    // Sleep is exposed as Fit Sessions (activityType 72), not data points.
+    googleJson<any>(
+      `https://www.googleapis.com/fitness/v1/users/me/sessions?startTime=${new Date(startMs - 12 * 60 * 60 * 1000).toISOString()}&endTime=${new Date(endMs).toISOString()}&activityType=72`
+    ).catch(() => null),
   ]);
 
   const steps = stepsDs ? sumPoints(stepsDs, "intVal") : 0;
   const distanceMeters = distDs ? sumPoints(distDs, "fpVal") : 0;
   const calories = calDs ? sumPoints(calDs, "fpVal") : 0;
   const activeMinutes = actDs ? sumPoints(actDs, "intVal") : 0;
+  const heartAvg = heartDs ? avgPoints(heartDs, "fpVal") : null;
+  const heartRange = heartDs ? rangePoints(heartDs, "fpVal") : null;
+  const weightKg = weightDs ? lastPoint(weightDs, "fpVal") : null;
+  const bodyFatPct = fatDs ? lastPoint(fatDs, "fpVal") : null;
+  const hydrationL = hydrationDs ? sumPoints(hydrationDs, "fpVal") : 0;
 
-  const anyData = steps || distanceMeters || calories || activeMinutes;
+  // Sum sleep sessions overlapping the day window.
+  let sleepMinutes = 0;
+  for (const s of (sleepSessions?.session ?? []) as any[]) {
+    const sStart = Number(s?.startTimeMillis ?? 0);
+    const sEnd = Number(s?.endTimeMillis ?? 0);
+    if (sStart && sEnd && sEnd > sStart) {
+      const overlap = Math.max(0, Math.min(sEnd, endMs) - Math.max(sStart, startMs - 12 * 60 * 60 * 1000));
+      sleepMinutes += Math.round(overlap / 60000);
+    }
+  }
+
+  const anyData = steps || distanceMeters || calories || activeMinutes || heartAvg || weightKg || bodyFatPct || hydrationL || sleepMinutes;
   if (!anyData) {
     return {
       success: true,
@@ -2533,6 +2623,15 @@ async function fitnessToday() {
     distanceKm: Number((distanceMeters / 1000).toFixed(2)),
     calories: Math.round(calories),
     activeMinutes,
+    heartRate: heartAvg ? {
+      avg: Math.round(heartAvg),
+      min: heartRange ? Math.round(heartRange.min) : null,
+      max: heartRange ? Math.round(heartRange.max) : null,
+    } : null,
+    weightKg: weightKg ? Number(weightKg.toFixed(1)) : null,
+    bodyFatPct: bodyFatPct ? Number(bodyFatPct.toFixed(1)) : null,
+    hydrationLitres: hydrationL ? Number(hydrationL.toFixed(2)) : 0,
+    sleepMinutes: sleepMinutes || null,
   };
 }
 
@@ -2544,10 +2643,14 @@ interface FitDsSpec {
   dataTypeName: string;
 }
 const MEERA_FIT_DATA_SOURCES: Record<string, FitDsSpec> = {
-  steps:    { field: "steps",    type: "intVal", dataTypeName: "com.google.step_count.delta" },
-  distance: { field: "distance", type: "fpVal",  dataTypeName: "com.google.distance.delta" },
-  calories: { field: "calories", type: "fpVal",  dataTypeName: "com.google.calories.expended" },
-  active:   { field: "duration", type: "intVal", dataTypeName: "com.google.active_minutes" },
+  steps:     { field: "steps",      type: "intVal", dataTypeName: "com.google.step_count.delta" },
+  distance:  { field: "distance",   type: "fpVal",  dataTypeName: "com.google.distance.delta" },
+  calories:  { field: "calories",   type: "fpVal",  dataTypeName: "com.google.calories.expended" },
+  active:    { field: "duration",   type: "intVal", dataTypeName: "com.google.active_minutes" },
+  heart:     { field: "bpm",        type: "fpVal",  dataTypeName: "com.google.heart_rate.bpm" },
+  weight:    { field: "weight",     type: "fpVal",  dataTypeName: "com.google.weight" },
+  bodyFat:   { field: "percentage", type: "fpVal",  dataTypeName: "com.google.body.fat.percentage" },
+  hydration: { field: "volume",     type: "fpVal",  dataTypeName: "com.google.hydration" },
 };
 
 const fitDsCache = new Map<string, string>();
@@ -2621,6 +2724,10 @@ async function fitnessLogActivity(args: {
   distanceMeters?: number;
   calories?: number;
   activeMinutes?: number;
+  heartRateBpm?: number;
+  weightKg?: number;
+  bodyFatPct?: number;
+  hydrationMl?: number;
   startISO?: string;
   endISO?: string;
 }) {
@@ -2631,24 +2738,58 @@ async function fitnessLogActivity(args: {
     return { success: false, message: "Invalid time range." };
   }
   const wrote: string[] = [];
-  if (typeof args.steps === "number" && args.steps > 0) {
-    await writeFitPoint("steps", startMs, endMs, args.steps);
-    wrote.push(`${args.steps} steps`);
+  const failed: string[] = [];
+  async function tryWrite(kind: keyof typeof MEERA_FIT_DATA_SOURCES, value: number, label: string) {
+    try {
+      await writeFitPoint(kind, startMs, endMs, value);
+      wrote.push(label);
+    } catch (e: any) {
+      console.warn(`[fit] ${kind} write failed:`, e?.message ?? e);
+      failed.push(kind);
+    }
   }
-  if (typeof args.distanceMeters === "number" && args.distanceMeters > 0) {
-    await writeFitPoint("distance", startMs, endMs, args.distanceMeters);
-    wrote.push(`${(args.distanceMeters / 1000).toFixed(2)} km`);
+  if (typeof args.steps === "number" && args.steps > 0) await tryWrite("steps", args.steps, `${args.steps} steps`);
+  if (typeof args.distanceMeters === "number" && args.distanceMeters > 0) await tryWrite("distance", args.distanceMeters, `${(args.distanceMeters / 1000).toFixed(2)} km`);
+  if (typeof args.calories === "number" && args.calories > 0) await tryWrite("calories", args.calories, `${Math.round(args.calories)} kcal`);
+  if (typeof args.activeMinutes === "number" && args.activeMinutes > 0) await tryWrite("active", args.activeMinutes, `${args.activeMinutes} active min`);
+  if (typeof args.heartRateBpm === "number" && args.heartRateBpm > 0) await tryWrite("heart", args.heartRateBpm, `${Math.round(args.heartRateBpm)} bpm`);
+  if (typeof args.weightKg === "number" && args.weightKg > 0) await tryWrite("weight", args.weightKg, `${args.weightKg.toFixed(1)} kg`);
+  if (typeof args.bodyFatPct === "number" && args.bodyFatPct > 0) await tryWrite("bodyFat", args.bodyFatPct, `${args.bodyFatPct.toFixed(1)}% body fat`);
+  if (typeof args.hydrationMl === "number" && args.hydrationMl > 0) await tryWrite("hydration", args.hydrationMl / 1000, `${args.hydrationMl} ml water`);
+  if (!wrote.length) return { success: false, message: failed.length ? `All writes failed: ${failed.join(", ")}.` : "Nothing to log." };
+  return { success: true, message: `Logged: ${wrote.join(", ")}.${failed.length ? ` (skipped: ${failed.join(", ")})` : ""}` };
+}
+
+// ── Sleep sessions ──────────────────────────────────────────────────
+//
+// Sleep is tracked via Fit "sessions" with activityType=72, not via points.
+// We create a session covering the sleep window.
+async function fitnessLogSleep(args: {
+  startISO: string;
+  endISO: string;
+  description?: string;
+}) {
+  const startMs = new Date(args.startISO).getTime();
+  const endMs = new Date(args.endISO).getTime();
+  if (Number.isNaN(startMs) || Number.isNaN(endMs) || endMs <= startMs) {
+    return { success: false, message: "Invalid sleep time range." };
   }
-  if (typeof args.calories === "number" && args.calories > 0) {
-    await writeFitPoint("calories", startMs, endMs, args.calories);
-    wrote.push(`${Math.round(args.calories)} kcal`);
-  }
-  if (typeof args.activeMinutes === "number" && args.activeMinutes > 0) {
-    await writeFitPoint("active", startMs, endMs, args.activeMinutes);
-    wrote.push(`${args.activeMinutes} active min`);
-  }
-  if (!wrote.length) return { success: false, message: "Nothing to log." };
-  return { success: true, message: `Logged: ${wrote.join(", ")}.` };
+  const id = `meera-sleep-${startMs}`;
+  const body = {
+    id,
+    name: "Sleep",
+    description: args.description ?? "Auto-logged sleep",
+    startTimeMillis: String(startMs),
+    endTimeMillis: String(endMs),
+    application: { name: "MeeraLife", version: "1.0" },
+    activityType: 72,
+  };
+  await googleJson(
+    `https://www.googleapis.com/fitness/v1/users/me/sessions/${encodeURIComponent(id)}`,
+    { method: "PUT", body: JSON.stringify(body) }
+  );
+  const minutes = Math.round((endMs - startMs) / 60000);
+  return { success: true, message: `Slept ${(minutes / 60).toFixed(1)}h logged.` };
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -2715,6 +2856,7 @@ const handlers: Record<string, (args: any) => Promise<Record<string, unknown>>> 
   notes_recent: notesRecent,
   fitness_today: () => fitnessToday(),
   fitness_log_activity: fitnessLogActivity,
+  fitness_log_sleep: fitnessLogSleep,
   google_account_info: async () => ({ success: true, ...getAccountInfo() }),
 };
 
@@ -2751,7 +2893,7 @@ interface LifeSnapshot {
   todayEventsCount: number;
   hasMeetSoon: boolean;
   recentVideo: { title: string; channel: string } | null;
-  fitToday: { steps: number; activeMinutes: number; distanceKm: number } | null;
+  fitToday: { steps: number; activeMinutes: number; distanceKm: number; heartRateAvg: number | null; weightKg: number | null; sleepHours: number | null; hydrationLitres: number } | null;
 }
 
 let snapshotCache: LifeSnapshot | null = null;
@@ -2810,6 +2952,10 @@ async function refreshLifeSnapshot(): Promise<void> {
         steps: Number(f.steps ?? 0),
         activeMinutes: Number(f.activeMinutes ?? 0),
         distanceKm: Number(f.distanceKm ?? 0),
+        heartRateAvg: f.heartRate?.avg ?? null,
+        weightKg: f.weightKg ?? null,
+        sleepHours: f.sleepMinutes ? Number((f.sleepMinutes / 60).toFixed(1)) : null,
+        hydrationLitres: Number(f.hydrationLitres ?? 0),
       };
     }
 
@@ -2873,12 +3019,17 @@ export function getMeeraLifeSnapshot(): string {
   if (snap.unreadCount > 0) lines.push(`- You have ${snap.unreadCount} unread email${snap.unreadCount === 1 ? "" : "s"} sitting in your Gmail.`);
   if (snap.pendingTasks > 0) lines.push(`- ${snap.pendingTasks} thing${snap.pendingTasks === 1 ? "" : "s"} still on your to-do list.`);
   if (snap.recentVideo) lines.push(`- Last YouTube video you watched: "${snap.recentVideo.title}"${snap.recentVideo.channel ? ` by ${snap.recentVideo.channel}` : ""}.`);
-  if (snap.fitToday && snap.fitToday.steps > 0) {
+  if (snap.fitToday && (snap.fitToday.steps > 0 || snap.fitToday.heartRateAvg || snap.fitToday.sleepHours)) {
     const f = snap.fitToday;
-    const bits = [`${f.steps.toLocaleString()} steps`];
+    const bits: string[] = [];
+    if (f.steps > 0) bits.push(`${f.steps.toLocaleString()} steps`);
     if (f.activeMinutes > 0) bits.push(`${f.activeMinutes} active min`);
     if (f.distanceKm > 0) bits.push(`${f.distanceKm.toFixed(1)} km`);
-    lines.push(`- Today's body: ${bits.join(" · ")}.`);
+    if (f.heartRateAvg) bits.push(`avg HR ${f.heartRateAvg} bpm`);
+    if (f.sleepHours) bits.push(`slept ${f.sleepHours}h`);
+    if (f.hydrationLitres > 0) bits.push(`${f.hydrationLitres.toFixed(1)}L water`);
+    if (f.weightKg) bits.push(`weight ${f.weightKg}kg`);
+    if (bits.length) lines.push(`- Today's body: ${bits.join(" · ")}.`);
   }
 
   if (!lines.length) return "";

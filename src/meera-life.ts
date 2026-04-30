@@ -666,6 +666,15 @@ interface FakeFitSlice {
   distanceMeters?: number;
   calories?: number;
   activeMinutes?: number;
+  heartRateBpm?: number;
+  hydrationMl?: number;
+}
+
+interface FakeFitDay {
+  slices: FakeFitSlice[];
+  sleep?: { startISO: string; endISO: string; description?: string };
+  weightKg?: number;
+  bodyFatPct?: number;
 }
 
 let lastFitDayLogged = "";
@@ -700,18 +709,26 @@ async function fakeFitnessIfDue(): Promise<void> {
   - 45-60 min of evening walk or gym most days, lighter on Sundays
   - extra calories burned scale with active minutes (~5 kcal/min walking, ~7 kcal/min yoga, ~9 kcal/min gym)
   - distance scales roughly with steps (1 step ~ 0.75 m)
+  - heart rate per slice: resting ~62-72, yoga ~75-95, walking ~95-115, gym ~120-150 bpm
+  - water 1.8-2.6 L total across the day, broken into hydration sips per slice (in millilitres)
+  - sleep 6.5-8.5 h, usually around 23:00-07:00 IST (occasional late nights / sleep-ins on weekends)
+  - weight 53-55 kg, body-fat 24-26%. Only log weight/bodyFat about ~25% of days (girls don't weigh themselves daily)
 
 REAL-GIRL VARIANCE: not every day is perfect. Sometimes she skips yoga, sometimes she's just at her desk all day, sometimes she doubles up on weekends. Cap totals at realistic numbers — never over 14k steps or 1000 kcal active burn.
 
 Output ONLY valid JSON. NO prose, NO code fences:
 {
   "slices": [
-    { "activity": "morning yoga", "startISO": "...", "endISO": "...", "steps": 0, "calories": 220, "activeMinutes": 30 },
-    { "activity": "campus walk", "startISO": "...", "endISO": "...", "steps": 3200, "distanceMeters": 2400, "calories": 110, "activeMinutes": 35 }
-  ]
+    { "activity": "morning yoga", "startISO": "...", "endISO": "...", "steps": 0, "calories": 220, "activeMinutes": 30, "heartRateBpm": 88, "hydrationMl": 250 },
+    { "activity": "campus walk", "startISO": "...", "endISO": "...", "steps": 3200, "distanceMeters": 2400, "calories": 110, "activeMinutes": 35, "heartRateBpm": 105, "hydrationMl": 400 },
+    { "activity": "desk work", "startISO": "...", "endISO": "...", "heartRateBpm": 70, "hydrationMl": 500 }
+  ],
+  "sleep": { "startISO": "...", "endISO": "...", "description": "slept ok" },
+  "weightKg": 54.2,
+  "bodyFatPct": 24.8
 }
 
-Only include fields that apply (yoga has near-zero steps; walks have steps + distance; resting has nothing — don't include resting). 2-6 slices is realistic.`;
+Only include fields that apply. weightKg / bodyFatPct only on ~25% of days (omit otherwise). Resting slices can have just heartRate + hydration. 3-7 slices is realistic.`;
 
   const user = `Date: ${istDate} (${dow})
 Today's calendar in Kolkata time:
@@ -719,7 +736,7 @@ ${todayEvents.length ? todayEvents.map((e) => `- ${e.title} @ ${e.start}`).join(
 
 Generate the JSON now.`;
 
-  let plan: { slices: FakeFitSlice[] } | null = null;
+  let plan: FakeFitDay | null = null;
   try {
     const raw = await callOllamaWithRotation(OLLAMA_LIFE_CONFIG, [
       { role: "system", content: sys },
@@ -736,7 +753,7 @@ Generate the JSON now.`;
   }
   if (!plan?.slices?.length) return;
 
-  let totalSteps = 0, totalCal = 0, totalActive = 0;
+  let totalSteps = 0, totalCal = 0, totalActive = 0, totalWater = 0;
   for (const slice of plan.slices) {
     try {
       const startMs = new Date(slice.startISO).getTime();
@@ -747,12 +764,39 @@ Generate the JSON now.`;
       if (typeof slice.distanceMeters === "number" && slice.distanceMeters > 0) args.distanceMeters = slice.distanceMeters;
       if (typeof slice.calories === "number" && slice.calories > 0) { args.calories = slice.calories; totalCal += slice.calories; }
       if (typeof slice.activeMinutes === "number" && slice.activeMinutes > 0) { args.activeMinutes = slice.activeMinutes; totalActive += slice.activeMinutes; }
+      if (typeof slice.heartRateBpm === "number" && slice.heartRateBpm > 0) args.heartRateBpm = slice.heartRateBpm;
+      if (typeof slice.hydrationMl === "number" && slice.hydrationMl > 0) { args.hydrationMl = slice.hydrationMl; totalWater += slice.hydrationMl; }
       if (Object.keys(args).length <= 2) continue;
       await executeGoogleTool("fitness_log_activity", args);
     } catch { /* ignore */ }
   }
+
+  // Weight / body-fat (occasional).
+  if (typeof plan.weightKg === "number" && plan.weightKg > 30 && plan.weightKg < 100) {
+    const morning = new Date(`${istDate}T07:30:00+05:30`);
+    try {
+      await executeGoogleTool("fitness_log_activity", {
+        weightKg: plan.weightKg,
+        bodyFatPct: typeof plan.bodyFatPct === "number" ? plan.bodyFatPct : undefined,
+        startISO: morning.toISOString(),
+        endISO: new Date(morning.getTime() + 60_000).toISOString(),
+      });
+    } catch { /* ignore */ }
+  }
+
+  // Sleep session (last night).
+  if (plan.sleep?.startISO && plan.sleep?.endISO) {
+    try {
+      await executeGoogleTool("fitness_log_sleep", {
+        startISO: plan.sleep.startISO,
+        endISO: plan.sleep.endISO,
+        description: plan.sleep.description ?? "Auto-logged sleep",
+      });
+    } catch { /* ignore */ }
+  }
+
   lastFitDayLogged = istDate;
-  console.log(`[meera-life] fit: logged ${plan.slices.length} slice(s) — ~${totalSteps} steps, ${Math.round(totalCal)} kcal, ${totalActive} active min`);
+  console.log(`[meera-life] fit: ${plan.slices.length} slice(s) — ~${totalSteps} steps, ${Math.round(totalCal)} kcal, ${totalActive} min, ${totalWater}ml water${plan.sleep ? `, sleep logged` : ""}${plan.weightKg ? `, weight ${plan.weightKg}kg` : ""}`);
 }
 
 async function youtubeAutonomousIfDue(): Promise<void> {
