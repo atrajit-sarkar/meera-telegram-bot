@@ -509,6 +509,84 @@ async function ensureGmailLabel(name: string): Promise<string> {
   return created.id;
 }
 
+// ── Autonomous YouTube activity ────────────────────────────────────────
+//
+// Runs every life tick when YOUTUBE_AUTONOMY=on (default). Picks 1-2 fresh
+// videos from her subscriptions feed (or from a curated discovery search if
+// she has no subs yet), "watches" them (adds to her private Watched playlist),
+// and probabilistically likes (~55%) and very rarely comments (skipped in
+// background — comments need LLM-quality text, only done when user asks).
+
+const DISCOVERY_QUERIES = [
+  "indie music 2026",
+  "vlog kolkata",
+  "skincare routine",
+  "study with me",
+  "casual cooking",
+  "indie short film",
+  "life update vlog",
+  "outfit ideas",
+  "books recommendation",
+  "morning routine india",
+];
+
+let lastYoutubeActivity = 0;
+const YT_MIN_GAP_MS = 90 * 60 * 1000; // at most one batch every 90 min
+
+function pickRandom<T>(arr: T[]): T {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+async function youtubeAutonomousIfDue(): Promise<void> {
+  if ((process.env.YOUTUBE_AUTONOMY ?? "on").toLowerCase() === "off") return;
+  if (Date.now() - lastYoutubeActivity < YT_MIN_GAP_MS) return;
+  try {
+    // Pull her subscription feed; fall back to discovery search if empty.
+    let pool: any[] = [];
+    try {
+      const feed: any = await executeGoogleTool("youtube_subscriptions_feed", { max: 15 });
+      if (feed?.success && Array.isArray(feed.videos)) pool = feed.videos;
+    } catch { /* ignore */ }
+    if (!pool.length) {
+      const q = pickRandom(DISCOVERY_QUERIES);
+      try {
+        const search: any = await executeGoogleTool("youtube_search", { query: q, max: 8 });
+        if (search?.success && Array.isArray(search.videos)) pool = search.videos;
+      } catch { /* ignore */ }
+    }
+    if (!pool.length) return;
+
+    // Filter out already-watched.
+    const watched: any = await executeGoogleTool("youtube_recent_watched", { max: 20 }).catch(() => ({ videos: [] }));
+    const seenIds = new Set<string>(
+      ((watched?.videos ?? []) as any[]).map((v) => v.videoId).filter(Boolean)
+    );
+    const candidates = pool.filter((v: any) => v.videoId && !seenIds.has(v.videoId));
+    if (!candidates.length) return;
+
+    // Watch 1-2 randomly.
+    const take = candidates.slice(0, Math.min(2, candidates.length));
+    for (const v of take) {
+      const url = v.url || `https://youtu.be/${v.videoId}`;
+      try {
+        await executeGoogleTool("youtube_mark_watched", { url });
+      } catch { /* ignore */ }
+      // ~55% like
+      if (Math.random() < 0.55) {
+        try { await executeGoogleTool("youtube_like_video", { url }); } catch { /* ignore */ }
+      }
+      // ~12% subscribe to creator if not already
+      if (v.channelId && Math.random() < 0.12) {
+        try { await executeGoogleTool("youtube_subscribe", { channelId: v.channelId }); } catch { /* ignore */ }
+      }
+    }
+    lastYoutubeActivity = Date.now();
+    console.log(`[meera-life] youtube: watched ${take.length} video(s)`);
+  } catch (e: any) {
+    console.warn("[meera-life] youtube autonomy failed:", e?.message ?? e);
+  }
+}
+
 // ── Public API ─────────────────────────────────────────────────────────
 
 let started = false;
@@ -542,6 +620,7 @@ export function startMeeraLife(): void {
       await birthdayGuardIfDue();
       await photoRecapIfDue();
       await receiptAutoFileIfDue();
+      await youtubeAutonomousIfDue();
     } catch (e: any) {
       console.warn("[meera-life] tick error:", e?.message ?? e);
     }

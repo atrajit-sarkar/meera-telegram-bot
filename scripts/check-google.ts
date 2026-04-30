@@ -65,6 +65,18 @@ async function main() {
   header("youtube_playlists");
   pretty(await executeGoogleTool("youtube_playlists", { max: 3 }));
 
+  header("youtube_search  (query='lo-fi indie 2026')");
+  pretty(await executeGoogleTool("youtube_search", { query: "lo-fi indie 2026", max: 3 }));
+
+  header("youtube_video_info  (a known stable video)");
+  pretty(await executeGoogleTool("youtube_video_info", { url: "https://youtu.be/dQw4w9WgXcQ" }));
+
+  header("youtube_subscriptions_feed");
+  pretty(await executeGoogleTool("youtube_subscriptions_feed", { max: 3 }));
+
+  header("youtube_recent_watched");
+  pretty(await executeGoogleTool("youtube_recent_watched", { max: 3 }));
+
   header("fitness_today  (Google Fit scope check)");
   pretty(await executeGoogleTool("fitness_today", {}));
 

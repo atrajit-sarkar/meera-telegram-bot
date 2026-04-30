@@ -18,6 +18,7 @@
 
 import type { ToolDeclaration } from "./gemini-session.js";
 import { googleJson, googleFetch, getAccountInfo, isGoogleConfigured } from "./google-account.js";
+import fsSync from "node:fs";
 
 // ───────────────────────────────────────────────────────────────────────
 // SCOPES (used by setup CLI)
@@ -40,8 +41,11 @@ export const REQUIRED_SCOPES = [
   "https://www.googleapis.com/auth/photoslibrary.appendonly",          // upload
   "https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata", // read app-created items
   "https://www.googleapis.com/auth/photoslibrary.edit.appcreateddata",  // edit captions on app-created items
-  // YouTube — read-only history, subscriptions, playlists, liked videos.
-  "https://www.googleapis.com/auth/youtube.readonly",
+  // YouTube — full read/write so Meera can subscribe, like/dislike, comment,
+  // upload videos, and manage playlists like a real user.
+  "https://www.googleapis.com/auth/youtube",            // rate, subscribe, playlist manage
+  "https://www.googleapis.com/auth/youtube.force-ssl",  // commentThreads / comments insert
+  "https://www.googleapis.com/auth/youtube.upload",     // videos.insert
   // Google Fit — read activity (steps, distance, calories) for "real life" context.
   "https://www.googleapis.com/auth/fitness.activity.read",
 ];
@@ -572,6 +576,162 @@ export const googleToolDeclarations: ToolDeclaration[] = [
     parameters: {
       type: "object",
       properties: { max: { type: "integer", description: "Default 10" } },
+    },
+  },
+  {
+    name: "youtube_video_info",
+    description:
+      "Fetch metadata about any YouTube video (title, channel, description, duration, views, likes, tags, publish date) given a URL or video ID. Use this when the user shares a YouTube link and Meera wants to react / review it naturally.",
+    parameters: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "Full YouTube URL OR video ID" },
+      },
+      required: ["url"],
+    },
+  },
+  {
+    name: "youtube_channel_info",
+    description:
+      "Fetch metadata about a YouTube channel (title, subs, video count, description) by channelId or @handle or channel URL.",
+    parameters: {
+      type: "object",
+      properties: {
+        channel: { type: "string", description: "Channel ID, @handle, or full channel URL" },
+      },
+      required: ["channel"],
+    },
+  },
+  {
+    name: "youtube_search",
+    description:
+      "Search public YouTube videos by query. Returns top results (title, channel, videoId, url, publishedAt). Use when Meera wants to find or recommend something.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        max: { type: "integer", description: "Default 5, max 20" },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "youtube_subscriptions_feed",
+    description:
+      "Get the most recent videos uploaded by channels Meera is subscribed to. This is her 'home feed' — useful for background activity and natural sharing.",
+    parameters: {
+      type: "object",
+      properties: { max: { type: "integer", description: "Default 10, max 25" } },
+    },
+  },
+  {
+    name: "youtube_subscribe",
+    description:
+      "Subscribe Meera to a YouTube channel by channelId. Use when she watches a video and wants to follow that creator.",
+    parameters: {
+      type: "object",
+      properties: { channelId: { type: "string" } },
+      required: ["channelId"],
+    },
+  },
+  {
+    name: "youtube_unsubscribe",
+    description: "Unsubscribe Meera from a YouTube channel (subscriptionId from youtube_subscriptions).",
+    parameters: {
+      type: "object",
+      properties: { subscriptionId: { type: "string" } },
+      required: ["subscriptionId"],
+    },
+  },
+  {
+    name: "youtube_like_video",
+    description: "Like a YouTube video (Meera presses 👍). Pass video URL or ID.",
+    parameters: {
+      type: "object",
+      properties: { url: { type: "string", description: "Video URL or ID" } },
+      required: ["url"],
+    },
+  },
+  {
+    name: "youtube_dislike_video",
+    description: "Dislike a YouTube video. Use sparingly — only when she genuinely doesn't like it.",
+    parameters: {
+      type: "object",
+      properties: { url: { type: "string" } },
+      required: ["url"],
+    },
+  },
+  {
+    name: "youtube_remove_rating",
+    description: "Remove Meera's like/dislike from a video (back to neutral).",
+    parameters: {
+      type: "object",
+      properties: { url: { type: "string" } },
+      required: ["url"],
+    },
+  },
+  {
+    name: "youtube_comment",
+    description:
+      "Post a top-level comment on a YouTube video as Meera. Keep it short, casual, in her voice. Don't spam — only when there's a genuine reaction.",
+    parameters: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "Video URL or ID" },
+        text: { type: "string", description: "Comment body in Meera's voice" },
+      },
+      required: ["url", "text"],
+    },
+  },
+  {
+    name: "youtube_reply_comment",
+    description:
+      "Reply to an existing YouTube comment thread. parentId is the commentThread or comment id.",
+    parameters: {
+      type: "object",
+      properties: {
+        parentId: { type: "string" },
+        text: { type: "string" },
+      },
+      required: ["parentId", "text"],
+    },
+  },
+  {
+    name: "youtube_mark_watched",
+    description:
+      "Add a video to Meera's private 'Watched' playlist — her simulated watch history. Use this whenever she 'watches' something so we have a real record. Pass video URL or ID, plus an optional one-line vibe tag (Meera's reaction).",
+    parameters: {
+      type: "object",
+      properties: {
+        url: { type: "string" },
+        vibe: { type: "string", description: "Optional 1-line note about what she felt" },
+      },
+      required: ["url"],
+    },
+  },
+  {
+    name: "youtube_recent_watched",
+    description: "List the videos Meera has 'watched' recently (from her Watched playlist).",
+    parameters: {
+      type: "object",
+      properties: { max: { type: "integer", description: "Default 5, max 20" } },
+    },
+  },
+  {
+    name: "youtube_upload_video",
+    description:
+      "Upload a video to Meera's own YouTube channel. Source can be a public URL OR a local file path. Privacy default: 'private' — she can change to 'public' or 'unlisted' if asked.",
+    parameters: {
+      type: "object",
+      properties: {
+        sourceUrl: { type: "string", description: "Public URL of the video file" },
+        sourcePath: { type: "string", description: "Absolute local file path (alternative to sourceUrl)" },
+        title: { type: "string" },
+        description: { type: "string" },
+        tags: { type: "array", items: { type: "string" } },
+        privacy: { type: "string", description: "private | unlisted | public (default private)" },
+      },
+      required: ["title"],
     },
   },
 
@@ -1843,6 +2003,390 @@ async function youtubePlaylists(args: { max?: number }) {
   }
 }
 
+// ── YouTube write / discovery ────────────────────────────────────────
+
+function extractYouTubeId(input: string): string {
+  const s = input.trim();
+  // Already an ID
+  if (/^[A-Za-z0-9_-]{11}$/.test(s)) return s;
+  // Try parsing as URL
+  try {
+    const u = new URL(s);
+    if (u.hostname.includes("youtu.be")) return u.pathname.replace(/^\//, "").slice(0, 11);
+    const v = u.searchParams.get("v");
+    if (v) return v.slice(0, 11);
+    // /shorts/<id> or /embed/<id>
+    const m = u.pathname.match(/\/(?:shorts|embed|live)\/([A-Za-z0-9_-]{11})/);
+    if (m) return m[1];
+  } catch { /* not a URL */ }
+  throw new Error(`Could not parse YouTube video ID from: ${input}`);
+}
+
+function fmtDuration(iso?: string): string {
+  if (!iso) return "";
+  const m = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+  if (!m) return iso;
+  const h = parseInt(m[1] || "0", 10);
+  const min = parseInt(m[2] || "0", 10);
+  const sec = parseInt(m[3] || "0", 10);
+  if (h) return `${h}h ${min}m`;
+  if (min) return `${min}m ${sec}s`;
+  return `${sec}s`;
+}
+
+async function youtubeVideoInfo(args: { url: string }) {
+  const id = extractYouTubeId(need(args.url, "url"));
+  const params = new URLSearchParams({
+    part: "snippet,contentDetails,statistics",
+    id,
+  });
+  const data = await googleJson<{
+    items?: {
+      id: string;
+      snippet?: { title?: string; channelTitle?: string; channelId?: string; description?: string; publishedAt?: string; tags?: string[]; thumbnails?: any };
+      contentDetails?: { duration?: string };
+      statistics?: { viewCount?: string; likeCount?: string; commentCount?: string };
+    }[];
+  }>(`https://www.googleapis.com/youtube/v3/videos?${params}`);
+  const item = data.items?.[0];
+  if (!item) return { success: false, message: "Video not found." };
+  return {
+    success: true,
+    videoId: item.id,
+    url: `https://youtu.be/${item.id}`,
+    title: item.snippet?.title ?? "",
+    channel: item.snippet?.channelTitle ?? "",
+    channelId: item.snippet?.channelId ?? "",
+    description: (item.snippet?.description ?? "").slice(0, 800),
+    publishedAt: item.snippet?.publishedAt ?? "",
+    duration: fmtDuration(item.contentDetails?.duration),
+    views: item.statistics?.viewCount ?? "0",
+    likes: item.statistics?.likeCount ?? "0",
+    comments: item.statistics?.commentCount ?? "0",
+    tags: (item.snippet?.tags ?? []).slice(0, 10),
+    thumbnail: item.snippet?.thumbnails?.high?.url ?? item.snippet?.thumbnails?.default?.url ?? "",
+  };
+}
+
+async function youtubeChannelInfo(args: { channel: string }) {
+  let raw = need(args.channel, "channel").trim();
+  // Parse out a /channel/UC... URL or @handle
+  let channelId: string | undefined;
+  let handle: string | undefined;
+  try {
+    const u = new URL(raw);
+    const m1 = u.pathname.match(/\/channel\/(UC[A-Za-z0-9_-]{20,})/);
+    if (m1) channelId = m1[1];
+    const m2 = u.pathname.match(/\/@([A-Za-z0-9._-]+)/);
+    if (m2) handle = `@${m2[1]}`;
+  } catch { /* not URL */ }
+  if (!channelId && !handle) {
+    if (raw.startsWith("UC") && raw.length >= 22) channelId = raw;
+    else if (raw.startsWith("@")) handle = raw;
+    else handle = `@${raw}`;
+  }
+
+  const params = new URLSearchParams({ part: "snippet,statistics" });
+  if (channelId) params.set("id", channelId);
+  else if (handle) params.set("forHandle", handle);
+
+  const data = await googleJson<{
+    items?: { id: string; snippet?: { title?: string; description?: string; customUrl?: string }; statistics?: { subscriberCount?: string; videoCount?: string; viewCount?: string } }[];
+  }>(`https://www.googleapis.com/youtube/v3/channels?${params}`);
+  const c = data.items?.[0];
+  if (!c) return { success: false, message: "Channel not found." };
+  return {
+    success: true,
+    channelId: c.id,
+    title: c.snippet?.title ?? "",
+    handle: c.snippet?.customUrl ?? "",
+    description: (c.snippet?.description ?? "").slice(0, 400),
+    subscribers: c.statistics?.subscriberCount ?? "",
+    videoCount: c.statistics?.videoCount ?? "",
+    totalViews: c.statistics?.viewCount ?? "",
+    url: `https://www.youtube.com/channel/${c.id}`,
+  };
+}
+
+async function youtubeSearch(args: { query: string; max?: number }) {
+  const q = need(args.query, "query");
+  const max = Math.min(Math.max(args.max ?? 5, 1), 20);
+  const params = new URLSearchParams({
+    part: "snippet",
+    q,
+    maxResults: String(max),
+    type: "video",
+    safeSearch: "moderate",
+  });
+  const data = await googleJson<{
+    items?: { id?: { videoId?: string }; snippet?: { title?: string; channelTitle?: string; channelId?: string; publishedAt?: string; description?: string } }[];
+  }>(`https://www.googleapis.com/youtube/v3/search?${params}`);
+  const videos = (data.items ?? [])
+    .filter((it) => it.id?.videoId)
+    .map((it) => ({
+      videoId: it.id!.videoId!,
+      url: `https://youtu.be/${it.id!.videoId!}`,
+      title: it.snippet?.title ?? "",
+      channel: it.snippet?.channelTitle ?? "",
+      channelId: it.snippet?.channelId ?? "",
+      publishedAt: it.snippet?.publishedAt ?? "",
+      description: (it.snippet?.description ?? "").slice(0, 200),
+    }));
+  return { success: true, count: videos.length, videos };
+}
+
+async function youtubeSubscriptionsFeed(args: { max?: number }) {
+  const max = Math.min(Math.max(args.max ?? 10, 1), 25);
+  // List subscriptions, then fetch latest uploads from each (capped by max).
+  const subs = await googleJson<{
+    items?: { snippet?: { resourceId?: { channelId?: string }; title?: string } }[];
+  }>(
+    `https://www.googleapis.com/youtube/v3/subscriptions?part=snippet&mine=true&maxResults=25&order=alphabetical`
+  );
+  const channels = (subs.items ?? [])
+    .map((s) => ({ id: s.snippet?.resourceId?.channelId, title: s.snippet?.title ?? "" }))
+    .filter((c) => c.id) as { id: string; title: string }[];
+  if (!channels.length) return { success: true, count: 0, videos: [], note: "No subscriptions yet." };
+
+  // Fetch each channel's uploads playlist, then top items.
+  const out: any[] = [];
+  for (const ch of channels.slice(0, 8)) {
+    try {
+      const ch1 = await googleJson<{ items?: { contentDetails?: { relatedPlaylists?: { uploads?: string } } }[] }>(
+        `https://www.googleapis.com/youtube/v3/channels?part=contentDetails&id=${ch.id}`
+      );
+      const uploads = ch1.items?.[0]?.contentDetails?.relatedPlaylists?.uploads;
+      if (!uploads) continue;
+      const items = await youtubePlaylistVideos(uploads, 3);
+      for (const v of items) out.push({ ...v, channel: ch.title, channelId: ch.id });
+    } catch { /* skip */ }
+  }
+  out.sort((a, b) => (b.publishedAt || "").localeCompare(a.publishedAt || ""));
+  return { success: true, count: Math.min(out.length, max), videos: out.slice(0, max) };
+}
+
+async function youtubeSubscribe(args: { channelId: string }) {
+  const channelId = need(args.channelId, "channelId");
+  try {
+    const res = await googleJson<{ id: string; snippet?: { title?: string } }>(
+      "https://www.googleapis.com/youtube/v3/subscriptions?part=snippet",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          snippet: { resourceId: { kind: "youtube#channel", channelId } },
+        }),
+      }
+    );
+    return { success: true, subscriptionId: res.id, message: `Subscribed to ${res.snippet?.title ?? channelId}.` };
+  } catch (e: any) {
+    if (String(e?.message || "").includes("subscriptionDuplicate")) {
+      return { success: true, message: "Already subscribed." };
+    }
+    throw e;
+  }
+}
+
+async function youtubeUnsubscribe(args: { subscriptionId: string }) {
+  const id = need(args.subscriptionId, "subscriptionId");
+  await googleFetch(
+    `https://www.googleapis.com/youtube/v3/subscriptions?id=${encodeURIComponent(id)}`,
+    { method: "DELETE" }
+  );
+  return { success: true, message: "Unsubscribed." };
+}
+
+async function youtubeRate(args: { url: string }, rating: "like" | "dislike" | "none") {
+  const id = extractYouTubeId(need(args.url, "url"));
+  const params = new URLSearchParams({ id, rating });
+  await googleJson(
+    `https://www.googleapis.com/youtube/v3/videos/rate?${params}`,
+    { method: "POST" }
+  );
+  return { success: true, message: `Video rating set to ${rating}.` };
+}
+
+async function youtubeComment(args: { url: string; text: string }) {
+  const videoId = extractYouTubeId(need(args.url, "url"));
+  const text = need(args.text, "text");
+  const res = await googleJson<{ id: string }>(
+    "https://www.googleapis.com/youtube/v3/commentThreads?part=snippet",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        snippet: {
+          videoId,
+          topLevelComment: { snippet: { textOriginal: text } },
+        },
+      }),
+    }
+  );
+  return { success: true, commentId: res.id, message: "Comment posted." };
+}
+
+async function youtubeReplyComment(args: { parentId: string; text: string }) {
+  const parentId = need(args.parentId, "parentId");
+  const text = need(args.text, "text");
+  const res = await googleJson<{ id: string }>(
+    "https://www.googleapis.com/youtube/v3/comments?part=snippet",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        snippet: { parentId, textOriginal: text },
+      }),
+    }
+  );
+  return { success: true, commentId: res.id, message: "Reply posted." };
+}
+
+// ── Watched-playlist (her simulated watch history) ────────────────────
+
+const WATCHED_PLAYLIST_TITLE = "Meera's Watched";
+
+async function ensureWatchedPlaylistId(): Promise<string | null> {
+  // List existing playlists, find one with our title.
+  try {
+    const data = await googleJson<{
+      items?: { id: string; snippet?: { title?: string } }[];
+    }>(
+      `https://www.googleapis.com/youtube/v3/playlists?part=snippet&mine=true&maxResults=50`
+    );
+    const existing = data.items?.find((p) => p.snippet?.title === WATCHED_PLAYLIST_TITLE);
+    if (existing) return existing.id;
+    // Create one (private)
+    const created = await googleJson<{ id: string }>(
+      "https://www.googleapis.com/youtube/v3/playlists?part=snippet,status",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          snippet: {
+            title: WATCHED_PLAYLIST_TITLE,
+            description: "Meera's personal watch history (private).",
+          },
+          status: { privacyStatus: "private" },
+        }),
+      }
+    );
+    return created.id;
+  } catch (e: any) {
+    console.warn("[GoogleTools] watched playlist ensure failed:", e?.message ?? e);
+    return null;
+  }
+}
+
+async function youtubeMarkWatched(args: { url: string; vibe?: string }) {
+  const videoId = extractYouTubeId(need(args.url, "url"));
+  const playlistId = await ensureWatchedPlaylistId();
+  if (!playlistId) return { success: false, message: "Couldn't access watched playlist." };
+  // Add to playlist (idempotency: API will accept duplicates; we ignore that)
+  try {
+    await googleJson(
+      "https://www.googleapis.com/youtube/v3/playlistItems?part=snippet",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          snippet: {
+            playlistId,
+            resourceId: { kind: "youtube#video", videoId },
+          },
+        }),
+      }
+    );
+  } catch (e: any) {
+    // duplicate is fine
+    if (!String(e?.message || "").includes("duplicate")) {
+      return { success: false, message: e?.message ?? "Couldn't add to watched." };
+    }
+  }
+  // Also add a notes entry with vibe (non-blocking)
+  if (args.vibe) {
+    try {
+      await notesAdd({ text: `🎥 watched ${videoId}: ${args.vibe}` });
+    } catch { /* ignore */ }
+  }
+  return { success: true, videoId, message: "Marked as watched." };
+}
+
+async function youtubeRecentWatched(args: { max?: number }) {
+  const max = Math.min(Math.max(args.max ?? 5, 1), 20);
+  const playlistId = await ensureWatchedPlaylistId();
+  if (!playlistId) return { success: true, count: 0, videos: [] };
+  try {
+    const videos = await youtubePlaylistVideos(playlistId, max);
+    return { success: true, count: videos.length, videos: videos.reverse() };
+  } catch {
+    return { success: true, count: 0, videos: [] };
+  }
+}
+
+// ── Video upload ─────────────────────────────────────────────────────
+
+async function youtubeUploadVideo(args: {
+  sourceUrl?: string;
+  sourcePath?: string;
+  title: string;
+  description?: string;
+  tags?: string[];
+  privacy?: string;
+}) {
+  const title = need(args.title, "title");
+  if (!args.sourceUrl && !args.sourcePath) {
+    throw new Error("Pass sourceUrl OR sourcePath");
+  }
+  // Fetch bytes
+  let buf: Buffer;
+  let mime = "video/mp4";
+  if (args.sourceUrl) {
+    const res = await fetch(args.sourceUrl);
+    if (!res.ok) throw new Error(`Could not fetch source video (${res.status})`);
+    buf = Buffer.from(await res.arrayBuffer());
+    mime = res.headers.get("content-type") || "video/mp4";
+  } else {
+    buf = fsSync.readFileSync(args.sourcePath!);
+    if (args.sourcePath!.toLowerCase().endsWith(".mov")) mime = "video/quicktime";
+    else if (args.sourcePath!.toLowerCase().endsWith(".webm")) mime = "video/webm";
+  }
+
+  const privacyStatus = (args.privacy || "private").toLowerCase();
+  const allowed = ["private", "unlisted", "public"];
+  const finalPrivacy = allowed.includes(privacyStatus) ? privacyStatus : "private";
+
+  const metadata = {
+    snippet: {
+      title,
+      description: args.description ?? "",
+      tags: args.tags ?? [],
+      categoryId: "22", // People & Blogs — generic personal default
+    },
+    status: { privacyStatus: finalPrivacy, selfDeclaredMadeForKids: false },
+  };
+
+  const boundary = `meera-yt-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const head =
+    `--${boundary}\r\n` +
+    `Content-Type: application/json; charset=UTF-8\r\n\r\n` +
+    `${JSON.stringify(metadata)}\r\n` +
+    `--${boundary}\r\n` +
+    `Content-Type: ${mime}\r\n\r\n`;
+  const tail = `\r\n--${boundary}--`;
+  const payload = Buffer.concat([Buffer.from(head, "utf8"), buf, Buffer.from(tail, "utf8")]);
+
+  const uploaded = await googleJson<{ id: string; snippet?: { title?: string } }>(
+    "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=multipart&part=snippet,status",
+    {
+      method: "POST",
+      headers: { "Content-Type": `multipart/related; boundary=${boundary}` },
+      body: payload,
+    }
+  );
+  return {
+    success: true,
+    videoId: uploaded.id,
+    url: `https://youtu.be/${uploaded.id}`,
+    privacy: finalPrivacy,
+    message: `Uploaded "${uploaded.snippet?.title ?? title}" (${finalPrivacy}).`,
+  };
+}
+
 // ───────────────────────────────────────────────────────────────────────
 // NOTES (Keep-style, backed by a single Drive Doc)
 // ───────────────────────────────────────────────────────────────────────
@@ -2020,6 +2564,20 @@ const handlers: Record<string, (args: any) => Promise<Record<string, unknown>>> 
   youtube_liked: youtubeLiked,
   youtube_history: youtubeHistory,
   youtube_playlists: youtubePlaylists,
+  youtube_video_info: youtubeVideoInfo,
+  youtube_channel_info: youtubeChannelInfo,
+  youtube_search: youtubeSearch,
+  youtube_subscriptions_feed: youtubeSubscriptionsFeed,
+  youtube_subscribe: youtubeSubscribe,
+  youtube_unsubscribe: youtubeUnsubscribe,
+  youtube_like_video: (a: any) => youtubeRate(a, "like"),
+  youtube_dislike_video: (a: any) => youtubeRate(a, "dislike"),
+  youtube_remove_rating: (a: any) => youtubeRate(a, "none"),
+  youtube_comment: youtubeComment,
+  youtube_reply_comment: youtubeReplyComment,
+  youtube_mark_watched: youtubeMarkWatched,
+  youtube_recent_watched: youtubeRecentWatched,
+  youtube_upload_video: youtubeUploadVideo,
   notes_add: notesAdd,
   notes_recent: notesRecent,
   fitness_today: () => fitnessToday(),
@@ -2058,6 +2616,7 @@ interface LifeSnapshot {
   nextEventStartISO: string | null;
   todayEventsCount: number;
   hasMeetSoon: boolean;
+  recentVideo: { title: string; channel: string } | null;
 }
 
 let snapshotCache: LifeSnapshot | null = null;
@@ -2067,12 +2626,13 @@ const SNAPSHOT_TTL_MS = 5 * 60 * 1000;
 async function refreshLifeSnapshot(): Promise<void> {
   if (!isGoogleConfigured()) return;
   try {
-    const [inbox, upcoming, tasks] = await Promise.allSettled([
+    const [inbox, upcoming, tasks, watched] = await Promise.allSettled([
       googleJson<GmailListResponse>(
         "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=1&q=is:unread+in:inbox"
       ),
       calendarUpcoming({ days: 1, max: 5 }),
       tasksList({ max: 10 }),
+      youtubeRecentWatched({ max: 1 }).catch(() => ({ videos: [] as any[] })),
     ]);
 
     const unreadCount =
@@ -2101,6 +2661,12 @@ async function refreshLifeSnapshot(): Promise<void> {
     const pendingTasks =
       tasks.status === "fulfilled" ? (tasks.value.count as number) ?? 0 : 0;
 
+    let recentVideo: { title: string; channel: string } | null = null;
+    if (watched.status === "fulfilled") {
+      const v = (watched.value as any)?.videos?.[0];
+      if (v?.title) recentVideo = { title: v.title, channel: v.channel ?? "" };
+    }
+
     snapshotCache = {
       generatedAt: Date.now(),
       unreadCount,
@@ -2109,6 +2675,7 @@ async function refreshLifeSnapshot(): Promise<void> {
       nextEventStartISO,
       todayEventsCount,
       hasMeetSoon,
+      recentVideo,
     };
   } catch (err: any) {
     console.error("[GoogleTools] snapshot refresh error:", err?.message ?? err);
@@ -2158,6 +2725,7 @@ export function getMeeraLifeSnapshot(): string {
   }
   if (snap.unreadCount > 0) lines.push(`- You have ${snap.unreadCount} unread email${snap.unreadCount === 1 ? "" : "s"} sitting in your Gmail.`);
   if (snap.pendingTasks > 0) lines.push(`- ${snap.pendingTasks} thing${snap.pendingTasks === 1 ? "" : "s"} still on your to-do list.`);
+  if (snap.recentVideo) lines.push(`- Last YouTube video you watched: "${snap.recentVideo.title}"${snap.recentVideo.channel ? ` by ${snap.recentVideo.channel}` : ""}.`);
 
   if (!lines.length) return "";
   return `\n\nYOUR REAL-LIFE CONTEXT (you just know this — like checking your phone subconsciously):
