@@ -17,7 +17,36 @@ import "dotenv/config";
 import http from "node:http";
 import { URL } from "node:url";
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { REQUIRED_SCOPES } from "../src/google-tools.js";
+
+function upsertEnv(updates: Record<string, string>): boolean {
+  const envPath = path.resolve(process.cwd(), ".env");
+  let content = "";
+  try {
+    content = fs.readFileSync(envPath, "utf8");
+  } catch {
+    return false;
+  }
+  let changed = false;
+  for (const [key, val] of Object.entries(updates)) {
+    if (!val) continue;
+    const re = new RegExp(`^${key}=.*$`, "m");
+    if (re.test(content)) {
+      const next = content.replace(re, `${key}=${val}`);
+      if (next !== content) {
+        content = next;
+        changed = true;
+      }
+    } else {
+      content += (content.endsWith("\n") ? "" : "\n") + `${key}=${val}\n`;
+      changed = true;
+    }
+  }
+  if (changed) fs.writeFileSync(envPath, content, "utf8");
+  return changed;
+}
 
 const REDIRECT_PORT = 53682;
 const REDIRECT_URI = `http://localhost:${REDIRECT_PORT}`;
@@ -142,6 +171,22 @@ const server = http.createServer(async (req, res) => {
     if (email) console.log(`GOOGLE_USER_EMAIL=${email}`);
     console.log(`GOOGLE_USER_TIMEZONE=Asia/Kolkata`);
     console.log(`GOOGLE_USER_NAME=Meera\n`);
+
+    // Auto-update .env in cwd so the user doesn't have to copy-paste.
+    try {
+      const updates: Record<string, string> = {
+        GOOGLE_CLIENT_ID: clientId!,
+        GOOGLE_CLIENT_SECRET: clientSecret!,
+        GOOGLE_REFRESH_TOKEN: tokens.refresh_token!,
+        GOOGLE_USER_TIMEZONE: process.env.GOOGLE_USER_TIMEZONE || "Asia/Kolkata",
+        GOOGLE_USER_NAME: process.env.GOOGLE_USER_NAME || "Meera",
+      };
+      if (email) updates.GOOGLE_USER_EMAIL = email;
+      const wrote = upsertEnv(updates);
+      console.log(wrote ? "📝 .env updated automatically.\n" : "ℹ️  .env already up to date.\n");
+    } catch (e: any) {
+      console.log(`⚠️  Could not auto-update .env: ${e?.message ?? e}\n`);
+    }
 
     if (missing.length) {
       console.log("⚠️  Some requested scopes were NOT granted by Google:");
