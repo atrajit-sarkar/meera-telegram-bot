@@ -2254,7 +2254,7 @@ async function youtubeRate(args: { url: string }, rating: "like" | "dislike" | "
 async function youtubeComment(args: { url: string; text: string }) {
   const videoId = extractYouTubeId(need(args.url, "url"));
   const text = need(args.text, "text");
-  const res = await googleJson<{ id: string }>(
+  const res = await googleJson<{ id: string; snippet?: { topLevelComment?: { id?: string } } }>(
     "https://www.googleapis.com/youtube/v3/commentThreads?part=snippet",
     {
       method: "POST",
@@ -2266,7 +2266,10 @@ async function youtubeComment(args: { url: string; text: string }) {
       }),
     }
   );
-  return { success: true, commentId: res.id, message: "Comment posted." };
+  // For YouTube deep-links (&lc=...) the COMMENT id is required, not the thread id.
+  // Top-level comment id lives at snippet.topLevelComment.id; fall back to thread id.
+  const commentId = res?.snippet?.topLevelComment?.id || res.id;
+  return { success: true, commentId, threadId: res.id, message: "Comment posted." };
 }
 
 async function youtubeReplyComment(args: { parentId: string; text: string }) {

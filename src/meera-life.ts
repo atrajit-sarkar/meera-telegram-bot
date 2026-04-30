@@ -560,6 +560,18 @@ export function drainPendingYoutubeShares(): YoutubeCommentShare[] {
   return out;
 }
 
+/**
+ * Put shares back at the front of the queue when the proactive loop couldn't
+ * deliver them (e.g. quiet hours, no eligible recipient). Caps queue at 20
+ * to prevent unbounded growth.
+ */
+export function requeueYoutubeShares(shares: YoutubeCommentShare[]): void {
+  pendingYoutubeShares.unshift(...shares);
+  if (pendingYoutubeShares.length > 20) {
+    pendingYoutubeShares.splice(20);
+  }
+}
+
 function pickRandom<T>(arr: T[]): T {
   return arr[Math.floor(Math.random() * arr.length)];
 }

@@ -5,7 +5,7 @@ import { execFile } from "child_process";
 import ffmpegPath from "ffmpeg-static";
 import { SessionManager } from "./session-manager.js";
 import { toolDeclarations, executeToolCall } from "./tools.js";
-import { startMeeraLife, drainPendingYoutubeShares } from "./meera-life.js";
+import { startMeeraLife, drainPendingYoutubeShares, requeueYoutubeShares } from "./meera-life.js";
 import {
   getBotName,
   buildOllamaMessages,
@@ -5086,41 +5086,43 @@ async function proactiveLoop() {
         bestUser = { userId, chatId: user.chatId, tier };
       }
     }
-    if (bestUser) {
-      const hour = getISTHour();
-      const okHour = !(hour >= 1 && hour < 7);
-      if (okHour) {
-        for (const share of ytShares) {
-          try {
-            const intros = bestUser.tier === "close"
-              ? [
-                  `okay you HAVE to see what i just commented on lmaooo`,
-                  `bro i actually commented on a video, look 😭`,
-                  `okay random but i was watching this and had to comment`,
-                  `couldn't help myself, commented on this one 😩`,
-                ]
-              : [
-                  `random share — i just commented on this one haha`,
-                  `was scrolling youtube and commented on this lol`,
-                  `okay this video had me, i commented and everything`,
-                ];
-            const intro = intros[Math.floor(Math.random() * intros.length)];
-            const body = `${intro}\n\n"${share.videoTitle}" — ${share.channel}\n${share.videoUrl}\n\nmy comment: "${share.commentText}"\n${share.commentLink}`;
-            await bot.telegram.sendMessage(bestUser.chatId, body, { disable_web_page_preview: false } as any);
-            store.addMessage(bestUser.userId, "assistant", body);
-            store.updateUser(bestUser.userId, { proactiveSent: true, lastProactiveSentAt: Date.now() });
-            totalSent++;
-            console.log(`[Proactive] YT comment-share -> user ${bestUser.userId}: "${share.commentText}"`);
-            // Stagger if multiple
-            await new Promise((r) => setTimeout(r, 4000));
-          } catch (err) {
-            console.error(`[Proactive] YT share send failed:`, err);
-          }
+    const hour = getISTHour();
+    const okHour = !(hour >= 1 && hour < 7);
+    if (bestUser && okHour) {
+      for (const share of ytShares) {
+        try {
+          const intros = bestUser.tier === "close"
+            ? [
+                `okay you HAVE to see what i just commented on lmaooo`,
+                `bro i actually commented on a video, look 😭`,
+                `okay random but i was watching this and had to comment`,
+                `couldn't help myself, commented on this one 😩`,
+              ]
+            : [
+                `random share — i just commented on this one haha`,
+                `was scrolling youtube and commented on this lol`,
+                `okay this video had me, i commented and everything`,
+              ];
+          const intro = intros[Math.floor(Math.random() * intros.length)];
+          const body = `${intro}\n\n"${share.videoTitle}" — ${share.channel}\n${share.videoUrl}\n\nmy comment: "${share.commentText}"\n${share.commentLink}`;
+          await bot.telegram.sendMessage(bestUser.chatId, body, { disable_web_page_preview: false } as any);
+          store.addMessage(bestUser.userId, "assistant", body);
+          store.updateUser(bestUser.userId, { proactiveSent: true, lastProactiveSentAt: Date.now() });
+          totalSent++;
+          console.log(`[Proactive] YT comment-share -> user ${bestUser.userId}: "${share.commentText}"`);
+          // Stagger if multiple
+          await new Promise((r) => setTimeout(r, 4000));
+        } catch (err) {
+          console.error(`[Proactive] YT share send failed:`, err);
         }
-      } else {
-        // Re-queue for the next loop if it's quiet hours
-        // (drained shares — push back so we don't lose them)
-        // Lightweight: just skip; next batch will replace them naturally.
+      }
+    } else {
+      // No eligible user (or quiet hours) — re-queue so the share isn't lost.
+      // Drop anything older than 12h to avoid stale buildup.
+      const fresh = ytShares.filter((s) => Date.now() - s.createdAt < 12 * 60 * 60 * 1000);
+      if (fresh.length) {
+        requeueYoutubeShares(fresh);
+        console.log(`[Proactive] YT shares re-queued (${fresh.length}) — ${bestUser ? "quiet hours" : "no eligible user"}`);
       }
     }
   }
