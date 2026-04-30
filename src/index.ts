@@ -5,6 +5,7 @@ import { execFile } from "child_process";
 import ffmpegPath from "ffmpeg-static";
 import { SessionManager } from "./session-manager.js";
 import { toolDeclarations, executeToolCall } from "./tools.js";
+import { startMeeraLife } from "./meera-life.js";
 import {
   getBotName,
   buildOllamaMessages,
@@ -5215,6 +5216,9 @@ console.log(`Starting ${botName} Telegram bot...`);
 
 bot.launch({ allowedUpdates: ["message", "callback_query", "poll_answer", "message_reaction"] }).then(async () => {
   console.log(`🤖 ${botName} Telegram bot is running!`);
+
+  // Kick off Meera's autonomous life loop (calendar routine, weekly chores, daily journal).
+  startMeeraLife();
 
   // Register commands so Telegram shows autocomplete suggestions when user types /
   await bot.telegram.setMyCommands([
