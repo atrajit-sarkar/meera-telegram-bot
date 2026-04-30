@@ -32,16 +32,14 @@ export const REQUIRED_SCOPES = [
   "https://www.googleapis.com/auth/tasks",                            // Google Tasks
   "https://www.googleapis.com/auth/contacts",                         // People (read/write)
   "https://www.googleapis.com/auth/contacts.other.readonly",
-  "https://www.googleapis.com/auth/drive",                            // Drive
+  "https://www.googleapis.com/auth/drive",                            // Drive (also creates Google Docs)
   "https://www.googleapis.com/auth/drive.file",
-  "https://www.googleapis.com/auth/documents",                        // Google Docs (journal)
-  // Google Photos: full library access (read + create media items + albums)
-  // Note: As of March 2025 the standard library API only exposes media
-  // created by the same OAuth client. That's fine for Meera — she'll be
-  // creating her own photos/videos via the bot.
-  "https://www.googleapis.com/auth/photoslibrary",                    // Photos full
-  "https://www.googleapis.com/auth/photoslibrary.appendonly",         // Photos upload
-  "https://www.googleapis.com/auth/photoslibrary.edit.appcreateddata", // Photos edit metadata
+  // Google Photos — only the "app-created" surface is available to new third-party
+  // apps as of March 2025. That's enough for Meera: she uploads new photos/videos
+  // herself and can read/edit only what she put there.
+  "https://www.googleapis.com/auth/photoslibrary.appendonly",          // upload
+  "https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata", // read app-created items
+  "https://www.googleapis.com/auth/photoslibrary.edit.appcreateddata",  // edit captions on app-created items
 ];
 
 // ───────────────────────────────────────────────────────────────────────
@@ -348,7 +346,7 @@ export const googleToolDeclarations: ToolDeclaration[] = [
   {
     name: "photos_recent",
     description:
-      "List Meera's most recent Google Photos (her own camera roll). Returns mediaUrl + metadata. Use sparingly, only when relevant (e.g. user asks 'show me a pic from your day').",
+      "List the photos/videos Meera has saved to her Google Photos through the bot (her bot-side memory roll). Returns id + URL + filename.",
     parameters: {
       type: "object",
       properties: { max: { type: "integer", description: "Default 5, max 25" } },
@@ -357,17 +355,13 @@ export const googleToolDeclarations: ToolDeclaration[] = [
   {
     name: "photos_search",
     description:
-      "Search Meera's Google Photos by content category (e.g. PEOPLE, FOOD, TRAVEL, ANIMALS, SELFIES). Returns matching media items.",
+      "(Deprecated) Returns the same items as photos_recent. Google Photos no longer lets new apps search the user's full library — only items the app uploaded itself are visible.",
     parameters: {
       type: "object",
       properties: {
-        category: {
-          type: "string",
-          description: "Photos content category (FOOD, TRAVEL, PEOPLE, SELFIES, ANIMALS, NATURE, etc.)",
-        },
+        category: { type: "string", description: "Ignored (kept for compatibility)" },
         max: { type: "integer", description: "Default 5" },
       },
-      required: ["category"],
     },
   },
 
@@ -416,7 +410,7 @@ export const googleToolDeclarations: ToolDeclaration[] = [
   },
   {
     name: "photos_list_albums",
-    description: "List the albums in Meera's Google Photos library that this app can access.",
+    description: "List the albums in Meera's Google Photos that this bot has created.",
     parameters: {
       type: "object",
       properties: { max: { type: "integer", description: "Default 10" } },
@@ -430,7 +424,6 @@ export const googleToolDeclarations: ToolDeclaration[] = [
       type: "object",
       properties: {
         title: { type: "string" },
-        share: { type: "boolean", description: "Make it shareable via link (default false)" },
       },
       required: ["title"],
     },
@@ -1236,33 +1229,11 @@ async function photosRecent(args: { max?: number }) {
   }
 }
 
-async function photosSearch(args: { category: string; max?: number }) {
-  const category = need(args.category, "category").toUpperCase();
-  const max = Math.min(Math.max(args.max ?? 5, 1), 25);
-  try {
-    const data = await googleJson<{ mediaItems?: PhotoMediaItem[] }>(
-      "https://photoslibrary.googleapis.com/v1/mediaItems:search",
-      {
-        method: "POST",
-        body: JSON.stringify({
-          pageSize: max,
-          filters: { contentFilter: { includedContentCategories: [category] } },
-        }),
-      }
-    );
-    const items = (data.mediaItems ?? []).map((m) => ({
-      id: m.id,
-      filename: m.filename,
-      url: m.baseUrl ? `${m.baseUrl}=w1024-h1024` : "",
-      createdAt: m.mediaMetadata?.creationTime,
-    }));
-    return { success: true, count: items.length, photos: items };
-  } catch (err: any) {
-    if (String(err?.message || "").includes("403")) {
-      return { success: false, message: "Google Photos scope not granted yet — re-run `npm run auth:google`." };
-    }
-    throw err;
-  }
+async function photosSearch(args: { category?: string; max?: number }) {
+  // As of March 2025, content-category search requires full library access
+  // which new third-party apps no longer get. Fall back to listing app-created
+  // items so this tool still returns something useful.
+  return photosRecent({ max: args.max });
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -1403,31 +1374,18 @@ async function photosListAlbums(args: { max?: number }) {
   return { success: true, count: albums.length, albums };
 }
 
-async function photosCreateAlbum(args: { title: string; share?: boolean }) {
+async function photosCreateAlbum(args: { title: string }) {
   const title = need(args.title, "title");
   const album = await googleJson<{ id: string; productUrl?: string; title?: string }>(
     "https://photoslibrary.googleapis.com/v1/albums",
     { method: "POST", body: JSON.stringify({ album: { title } }) }
   );
-  let shareUrl: string | undefined;
-  if (args.share) {
-    try {
-      const shared = await googleJson<{ shareInfo?: { shareableUrl?: string } }>(
-        `https://photoslibrary.googleapis.com/v1/albums/${album.id}:share`,
-        { method: "POST", body: JSON.stringify({ sharedAlbumOptions: { isCollaborative: false, isCommentable: true } }) }
-      );
-      shareUrl = shared.shareInfo?.shareableUrl;
-    } catch (e: any) {
-      console.warn("[GoogleTools] album share failed:", e?.message ?? e);
-    }
-  }
   return {
     success: true,
     albumId: album.id,
     title: album.title ?? title,
     url: album.productUrl,
-    shareUrl,
-    message: shareUrl ? "Album created & shared." : "Album created.",
+    message: "Album created.",
   };
 }
 

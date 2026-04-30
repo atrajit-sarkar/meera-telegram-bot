@@ -117,6 +117,24 @@ const server = http.createServer(async (req, res) => {
 
     reply(200, "✅ Meera is connected to Google. You can close this tab.");
 
+    // Verify which scopes were actually granted (Google silently drops ones
+    // not enabled in Cloud Console / not ticked in granular consent).
+    let grantedScopes: string[] = [];
+    try {
+      const ti = await fetch(
+        `https://oauth2.googleapis.com/tokeninfo?access_token=${tokens.access_token}`
+      );
+      const tj = (await ti.json()) as { scope?: string };
+      grantedScopes = (tj.scope ?? "").split(/\s+/).filter(Boolean);
+    } catch {
+      /* ignore */
+    }
+    const expanded = new Set(grantedScopes);
+    // tokeninfo collapses these — accept either form
+    if (expanded.has("email")) expanded.add("https://www.googleapis.com/auth/userinfo.email");
+    if (expanded.has("profile")) expanded.add("https://www.googleapis.com/auth/userinfo.profile");
+    const missing = REQUIRED_SCOPES.filter((s) => !expanded.has(s));
+
     console.log("\n✅ Success! Add the following to your .env:\n");
     console.log(`GOOGLE_CLIENT_ID=${clientId}`);
     console.log(`GOOGLE_CLIENT_SECRET=${clientSecret}`);
@@ -124,6 +142,19 @@ const server = http.createServer(async (req, res) => {
     if (email) console.log(`GOOGLE_USER_EMAIL=${email}`);
     console.log(`GOOGLE_USER_TIMEZONE=Asia/Kolkata`);
     console.log(`GOOGLE_USER_NAME=Meera\n`);
+
+    if (missing.length) {
+      console.log("⚠️  Some requested scopes were NOT granted by Google:");
+      for (const s of missing) console.log("    ✗", s);
+      console.log(
+        "\n   Likely fixes:\n" +
+          "   1. Enable the corresponding API in Google Cloud Console.\n" +
+          "   2. Add the scope under OAuth consent screen → Scopes.\n" +
+          "   3. Re-run this script and tick every permission box.\n"
+      );
+    } else {
+      console.log("✅ All requested scopes were granted.\n");
+    }
     server.close();
     process.exit(0);
   } catch (e: any) {
