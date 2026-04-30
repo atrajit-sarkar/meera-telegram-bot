@@ -47,6 +47,15 @@ async function main() {
   header("drive_recent");
   pretty(await executeGoogleTool("drive_recent", { max: 3 }));
 
+  header("calendar_find_free_slot  (30min within 3 days)");
+  pretty(await executeGoogleTool("calendar_find_free_slot", { durationMinutes: 30, withinDays: 3 }));
+
+  header("photos_list_albums  (Photos write scope check)");
+  pretty(await executeGoogleTool("photos_list_albums", { max: 3 }));
+
+  header("photos_recent  (Photos read scope check)");
+  pretty(await executeGoogleTool("photos_recent", { max: 3 }));
+
   header("Life snapshot (this is what gets injected into the system prompt)");
   warmGoogleSnapshot();
   // Snapshot is async on first call — poll for up to 8s while it fills.

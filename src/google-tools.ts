@@ -35,7 +35,13 @@ export const REQUIRED_SCOPES = [
   "https://www.googleapis.com/auth/drive",                            // Drive
   "https://www.googleapis.com/auth/drive.file",
   "https://www.googleapis.com/auth/documents",                        // Google Docs (journal)
-  "https://www.googleapis.com/auth/photoslibrary.readonly",           // Google Photos read
+  // Google Photos: full library access (read + create media items + albums)
+  // Note: As of March 2025 the standard library API only exposes media
+  // created by the same OAuth client. That's fine for Meera — she'll be
+  // creating her own photos/videos via the bot.
+  "https://www.googleapis.com/auth/photoslibrary",                    // Photos full
+  "https://www.googleapis.com/auth/photoslibrary.appendonly",         // Photos upload
+  "https://www.googleapis.com/auth/photoslibrary.edit.appcreateddata", // Photos edit metadata
 ];
 
 // ───────────────────────────────────────────────────────────────────────
@@ -392,34 +398,71 @@ export const googleToolDeclarations: ToolDeclaration[] = [
     },
   },
 
-  // ── Maps / Places (only if MAPS_API_KEY set) ─────────────────────────
+  // ── Google Photos (write & edit) ─────────────────────────────────────
   {
-    name: "maps_search_places",
+    name: "photos_upload_url",
     description:
-      "Search Google Maps for places near a location (cafes, restaurants, gyms, etc.). Returns name, address, rating. Useful when user asks for recommendations or 'where to go'.",
+      "Download a photo OR video from a public URL and save it to Meera's Google Photos library (her camera roll). Optionally caption it and drop it into an album. Use this for personal/memory media — selfies, moments, snaps. For documents/files use Drive instead.",
     parameters: {
       type: "object",
       properties: {
-        query: { type: "string", description: "What to search for, e.g. 'coffee shops'" },
-        near: { type: "string", description: "Location text, e.g. 'Bandra Mumbai' (default Meera's city)" },
-        max: { type: "integer", description: "Default 5" },
+        url: { type: "string", description: "Public URL of the photo or video" },
+        description: { type: "string", description: "Optional caption / description" },
+        filename: { type: "string", description: "Optional filename" },
+        albumId: { type: "string", description: "Optional album ID to add it to (from photos_list_albums)" },
       },
-      required: ["query"],
+      required: ["url"],
     },
   },
-
-  // ── Web search (only if GOOGLE_CSE_ID + GOOGLE_SEARCH_KEY set) ───────
   {
-    name: "web_search",
+    name: "photos_list_albums",
+    description: "List the albums in Meera's Google Photos library that this app can access.",
+    parameters: {
+      type: "object",
+      properties: { max: { type: "integer", description: "Default 10" } },
+    },
+  },
+  {
+    name: "photos_create_album",
     description:
-      "Search the web (Google) for current information. Returns top results with title, snippet, link. Use when the user asks something Meera wouldn't naturally know — news, facts, lookups.",
+      "Create a new album in Meera's Google Photos. Use when she wants to start a new memory collection (e.g. 'College Trip 2026').",
     parameters: {
       type: "object",
       properties: {
-        query: { type: "string" },
-        max: { type: "integer", description: "Default 5" },
+        title: { type: "string" },
+        share: { type: "boolean", description: "Make it shareable via link (default false)" },
       },
-      required: ["query"],
+      required: ["title"],
+    },
+  },
+  {
+    name: "photos_add_to_album",
+    description:
+      "Add an existing media item (from photos_recent / photos_upload_url) to one of Meera's albums.",
+    parameters: {
+      type: "object",
+      properties: {
+        albumId: { type: "string" },
+        mediaItemIds: {
+          type: "array",
+          items: { type: "string" },
+          description: "One or more media item IDs",
+        },
+      },
+      required: ["albumId", "mediaItemIds"],
+    },
+  },
+  {
+    name: "photos_describe",
+    description:
+      "Update / edit the description (caption) of a media item in Meera's Google Photos. Only works on items the bot has uploaded itself.",
+    parameters: {
+      type: "object",
+      properties: {
+        mediaItemId: { type: "string" },
+        description: { type: "string" },
+      },
+      required: ["mediaItemId", "description"],
     },
   },
 
@@ -1256,68 +1299,157 @@ async function tasksDelete(args: { taskId: string }) {
 }
 
 // ───────────────────────────────────────────────────────────────────────
-// MAPS / PLACES (Places API v1, optional — needs MAPS_API_KEY)
+// GOOGLE PHOTOS — write / album management
 // ───────────────────────────────────────────────────────────────────────
 
-async function mapsSearchPlaces(args: { query: string; near?: string; max?: number }) {
-  const key = process.env.MAPS_API_KEY || process.env.GOOGLE_MAPS_API_KEY;
-  if (!key) {
-    return { success: false, message: "Maps API key not configured. Set MAPS_API_KEY in .env to enable place search." };
-  }
-  const query = need(args.query, "query");
-  const max = Math.min(Math.max(args.max ?? 5, 1), 10);
-  const textQuery = args.near ? `${query} near ${args.near}` : query;
-  const res = await fetch("https://places.googleapis.com/v1/places:searchText", {
+/** Upload raw bytes to Google Photos and get an upload token. */
+async function photosUploadBytes(bytes: Buffer, mimeType: string, filename: string): Promise<string> {
+  const res = await googleFetch("https://photoslibrary.googleapis.com/v1/uploads", {
     method: "POST",
     headers: {
-      "Content-Type": "application/json",
-      "X-Goog-Api-Key": key,
-      "X-Goog-FieldMask":
-        "places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.googleMapsUri,places.priceLevel",
+      "Content-Type": "application/octet-stream",
+      "X-Goog-Upload-Content-Type": mimeType,
+      "X-Goog-Upload-Protocol": "raw",
+      "X-Goog-Upload-File-Name": filename,
     },
-    body: JSON.stringify({ textQuery, pageSize: max }),
+    body: new Uint8Array(bytes),
   });
   if (!res.ok) {
-    return { success: false, message: `Places API error ${res.status}` };
+    const txt = await res.text().catch(() => "");
+    throw new Error(`Photos upload bytes failed (${res.status}): ${txt.slice(0, 200)}`);
   }
-  const data: any = await res.json();
-  const places = (data.places ?? []).map((p: any) => ({
-    name: p.displayName?.text ?? "",
-    address: p.formattedAddress ?? "",
-    rating: p.rating,
-    reviews: p.userRatingCount,
-    url: p.googleMapsUri,
-    priceLevel: p.priceLevel,
-  }));
-  return { success: true, count: places.length, places };
+  const token = (await res.text()).trim();
+  if (!token) throw new Error("Photos upload returned empty token");
+  return token;
 }
 
-// ───────────────────────────────────────────────────────────────────────
-// WEB SEARCH (Google Custom Search JSON API, optional)
-// ───────────────────────────────────────────────────────────────────────
+function guessExt(mime: string): string {
+  if (mime.includes("png")) return "png";
+  if (mime.includes("webp")) return "webp";
+  if (mime.includes("gif")) return "gif";
+  if (mime.includes("heic")) return "heic";
+  if (mime.includes("mp4")) return "mp4";
+  if (mime.includes("quicktime")) return "mov";
+  if (mime.includes("webm")) return "webm";
+  if (mime.includes("video")) return "mp4";
+  return "jpg";
+}
 
-async function webSearch(args: { query: string; max?: number }) {
-  const key = process.env.GOOGLE_SEARCH_KEY || process.env.GOOGLE_CSE_KEY;
-  const cx = process.env.GOOGLE_CSE_ID;
-  if (!key || !cx) {
+async function photosUploadUrl(args: {
+  url: string;
+  description?: string;
+  filename?: string;
+  albumId?: string;
+}) {
+  const url = need(args.url, "url");
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Could not fetch source media (${res.status})`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  const mime = res.headers.get("content-type") || "image/jpeg";
+  const ext = guessExt(mime);
+  const filename = args.filename || `meera-${new Date().toISOString().slice(0, 10)}-${Date.now()}.${ext}`;
+
+  const uploadToken = await photosUploadBytes(buf, mime, filename);
+
+  const body: Record<string, unknown> = {
+    newMediaItems: [
+      {
+        description: args.description ?? "",
+        simpleMediaItem: { uploadToken, fileName: filename },
+      },
+    ],
+  };
+  if (args.albumId) body.albumId = args.albumId;
+
+  const created = await googleJson<{
+    newMediaItemResults?: {
+      status?: { message?: string; code?: number };
+      mediaItem?: { id: string; productUrl?: string; baseUrl?: string; filename?: string };
+    }[];
+  }>("https://photoslibrary.googleapis.com/v1/mediaItems:batchCreate", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
+  const result = created.newMediaItemResults?.[0];
+  const item = result?.mediaItem;
+  const status = result?.status;
+  if (!item) {
     return {
       success: false,
-      message: "Web search not configured. Set GOOGLE_SEARCH_KEY + GOOGLE_CSE_ID in .env to enable.",
+      message: status?.message || "Photos rejected the upload.",
     };
   }
-  const query = need(args.query, "query");
-  const max = Math.min(Math.max(args.max ?? 5, 1), 10);
-  const url = `https://www.googleapis.com/customsearch/v1?key=${encodeURIComponent(key)}&cx=${encodeURIComponent(cx)}&num=${max}&q=${encodeURIComponent(query)}`;
-  const res = await fetch(url);
-  if (!res.ok) return { success: false, message: `Search API error ${res.status}` };
-  const data: any = await res.json();
-  const results = (data.items ?? []).map((it: any) => ({
-    title: it.title,
-    link: it.link,
-    snippet: it.snippet,
-    source: it.displayLink,
+  return {
+    success: true,
+    mediaItemId: item.id,
+    productUrl: item.productUrl,
+    filename: item.filename,
+    message: "Saved to Google Photos.",
+  };
+}
+
+async function photosListAlbums(args: { max?: number }) {
+  const max = Math.min(Math.max(args.max ?? 10, 1), 50);
+  const data = await googleJson<{
+    albums?: { id: string; title?: string; mediaItemsCount?: string; productUrl?: string; coverPhotoBaseUrl?: string }[];
+  }>(`https://photoslibrary.googleapis.com/v1/albums?pageSize=${max}`);
+  const albums = (data.albums ?? []).map((a) => ({
+    id: a.id,
+    title: a.title ?? "",
+    count: a.mediaItemsCount ?? "0",
+    url: a.productUrl ?? "",
   }));
-  return { success: true, count: results.length, results };
+  return { success: true, count: albums.length, albums };
+}
+
+async function photosCreateAlbum(args: { title: string; share?: boolean }) {
+  const title = need(args.title, "title");
+  const album = await googleJson<{ id: string; productUrl?: string; title?: string }>(
+    "https://photoslibrary.googleapis.com/v1/albums",
+    { method: "POST", body: JSON.stringify({ album: { title } }) }
+  );
+  let shareUrl: string | undefined;
+  if (args.share) {
+    try {
+      const shared = await googleJson<{ shareInfo?: { shareableUrl?: string } }>(
+        `https://photoslibrary.googleapis.com/v1/albums/${album.id}:share`,
+        { method: "POST", body: JSON.stringify({ sharedAlbumOptions: { isCollaborative: false, isCommentable: true } }) }
+      );
+      shareUrl = shared.shareInfo?.shareableUrl;
+    } catch (e: any) {
+      console.warn("[GoogleTools] album share failed:", e?.message ?? e);
+    }
+  }
+  return {
+    success: true,
+    albumId: album.id,
+    title: album.title ?? title,
+    url: album.productUrl,
+    shareUrl,
+    message: shareUrl ? "Album created & shared." : "Album created.",
+  };
+}
+
+async function photosAddToAlbum(args: { albumId: string; mediaItemIds: string[] }) {
+  const albumId = need(args.albumId, "albumId");
+  const ids = args.mediaItemIds ?? [];
+  if (!ids.length) throw new Error("mediaItemIds is empty");
+  await googleJson(
+    `https://photoslibrary.googleapis.com/v1/albums/${albumId}:batchAddMediaItems`,
+    { method: "POST", body: JSON.stringify({ mediaItemIds: ids }) }
+  );
+  return { success: true, message: `Added ${ids.length} item(s) to album.` };
+}
+
+async function photosDescribe(args: { mediaItemId: string; description: string }) {
+  const id = need(args.mediaItemId, "mediaItemId");
+  const description = args.description ?? "";
+  await googleJson(
+    `https://photoslibrary.googleapis.com/v1/mediaItems/${id}?updateMask=description`,
+    { method: "PATCH", body: JSON.stringify({ description }) }
+  );
+  return { success: true, message: "Caption updated." };
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -1352,8 +1484,11 @@ const handlers: Record<string, (args: any) => Promise<Record<string, unknown>>> 
   drive_delete: driveDelete,
   photos_recent: photosRecent,
   photos_search: photosSearch,
-  maps_search_places: mapsSearchPlaces,
-  web_search: webSearch,
+  photos_upload_url: photosUploadUrl,
+  photos_list_albums: photosListAlbums,
+  photos_create_album: photosCreateAlbum,
+  photos_add_to_album: photosAddToAlbum,
+  photos_describe: photosDescribe,
   google_account_info: async () => ({ success: true, ...getAccountInfo() }),
 };
 
