@@ -18,6 +18,13 @@
 
 import { isGoogleConfigured, googleJson, getAccountInfo } from "./google-account.js";
 import { executeGoogleTool, ensureDriveFolder } from "./google-tools.js";
+import { callOllamaWithRotation, type OllamaMessage } from "./ollama-service.js";
+
+const OLLAMA_LIFE_CONFIG = {
+  host: process.env.OLLAMA_HOST || "https://ollama.com",
+  model: process.env.OLLAMA_MODEL || "gemini-3-flash-preview:cloud",
+  apiKey: process.env.OLLAMA_API_KEY || "",
+};
 
 interface RoutineSlot {
   title: string;
@@ -531,10 +538,115 @@ const DISCOVERY_QUERIES = [
 ];
 
 let lastYoutubeActivity = 0;
-const YT_MIN_GAP_MS = 90 * 60 * 1000; // at most one batch every 90 min
+const YT_MIN_GAP_MS = 30 * 60 * 1000; // soft floor: don't even consider running more than every 30 min
+
+// ── Outbound queue for "share what I commented" pings ──
+//
+// When Meera autonomously comments on a video she vibes with, she sometimes
+// (mood-driven) wants to show the user. The proactive loop in index.ts drains
+// this queue and sends the share to recently-active users.
+export interface YoutubeCommentShare {
+  videoUrl: string;
+  videoTitle: string;
+  channel: string;
+  commentText: string;
+  commentLink: string;
+  createdAt: number;
+}
+const pendingYoutubeShares: YoutubeCommentShare[] = [];
+
+export function drainPendingYoutubeShares(): YoutubeCommentShare[] {
+  const out = pendingYoutubeShares.splice(0, pendingYoutubeShares.length);
+  return out;
+}
 
 function pickRandom<T>(arr: T[]): T {
   return arr[Math.floor(Math.random() * arr.length)];
+}
+
+interface YtVideoAction {
+  videoId: string;
+  watch: boolean;
+  like: boolean;
+  subscribe: boolean;
+  comment: string | null;
+  shareWithUser: boolean;
+}
+interface YtBatchPlan {
+  skip: boolean;
+  actions: YtVideoAction[];
+}
+
+/**
+ * Ask Ollama (acting as Meera) what she wants to do with the candidate videos.
+ * Returns a per-video plan. Falls back to a "skip" plan on any failure so we
+ * never act blindly without her judgement.
+ */
+async function decideYoutubeBatch(candidates: any[], recentTitles: string[]): Promise<YtBatchPlan> {
+  if (!OLLAMA_LIFE_CONFIG.apiKey || !candidates.length) return { skip: true, actions: [] };
+
+  const hour = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", hour12: false });
+  const summary = candidates.slice(0, 10).map((v: any, i: number) =>
+    `${i + 1}. id=${v.videoId} | "${(v.title ?? "").slice(0, 100)}" — ${v.channel ?? "unknown"}`
+  ).join("\n");
+
+  const sys = `You are Meera — a 22-year-old college girl from Kolkata. You are scrolling YouTube right now, like a real person. You decide based on YOUR mood and what looks interesting.
+
+You will be shown candidate videos. Decide PER VIDEO whether you:
+  - "watch": actually watch it (most you scroll past — only watch what genuinely catches your eye)
+  - "like": tap like (only on stuff you really enjoyed)
+  - "subscribe": follow the channel (rare — only if the creator seems genuinely your vibe)
+  - "comment": write a short genuine human comment (very rare — only when something really moves you, makes you laugh, or you have a real reaction worth posting). Lowercase ok, max 12 words, max 1-2 emojis, NO hashtags, NO promotion. Use null when not commenting.
+  - "shareWithUser": after commenting, do you feel like showing your close friend what you commented? (only matters if you commented; mood-based)
+
+Be REAL. Most candidates should NOT get watched. Of those watched, most should NOT get commented. You are not a content farm — you are a girl with taste.
+
+You may also set "skip": true at the top level if you're just not in the mood to scroll YouTube right now.
+
+Respond with ONLY valid JSON, no prose, no markdown fences:
+{
+  "skip": false,
+  "actions": [
+    { "videoId": "xxx", "watch": true, "like": true, "subscribe": false, "comment": null, "shareWithUser": false }
+  ]
+}`;
+
+  const user = `Current time (Kolkata): ${hour}:00
+You recently watched: ${recentTitles.length ? recentTitles.slice(0, 5).map((t) => `"${t}"`).join(", ") : "(nothing recent)"}
+
+Candidate videos in your feed right now:
+${summary}
+
+Decide what to do with each. Return JSON only.`;
+
+  const messages: OllamaMessage[] = [
+    { role: "system", content: sys },
+    { role: "user", content: user },
+  ];
+
+  try {
+    const raw = await callOllamaWithRotation(OLLAMA_LIFE_CONFIG, messages);
+    // Strip code fences if present.
+    const cleaned = raw.replace(/```json\s*|```/gi, "").trim();
+    // Find first { ... last }
+    const start = cleaned.indexOf("{");
+    const end = cleaned.lastIndexOf("}");
+    if (start < 0 || end <= start) return { skip: true, actions: [] };
+    const parsed = JSON.parse(cleaned.slice(start, end + 1));
+    if (parsed?.skip === true) return { skip: true, actions: [] };
+    const actions: YtVideoAction[] = Array.isArray(parsed?.actions) ? parsed.actions.map((a: any) => ({
+      videoId: String(a.videoId ?? ""),
+      watch: !!a.watch,
+      like: !!a.like,
+      subscribe: !!a.subscribe,
+      comment: typeof a.comment === "string" && a.comment.trim() ? a.comment.trim().replace(/^["'`]+|["'`]+$/g, "").slice(0, 240) : null,
+      shareWithUser: !!a.shareWithUser,
+    })).filter((a: YtVideoAction) => a.videoId) : [];
+    return { skip: false, actions };
+  } catch (e: any) {
+    console.warn("[meera-life] yt decision parse failed:", e?.message ?? e);
+    return { skip: true, actions: [] };
+  }
 }
 
 async function youtubeAutonomousIfDue(): Promise<void> {
@@ -561,27 +673,58 @@ async function youtubeAutonomousIfDue(): Promise<void> {
     const seenIds = new Set<string>(
       ((watched?.videos ?? []) as any[]).map((v) => v.videoId).filter(Boolean)
     );
+    const recentTitles: string[] = ((watched?.videos ?? []) as any[]).map((v) => v.title).filter(Boolean);
     const candidates = pool.filter((v: any) => v.videoId && !seenIds.has(v.videoId));
     if (!candidates.length) return;
 
-    // Watch 1-2 randomly.
-    const take = candidates.slice(0, Math.min(2, candidates.length));
-    for (const v of take) {
+    // ── Ask Ollama (Meera) what to do ──
+    const plan = await decideYoutubeBatch(candidates, recentTitles);
+    if (plan.skip || !plan.actions.length) {
+      lastYoutubeActivity = Date.now(); // still respect the gap so we don't re-ask immediately
+      console.log(`[meera-life] youtube: not in the mood, skipping`);
+      return;
+    }
+
+    let watchedCount = 0;
+    for (const action of plan.actions) {
+      if (!action.watch) continue;
+      const v = candidates.find((c: any) => c.videoId === action.videoId);
+      if (!v) continue;
       const url = v.url || `https://youtu.be/${v.videoId}`;
-      try {
-        await executeGoogleTool("youtube_mark_watched", { url });
-      } catch { /* ignore */ }
-      // ~55% like
-      if (Math.random() < 0.55) {
+
+      try { await executeGoogleTool("youtube_mark_watched", { url }); } catch { /* ignore */ }
+      watchedCount++;
+
+      if (action.like) {
         try { await executeGoogleTool("youtube_like_video", { url }); } catch { /* ignore */ }
       }
-      // ~12% subscribe to creator if not already
-      if (v.channelId && Math.random() < 0.12) {
+      if (action.subscribe && v.channelId) {
         try { await executeGoogleTool("youtube_subscribe", { channelId: v.channelId }); } catch { /* ignore */ }
+      }
+      if (action.comment) {
+        try {
+          const posted: any = await executeGoogleTool("youtube_comment", { url, text: action.comment });
+          if (posted?.success && posted?.commentId) {
+            const commentLink = `https://www.youtube.com/watch?v=${v.videoId}&lc=${posted.commentId}`;
+            if (action.shareWithUser) {
+              pendingYoutubeShares.push({
+                videoUrl: url,
+                videoTitle: v.title || "this video",
+                channel: v.channel || "",
+                commentText: action.comment,
+                commentLink,
+                createdAt: Date.now(),
+              });
+              console.log(`[meera-life] youtube: commented + queued share — "${action.comment}"`);
+            } else {
+              console.log(`[meera-life] youtube: commented silently — "${action.comment}"`);
+            }
+          }
+        } catch { /* ignore */ }
       }
     }
     lastYoutubeActivity = Date.now();
-    console.log(`[meera-life] youtube: watched ${take.length} video(s)`);
+    console.log(`[meera-life] youtube: watched ${watchedCount} video(s) of ${plan.actions.length} planned`);
   } catch (e: any) {
     console.warn("[meera-life] youtube autonomy failed:", e?.message ?? e);
   }

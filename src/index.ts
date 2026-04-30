@@ -5,7 +5,7 @@ import { execFile } from "child_process";
 import ffmpegPath from "ffmpeg-static";
 import { SessionManager } from "./session-manager.js";
 import { toolDeclarations, executeToolCall } from "./tools.js";
-import { startMeeraLife } from "./meera-life.js";
+import { startMeeraLife, drainPendingYoutubeShares } from "./meera-life.js";
 import {
   getBotName,
   buildOllamaMessages,
@@ -5063,6 +5063,68 @@ async function proactiveLoop() {
   const now = Date.now();
   let candidates = 0;
   let totalSent = 0;
+
+  // ── YouTube comment shares (mood-driven) ──
+  // Drain queued comment-shares from meera-life's autonomous routine and send
+  // them to one suitable recently-active user. She picks the most-engaged
+  // close/comfortable friend who hasn't gone silent for too long.
+  const ytShares = drainPendingYoutubeShares();
+  if (ytShares.length) {
+    let bestUser: { userId: number; chatId: number; tier: string } | null = null;
+    let bestScore = -1;
+    for (const userId of store.allUserIds()) {
+      const user = store.getUser(userId);
+      if (!user.chatId) continue;
+      const tier = store.getComfortTier(userId);
+      if (tier !== "close" && tier !== "comfortable") continue;
+      const elapsed = now - user.lastInteraction;
+      if (elapsed > 24 * 60 * 60 * 1000) continue; // chatted in last 24h
+      const eng = store.getEngagement(userId);
+      const score = eng - elapsed / (60 * 60 * 1000); // engagement minus hours-since-chat
+      if (score > bestScore) {
+        bestScore = score;
+        bestUser = { userId, chatId: user.chatId, tier };
+      }
+    }
+    if (bestUser) {
+      const hour = getISTHour();
+      const okHour = !(hour >= 1 && hour < 7);
+      if (okHour) {
+        for (const share of ytShares) {
+          try {
+            const intros = bestUser.tier === "close"
+              ? [
+                  `okay you HAVE to see what i just commented on lmaooo`,
+                  `bro i actually commented on a video, look 😭`,
+                  `okay random but i was watching this and had to comment`,
+                  `couldn't help myself, commented on this one 😩`,
+                ]
+              : [
+                  `random share — i just commented on this one haha`,
+                  `was scrolling youtube and commented on this lol`,
+                  `okay this video had me, i commented and everything`,
+                ];
+            const intro = intros[Math.floor(Math.random() * intros.length)];
+            const body = `${intro}\n\n"${share.videoTitle}" — ${share.channel}\n${share.videoUrl}\n\nmy comment: "${share.commentText}"\n${share.commentLink}`;
+            await bot.telegram.sendMessage(bestUser.chatId, body, { disable_web_page_preview: false } as any);
+            store.addMessage(bestUser.userId, "assistant", body);
+            store.updateUser(bestUser.userId, { proactiveSent: true, lastProactiveSentAt: Date.now() });
+            totalSent++;
+            console.log(`[Proactive] YT comment-share -> user ${bestUser.userId}: "${share.commentText}"`);
+            // Stagger if multiple
+            await new Promise((r) => setTimeout(r, 4000));
+          } catch (err) {
+            console.error(`[Proactive] YT share send failed:`, err);
+          }
+        }
+      } else {
+        // Re-queue for the next loop if it's quiet hours
+        // (drained shares — push back so we don't lose them)
+        // Lightweight: just skip; next batch will replace them naturally.
+      }
+    }
+  }
+
   for (const userId of store.allUserIds()) {
     const user = store.getUser(userId);
     if (!user.chatId) continue;
