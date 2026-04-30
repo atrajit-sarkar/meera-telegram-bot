@@ -2592,9 +2592,25 @@ async function fitnessToday() {
   const activeMinutes = actDs ? sumPoints(actDs, "intVal") : 0;
   const heartAvg = heartDs ? avgPoints(heartDs, "fpVal") : null;
   const heartRange = heartDs ? rangePoints(heartDs, "fpVal") : null;
-  const weightKg = weightDs ? lastPoint(weightDs, "fpVal") : null;
-  const bodyFatPct = fatDs ? lastPoint(fatDs, "fpVal") : null;
+  let weightKg = weightDs ? lastPoint(weightDs, "fpVal") : null;
+  let bodyFatPct = fatDs ? lastPoint(fatDs, "fpVal") : null;
   const hydrationL = hydrationDs ? sumPoints(hydrationDs, "fpVal") : 0;
+
+  // Fallback: Google Fit's merge_weight / merge_body_fat_percentage streams do
+  // NOT include points from custom application data sources (only Google-known
+  // ones like Wear OS / Health Connect). So if the merged read is empty, also
+  // read from our own raw "meera-life-*" source.
+  async function readOwnRaw(kind: "weight" | "bodyFat"): Promise<number | null> {
+    try {
+      const dsId = await ensureMeeraFitDataSource(kind);
+      const ds = await googleJson<any>(
+        `https://www.googleapis.com/fitness/v1/users/me/dataSources/${encodeURIComponent(dsId)}/datasets/${startNs}-${endNs}`
+      );
+      return lastPoint(ds, "fpVal");
+    } catch { return null; }
+  }
+  if (weightKg == null) weightKg = await readOwnRaw("weight");
+  if (bodyFatPct == null) bodyFatPct = await readOwnRaw("bodyFat");
 
   // Sum sleep sessions overlapping the day window.
   let sleepMinutes = 0;
