@@ -56,6 +56,22 @@ async function main() {
   header("photos_recent  (Photos read scope check)");
   pretty(await executeGoogleTool("photos_recent", { max: 3 }));
 
+  header("youtube_subscriptions  (YouTube scope check)");
+  pretty(await executeGoogleTool("youtube_subscriptions", { max: 3 }));
+
+  header("youtube_liked");
+  pretty(await executeGoogleTool("youtube_liked", { max: 3 }));
+
+  header("youtube_playlists");
+  pretty(await executeGoogleTool("youtube_playlists", { max: 3 }));
+
+  header("fitness_today  (Google Fit scope check)");
+  pretty(await executeGoogleTool("fitness_today", {}));
+
+  header("notes_add + notes_recent");
+  pretty(await executeGoogleTool("notes_add", { text: "smoke-test ping from check-google" }));
+  pretty(await executeGoogleTool("notes_recent", { lines: 3 }));
+
   header("Life snapshot (this is what gets injected into the system prompt)");
   warmGoogleSnapshot();
   // Snapshot is async on first call — poll for up to 8s while it fills.

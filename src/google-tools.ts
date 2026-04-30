@@ -40,6 +40,10 @@ export const REQUIRED_SCOPES = [
   "https://www.googleapis.com/auth/photoslibrary.appendonly",          // upload
   "https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata", // read app-created items
   "https://www.googleapis.com/auth/photoslibrary.edit.appcreateddata",  // edit captions on app-created items
+  // YouTube — read-only history, subscriptions, playlists, liked videos.
+  "https://www.googleapis.com/auth/youtube.readonly",
+  // Google Fit — read activity (steps, distance, calories) for "real life" context.
+  "https://www.googleapis.com/auth/fitness.activity.read",
 ];
 
 // ───────────────────────────────────────────────────────────────────────
@@ -457,6 +461,146 @@ export const googleToolDeclarations: ToolDeclaration[] = [
       },
       required: ["mediaItemId", "description"],
     },
+  },
+
+  // ── Calendar advanced: RSVP / reminders ──────────────────────────────
+  {
+    name: "calendar_rsvp",
+    description:
+      "Respond to an event Meera was invited to. action one of: accept | decline | tentative. Pass eventId from calendar_today / calendar_upcoming.",
+    parameters: {
+      type: "object",
+      properties: {
+        eventId: { type: "string" },
+        action: { type: "string", description: "accept | decline | tentative" },
+        comment: { type: "string", description: "Optional comment to send back" },
+      },
+      required: ["eventId", "action"],
+    },
+  },
+  {
+    name: "calendar_set_reminders",
+    description:
+      "Set custom reminders on one of Meera's calendar events (overrides defaults). Pass minutes-before for popup and/or email reminders.",
+    parameters: {
+      type: "object",
+      properties: {
+        eventId: { type: "string" },
+        popupMinutes: { type: "integer", description: "Minutes before event for popup reminder" },
+        emailMinutes: { type: "integer", description: "Minutes before event for email reminder" },
+      },
+      required: ["eventId"],
+    },
+  },
+
+  // ── Tasks advanced ───────────────────────────────────────────────────
+  {
+    name: "tasks_set_due",
+    description: "Set or change the due date on one of Meera's tasks (taskId from tasks_list).",
+    parameters: {
+      type: "object",
+      properties: {
+        taskId: { type: "string" },
+        dueISO: { type: "string", description: "ISO datetime; pass empty string to clear" },
+      },
+      required: ["taskId", "dueISO"],
+    },
+  },
+
+  // ── Contacts update ──────────────────────────────────────────────────
+  {
+    name: "contacts_update",
+    description:
+      "Update fields on an existing Google Contact. resourceName comes from contacts_search (e.g. 'people/c1234'). Only the fields you pass will be updated.",
+    parameters: {
+      type: "object",
+      properties: {
+        resourceName: { type: "string", description: "Contact resourceName like 'people/c123'" },
+        name: { type: "string" },
+        email: { type: "string" },
+        phone: { type: "string" },
+        note: { type: "string" },
+      },
+      required: ["resourceName"],
+    },
+  },
+
+  // ── Gmail: smart reply draft ─────────────────────────────────────────
+  {
+    name: "gmail_draft_reply",
+    description:
+      "Compose a draft reply (NOT sent yet) to a Gmail message and save it as a Gmail draft. Returns draft id + suggested body. Use this when Meera wants to suggest a reply for the user to approve before sending.",
+    parameters: {
+      type: "object",
+      properties: {
+        messageId: { type: "string" },
+        body: { type: "string", description: "Suggested reply body" },
+      },
+      required: ["messageId", "body"],
+    },
+  },
+
+  // ── YouTube (read-only) ──────────────────────────────────────────────
+  {
+    name: "youtube_subscriptions",
+    description: "List the YouTube channels Meera is subscribed to.",
+    parameters: {
+      type: "object",
+      properties: { max: { type: "integer", description: "Default 10, max 25" } },
+    },
+  },
+  {
+    name: "youtube_liked",
+    description: "List videos Meera has liked on YouTube (most recent first).",
+    parameters: {
+      type: "object",
+      properties: { max: { type: "integer", description: "Default 10, max 25" } },
+    },
+  },
+  {
+    name: "youtube_history",
+    description:
+      "Best-effort recent watch history (YouTube no longer exposes this directly — falls back to her 'Watch later' playlist).",
+    parameters: {
+      type: "object",
+      properties: { max: { type: "integer", description: "Default 10" } },
+    },
+  },
+  {
+    name: "youtube_playlists",
+    description: "List Meera's own YouTube playlists.",
+    parameters: {
+      type: "object",
+      properties: { max: { type: "integer", description: "Default 10" } },
+    },
+  },
+
+  // ── Notes (lightweight diary kept inside one Drive Doc) ──────────────
+  {
+    name: "notes_add",
+    description:
+      "Append a quick note (one or two lines) to Meera's running notes doc in Drive. Like a Keep note. Each entry is timestamped automatically.",
+    parameters: {
+      type: "object",
+      properties: { text: { type: "string" } },
+      required: ["text"],
+    },
+  },
+  {
+    name: "notes_recent",
+    description: "Read the last N lines of Meera's notes doc.",
+    parameters: {
+      type: "object",
+      properties: { lines: { type: "integer", description: "Default 10, max 50" } },
+    },
+  },
+
+  // ── Fitness (Google Fit) ─────────────────────────────────────────────
+  {
+    name: "fitness_today",
+    description:
+      "Read Meera's Google Fit data for today (steps, distance in km, active minutes, calories). Useful to ground 'how active was she today?' replies.",
+    parameters: { type: "object", properties: {} },
   },
 
   // ── Account helper ───────────────────────────────────────────────────
@@ -1411,6 +1555,399 @@ async function photosDescribe(args: { mediaItemId: string; description: string }
 }
 
 // ───────────────────────────────────────────────────────────────────────
+// CALENDAR — RSVP / reminders
+// ───────────────────────────────────────────────────────────────────────
+
+async function calendarRsvp(args: { eventId: string; action: string; comment?: string }) {
+  const eventId = need(args.eventId, "eventId");
+  const action = need(args.action, "action").toLowerCase();
+  const responseStatus =
+    action === "accept" || action === "yes" ? "accepted"
+    : action === "decline" || action === "no" ? "declined"
+    : action === "tentative" || action === "maybe" ? "tentative"
+    : null;
+  if (!responseStatus) throw new Error(`Unknown RSVP action: ${action}`);
+
+  const acct = getAccountInfo();
+  // Fetch existing event to update self attendee entry.
+  const ev = await googleJson<CalEvent>(
+    `https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(eventId)}`
+  );
+  const attendees = (ev.attendees ?? []).map((a) => ({ ...a }));
+  const meIdx = attendees.findIndex(
+    (a) => a.email && a.email.toLowerCase() === acct.email.toLowerCase()
+  );
+  if (meIdx >= 0) {
+    (attendees[meIdx] as any).responseStatus = responseStatus;
+    if (args.comment) (attendees[meIdx] as any).comment = args.comment;
+  } else {
+    const me: any = { email: acct.email, responseStatus, self: true };
+    if (args.comment) me.comment = args.comment;
+    attendees.push(me);
+  }
+  const patched = await googleJson<CalEvent>(
+    `https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(eventId)}?sendUpdates=all`,
+    { method: "PATCH", body: JSON.stringify({ attendees }) }
+  );
+  return {
+    success: true,
+    event: summarizeEvent(patched, acct.timezone),
+    message: `RSVP set to ${responseStatus}.`,
+  };
+}
+
+async function calendarSetReminders(args: {
+  eventId: string;
+  popupMinutes?: number;
+  emailMinutes?: number;
+}) {
+  const eventId = need(args.eventId, "eventId");
+  const overrides: { method: string; minutes: number }[] = [];
+  if (typeof args.popupMinutes === "number") overrides.push({ method: "popup", minutes: args.popupMinutes });
+  if (typeof args.emailMinutes === "number") overrides.push({ method: "email", minutes: args.emailMinutes });
+  if (!overrides.length) throw new Error("Pass popupMinutes and/or emailMinutes");
+  const ev = await googleJson<CalEvent>(
+    `https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(eventId)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ reminders: { useDefault: false, overrides } }),
+    }
+  );
+  return {
+    success: true,
+    event: summarizeEvent(ev, getAccountInfo().timezone),
+    message: "Reminders updated.",
+  };
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// TASKS — set due
+// ───────────────────────────────────────────────────────────────────────
+
+async function tasksSetDue(args: { taskId: string; dueISO: string }) {
+  const taskId = need(args.taskId, "taskId");
+  const listId = await defaultTaskListId();
+  const body: Record<string, unknown> = {};
+  if (args.dueISO) body.due = args.dueISO;
+  else body.due = null; // clear
+  await googleJson(
+    `https://tasks.googleapis.com/tasks/v1/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}`,
+    { method: "PATCH", body: JSON.stringify(body) }
+  );
+  return { success: true, message: args.dueISO ? "Due date set." : "Due date cleared." };
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// CONTACTS — update
+// ───────────────────────────────────────────────────────────────────────
+
+async function contactsUpdate(args: {
+  resourceName: string;
+  name?: string;
+  email?: string;
+  phone?: string;
+  note?: string;
+}) {
+  const resourceName = need(args.resourceName, "resourceName");
+  // Fetch current etag (required for updateContact)
+  const current = await googleJson<{ etag: string }>(
+    `https://people.googleapis.com/v1/${encodeURIComponent(resourceName)}?personFields=metadata`
+  );
+  const updateFields: string[] = [];
+  const body: Record<string, unknown> = { etag: current.etag };
+  if (args.name !== undefined) {
+    body.names = [{ givenName: args.name }];
+    updateFields.push("names");
+  }
+  if (args.email !== undefined) {
+    body.emailAddresses = args.email ? [{ value: args.email }] : [];
+    updateFields.push("emailAddresses");
+  }
+  if (args.phone !== undefined) {
+    body.phoneNumbers = args.phone ? [{ value: args.phone }] : [];
+    updateFields.push("phoneNumbers");
+  }
+  if (args.note !== undefined) {
+    body.biographies = args.note ? [{ value: args.note, contentType: "TEXT_PLAIN" }] : [];
+    updateFields.push("biographies");
+  }
+  if (!updateFields.length) throw new Error("No fields to update");
+  await googleJson(
+    `https://people.googleapis.com/v1/${encodeURIComponent(resourceName)}:updateContact?updatePersonFields=${updateFields.join(",")}`,
+    { method: "PATCH", body: JSON.stringify(body) }
+  );
+  return { success: true, message: "Contact updated." };
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// GMAIL — draft reply (smart reply)
+// ───────────────────────────────────────────────────────────────────────
+
+async function gmailDraftReply(args: { messageId: string; body: string }) {
+  const messageId = need(args.messageId, "messageId");
+  const body = need(args.body, "body");
+  const orig = await googleJson<GmailMessage>(
+    `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}?format=metadata&metadataHeaders=Message-Id&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=References`
+  );
+  const origMessageId = headerValue(orig.payload?.headers, "Message-Id");
+  const origFrom = headerValue(orig.payload?.headers, "From");
+  const origSubject = headerValue(orig.payload?.headers, "Subject") || "(no subject)";
+  const origRefs = headerValue(orig.payload?.headers, "References");
+  const acct = getAccountInfo();
+  const fromHeader = acct.name ? `${acct.name} <${acct.email}>` : acct.email;
+  const replySubject = origSubject.toLowerCase().startsWith("re:") ? origSubject : `Re: ${origSubject}`;
+  const refs = origRefs ? `${origRefs} ${origMessageId}` : origMessageId;
+  const headers = [
+    `From: ${fromHeader}`,
+    `To: ${origFrom}`,
+    `Subject: ${replySubject}`,
+    origMessageId ? `In-Reply-To: ${origMessageId}` : "",
+    refs ? `References: ${refs}` : "",
+    "MIME-Version: 1.0",
+    'Content-Type: text/plain; charset="UTF-8"',
+    "Content-Transfer-Encoding: 7bit",
+  ].filter(Boolean);
+  const raw = encodeB64Url(`${headers.join("\r\n")}\r\n\r\n${body}`);
+  const draft = await googleJson<{ id: string; message?: { id?: string } }>(
+    "https://gmail.googleapis.com/gmail/v1/users/me/drafts",
+    {
+      method: "POST",
+      body: JSON.stringify({ message: { raw, threadId: orig.threadId } }),
+    }
+  );
+  return {
+    success: true,
+    draftId: draft.id,
+    suggestedBody: body,
+    message: `Draft reply saved to ${origFrom}. (Not sent — review in Gmail or call gmail_send/gmail_reply to send.)`,
+  };
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// YOUTUBE
+// ───────────────────────────────────────────────────────────────────────
+
+async function youtubeSubscriptions(args: { max?: number }) {
+  const max = Math.min(Math.max(args.max ?? 10, 1), 25);
+  const params = new URLSearchParams({
+    part: "snippet",
+    mine: "true",
+    maxResults: String(max),
+    order: "relevance",
+  });
+  const data = await googleJson<{
+    items?: { snippet?: { title?: string; resourceId?: { channelId?: string }; description?: string } }[];
+  }>(`https://www.googleapis.com/youtube/v3/subscriptions?${params}`);
+  const channels = (data.items ?? []).map((it) => ({
+    title: it.snippet?.title ?? "",
+    channelId: it.snippet?.resourceId?.channelId ?? "",
+    description: (it.snippet?.description ?? "").slice(0, 120),
+  }));
+  return { success: true, count: channels.length, channels };
+}
+
+async function youtubePlaylistVideos(playlistId: string, max: number) {
+  const params = new URLSearchParams({
+    part: "snippet,contentDetails",
+    playlistId,
+    maxResults: String(max),
+  });
+  const data = await googleJson<{
+    items?: {
+      snippet?: { title?: string; channelTitle?: string; publishedAt?: string };
+      contentDetails?: { videoId?: string };
+    }[];
+  }>(`https://www.googleapis.com/youtube/v3/playlistItems?${params}`);
+  return (data.items ?? []).map((it) => ({
+    title: it.snippet?.title ?? "",
+    channel: it.snippet?.channelTitle ?? "",
+    videoId: it.contentDetails?.videoId ?? "",
+    url: it.contentDetails?.videoId ? `https://youtu.be/${it.contentDetails.videoId}` : "",
+    publishedAt: it.snippet?.publishedAt ?? "",
+  }));
+}
+
+async function getMyChannelPlaylists(): Promise<{
+  liked?: string;
+  watchLater?: string;
+  uploads?: string;
+}> {
+  const data = await googleJson<{
+    items?: { contentDetails?: { relatedPlaylists?: { likes?: string; watchLater?: string; uploads?: string } } }[];
+  }>(
+    "https://www.googleapis.com/youtube/v3/channels?part=contentDetails&mine=true"
+  );
+  const r = data.items?.[0]?.contentDetails?.relatedPlaylists ?? {};
+  return { liked: r.likes, watchLater: r.watchLater, uploads: r.uploads };
+}
+
+async function youtubeLiked(args: { max?: number }) {
+  const max = Math.min(Math.max(args.max ?? 10, 1), 25);
+  const lists = await getMyChannelPlaylists();
+  if (!lists.liked) return { success: false, message: "Liked playlist not available." };
+  const videos = await youtubePlaylistVideos(lists.liked, max);
+  return { success: true, count: videos.length, videos };
+}
+
+async function youtubeHistory(args: { max?: number }) {
+  // YouTube deprecated history playlist access. Use "Watch later" as the closest proxy.
+  const max = Math.min(Math.max(args.max ?? 10, 1), 25);
+  const lists = await getMyChannelPlaylists();
+  if (!lists.watchLater) return { success: false, message: "Watch later not accessible." };
+  try {
+    const videos = await youtubePlaylistVideos(lists.watchLater, max);
+    return { success: true, count: videos.length, videos, note: "Recent watch history isn't exposed by YouTube — showing Watch Later instead." };
+  } catch {
+    return { success: false, message: "Watch history isn't accessible via YouTube API." };
+  }
+}
+
+async function youtubePlaylists(args: { max?: number }) {
+  const max = Math.min(Math.max(args.max ?? 10, 1), 25);
+  const params = new URLSearchParams({ part: "snippet,contentDetails", mine: "true", maxResults: String(max) });
+  const data = await googleJson<{
+    items?: { id: string; snippet?: { title?: string; description?: string }; contentDetails?: { itemCount?: number } }[];
+  }>(`https://www.googleapis.com/youtube/v3/playlists?${params}`);
+  const playlists = (data.items ?? []).map((p) => ({
+    id: p.id,
+    title: p.snippet?.title ?? "",
+    description: (p.snippet?.description ?? "").slice(0, 120),
+    itemCount: p.contentDetails?.itemCount ?? 0,
+  }));
+  return { success: true, count: playlists.length, playlists };
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// NOTES (Keep-style, backed by a single Drive Doc)
+// ───────────────────────────────────────────────────────────────────────
+
+const NOTES_DOC_TITLE = "Meera's Notes";
+
+async function findOrCreateNotesDoc(): Promise<string> {
+  const params = new URLSearchParams({
+    q: `name='${NOTES_DOC_TITLE}' and mimeType='application/vnd.google-apps.document' and trashed=false`,
+    fields: "files(id,name)",
+    pageSize: "1",
+  });
+  const found = await googleJson<{ files?: { id: string }[] }>(
+    `https://www.googleapis.com/drive/v3/files?${params}`
+  );
+  if (found.files?.[0]?.id) return found.files[0].id;
+  const created = await driveMultipartUpload(
+    { name: NOTES_DOC_TITLE, mimeType: "application/vnd.google-apps.document" },
+    Buffer.from("Meera's quick notes\n\n", "utf8"),
+    "text/plain"
+  );
+  return created.id;
+}
+
+async function readDocText(fileId: string): Promise<string> {
+  const res = await googleFetch(
+    `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=text/plain`
+  );
+  if (!res.ok) return "";
+  return await res.text();
+}
+
+async function overwriteDocText(fileId: string, text: string): Promise<void> {
+  await googleJson(
+    `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "text/plain; charset=UTF-8" },
+      body: text,
+    }
+  );
+}
+
+async function notesAdd(args: { text: string }) {
+  const text = need(args.text, "text").trim();
+  const id = await findOrCreateNotesDoc();
+  const existing = await readDocText(id);
+  const ts = new Date().toLocaleString("en-IN", { timeZone: getAccountInfo().timezone });
+  const next = `${existing.replace(/\s+$/, "")}\n[${ts}] ${text}\n`;
+  await overwriteDocText(id, next);
+  return { success: true, message: "Note added." };
+}
+
+async function notesRecent(args: { lines?: number }) {
+  const lines = Math.min(Math.max(args.lines ?? 10, 1), 50);
+  const id = await findOrCreateNotesDoc();
+  const txt = await readDocText(id);
+  const all = txt.split(/\r?\n/).filter((l) => l.trim());
+  const recent = all.slice(-lines);
+  return { success: true, count: recent.length, notes: recent };
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// FITNESS (Google Fit)
+// ───────────────────────────────────────────────────────────────────────
+
+async function fitnessToday() {
+  const tz = getAccountInfo().timezone;
+  // Day boundaries in UTC ms based on local TZ midnight.
+  const now = new Date();
+  const localMidnight = new Date(now);
+  localMidnight.setHours(0, 0, 0, 0);
+  const startMs = localMidnight.getTime();
+  const endMs = startMs + 86400000;
+  const startNs = `${startMs}000000`;
+  const endNs = `${endMs}000000`;
+
+  const dataSetUrl = (dataType: string) =>
+    `https://www.googleapis.com/fitness/v1/users/me/dataSources/derived:${encodeURIComponent(
+      dataType
+    )}/datasets/${startNs}-${endNs}`;
+
+  const sources = {
+    steps: "com.google.step_count.delta:com.google.android.gms:estimated_steps",
+    distance: "com.google.distance.delta:com.google.android.gms:merge_distance_delta",
+    calories: "com.google.calories.expended:com.google.android.gms:merge_calories_expended",
+    active: "com.google.active_minutes:com.google.android.gms:merge_active_minutes",
+  };
+
+  function sumPoints(ds: any, field: "intVal" | "fpVal"): number {
+    let total = 0;
+    for (const p of ds?.point ?? []) {
+      for (const v of p?.value ?? []) {
+        if (typeof v?.[field] === "number") total += v[field];
+      }
+    }
+    return total;
+  }
+
+  const [stepsDs, distDs, calDs, actDs] = await Promise.all([
+    googleJson<any>(dataSetUrl(sources.steps)).catch(() => null),
+    googleJson<any>(dataSetUrl(sources.distance)).catch(() => null),
+    googleJson<any>(dataSetUrl(sources.calories)).catch(() => null),
+    googleJson<any>(dataSetUrl(sources.active)).catch(() => null),
+  ]);
+
+  const steps = stepsDs ? sumPoints(stepsDs, "intVal") : 0;
+  const distanceMeters = distDs ? sumPoints(distDs, "fpVal") : 0;
+  const calories = calDs ? sumPoints(calDs, "fpVal") : 0;
+  const activeMinutes = actDs ? sumPoints(actDs, "intVal") : 0;
+
+  const anyData = steps || distanceMeters || calories || activeMinutes;
+  if (!anyData) {
+    return {
+      success: true,
+      empty: true,
+      message: "No Fit data for today (probably no synced device).",
+      timezone: tz,
+    };
+  }
+  return {
+    success: true,
+    timezone: tz,
+    steps,
+    distanceKm: Number((distanceMeters / 1000).toFixed(2)),
+    calories: Math.round(calories),
+    activeMinutes,
+  };
+}
+
+// ───────────────────────────────────────────────────────────────────────
 // DISPATCH
 // ───────────────────────────────────────────────────────────────────────
 
@@ -1447,6 +1984,18 @@ const handlers: Record<string, (args: any) => Promise<Record<string, unknown>>> 
   photos_create_album: photosCreateAlbum,
   photos_add_to_album: photosAddToAlbum,
   photos_describe: photosDescribe,
+  calendar_rsvp: calendarRsvp,
+  calendar_set_reminders: calendarSetReminders,
+  tasks_set_due: tasksSetDue,
+  contacts_update: contactsUpdate,
+  gmail_draft_reply: gmailDraftReply,
+  youtube_subscriptions: youtubeSubscriptions,
+  youtube_liked: youtubeLiked,
+  youtube_history: youtubeHistory,
+  youtube_playlists: youtubePlaylists,
+  notes_add: notesAdd,
+  notes_recent: notesRecent,
+  fitness_today: () => fitnessToday(),
   google_account_info: async () => ({ success: true, ...getAccountInfo() }),
 };
 

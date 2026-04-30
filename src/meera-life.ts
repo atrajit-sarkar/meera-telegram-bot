@@ -228,6 +228,287 @@ async function writeDailyJournalIfDue(): Promise<void> {
   }
 }
 
+// ── Auto-reschedule on conflict ────────────────────────────────────────
+//
+// When two events overlap on her calendar, propose a new free slot for
+// the *non-routine* event (we never move yoga / college / dinner) and add
+// a [meera-life:proposed] tag in the description so we don't propose
+// twice. We only mutate her own events that don't have attendees (moving
+// a meeting with someone else without notice is rude).
+
+async function autoRescheduleConflicts(): Promise<void> {
+  const now = new Date();
+  const horizon = new Date(now.getTime() + 3 * 86400000);
+  const events = (await listEventsForRange(now.toISOString(), horizon.toISOString())) as any[];
+
+  // Sort and detect overlap pairs.
+  const ranged = events
+    .map((e: any) => ({
+      id: e.id,
+      title: (e.summary ?? "").trim(),
+      desc: e.description ?? "",
+      start: new Date(e.start?.dateTime ?? e.start?.date ?? 0).getTime(),
+      end: new Date(e.end?.dateTime ?? e.end?.date ?? 0).getTime(),
+      attendees: (e.attendees ?? []).length,
+    }))
+    .filter((x) => x.start && x.end && x.end > now.getTime())
+    .sort((a, b) => a.start - b.start);
+
+  for (let i = 0; i < ranged.length; i++) {
+    for (let j = i + 1; j < ranged.length; j++) {
+      const a = ranged[i];
+      const b = ranged[j];
+      if (b.start >= a.end) break;
+      // Decide which one to move: prefer moving the non-routine, no-attendee event.
+      const moveCandidate = !b.desc.includes(MARKER) && b.attendees === 0
+        ? b
+        : !a.desc.includes(MARKER) && a.attendees === 0
+        ? a
+        : null;
+      if (!moveCandidate) continue;
+      if (moveCandidate.desc.includes("[meera-life:proposed]")) continue;
+      // Find next free slot of equal length.
+      const dur = Math.round((moveCandidate.end - moveCandidate.start) / 60_000);
+      try {
+        const free: any = await executeGoogleTool("calendar_find_free_slot", {
+          durationMinutes: dur,
+          withinDays: 5,
+        });
+        if (!free?.success) continue;
+        await executeGoogleTool("calendar_update_event", {
+          eventId: moveCandidate.id,
+          startISO: free.startISO,
+          endISO: free.endISO,
+          description: `${moveCandidate.desc}\n[meera-life:proposed] auto-moved from conflict`,
+        });
+        console.log(`[meera-life] auto-rescheduled "${moveCandidate.title}" to ${free.startISO}`);
+      } catch (e: any) {
+        console.warn("[meera-life] reschedule failed:", e?.message ?? e);
+      }
+    }
+  }
+}
+
+// ── Morning email triage ───────────────────────────────────────────────
+//
+// Once per IST day, around `MEERA_TRIAGE_HOUR_IST` (default 8), scan the
+// last 24h of unread inbox; star any obvious "important" matches (boss,
+// dad, bank, doctor, college) and append a one-line summary line per
+// email to her notes doc.
+
+let lastTriageDay = "";
+const IMPORTANT_PATTERNS = [
+  /\bdad\b/i,
+  /\bmom\b/i,
+  /\bboss\b/i,
+  /bank|hdfc|sbi|icici|axis|kotak/i,
+  /college|university|professor|prof\./i,
+  /doctor|appointment|hospital|clinic/i,
+  /interview|offer letter/i,
+];
+
+async function morningTriageIfDue(): Promise<void> {
+  const targetHour = parseInt(process.env.MEERA_TRIAGE_HOUR_IST ?? "8", 10);
+  if (istHour() < targetHour) return;
+  const today = istDayKey();
+  if (today === lastTriageDay) return;
+  try {
+    const inbox: any = await executeGoogleTool("gmail_search", {
+      query: "is:unread newer_than:1d",
+      max: 15,
+    });
+    if (!inbox?.success || !inbox.emails?.length) {
+      lastTriageDay = today;
+      return;
+    }
+    const summaryLines: string[] = [`Morning triage ${today}:`];
+    for (const e of inbox.emails) {
+      const subject = String(e.subject ?? "");
+      const from = String(e.from ?? "");
+      const blob = `${from} ${subject}`;
+      const important = IMPORTANT_PATTERNS.some((re) => re.test(blob));
+      if (important) {
+        try {
+          await executeGoogleTool("gmail_label", { messageId: e.id, action: "star" });
+        } catch { /* ignore */ }
+      }
+      summaryLines.push(`- ${important ? "⭐ " : ""}${from} — ${subject}`);
+    }
+    await executeGoogleTool("notes_add", { text: summaryLines.join("\n") });
+    lastTriageDay = today;
+    console.log(`[meera-life] morning triage done (${inbox.emails.length} emails)`);
+  } catch (e: any) {
+    console.warn("[meera-life] triage failed:", e?.message ?? e);
+  }
+}
+
+// ── Birthday guard ─────────────────────────────────────────────────────
+//
+// Twice a day, scan contacts for any whose birthday falls within the next
+// 2 days, and add a one-time [meera-life:bday] task so Meera "remembers".
+
+let lastBirthdayCheckDay = "";
+
+async function birthdayGuardIfDue(): Promise<void> {
+  const today = istDayKey();
+  if (today === lastBirthdayCheckDay) return;
+
+  try {
+    // Pull all connections with birthdays. People API doesn't sort by upcoming birthday,
+    // so we list and filter client-side. Cap at 200.
+    const params = new URLSearchParams({
+      pageSize: "200",
+      personFields: "names,birthdays",
+    });
+    const data = await googleJson<{
+      connections?: { resourceName?: string; names?: { displayName?: string }[]; birthdays?: { date?: { month?: number; day?: number } }[] }[];
+    }>(`https://people.googleapis.com/v1/people/me/connections?${params}`);
+
+    const now = new Date();
+    const todayMonth = now.getMonth() + 1;
+    const todayDay = now.getDate();
+    const tomorrow = new Date(now.getTime() + 86400000);
+    const tomMonth = tomorrow.getMonth() + 1;
+    const tomDay = tomorrow.getDate();
+    const dayAfter = new Date(now.getTime() + 2 * 86400000);
+    const daMonth = dayAfter.getMonth() + 1;
+    const daDay = dayAfter.getDate();
+
+    const matches: { name: string; when: string }[] = [];
+    for (const c of data.connections ?? []) {
+      const name = c.names?.[0]?.displayName ?? "";
+      if (!name) continue;
+      for (const b of c.birthdays ?? []) {
+        const d = b.date;
+        if (!d?.month || !d?.day) continue;
+        if (d.month === todayMonth && d.day === todayDay) matches.push({ name, when: "today" });
+        else if (d.month === tomMonth && d.day === tomDay) matches.push({ name, when: "tomorrow" });
+        else if (d.month === daMonth && d.day === daDay) matches.push({ name, when: "day after tomorrow" });
+      }
+    }
+
+    if (matches.length) {
+      // Add a single grouped task; check existing first to avoid dupes.
+      const tasksResp: any = await executeGoogleTool("tasks_list", { max: 30 });
+      const existingTitles = new Set<string>(
+        (tasksResp.tasks ?? []).map((t: any) => String(t.title || ""))
+      );
+      for (const m of matches) {
+        const title = `🎂 ${m.name}'s birthday ${m.when}`;
+        if (existingTitles.has(title)) continue;
+        try {
+          await executeGoogleTool("tasks_add", {
+            title,
+            notes: `Don't forget to wish them. ${MARKER}:bday`,
+          });
+        } catch { /* ignore */ }
+      }
+      console.log(`[meera-life] birthday guard: ${matches.length} upcoming`);
+    }
+    lastBirthdayCheckDay = today;
+  } catch (e: any) {
+    console.warn("[meera-life] birthday guard failed:", e?.message ?? e);
+  }
+}
+
+// ── Weekly photo recap (Sunday night) ──────────────────────────────────
+
+let lastPhotoRecapWeek = "";
+
+function isoWeek(d: Date): string {
+  const year = d.getFullYear();
+  const start = new Date(year, 0, 1);
+  const days = Math.floor((d.getTime() - start.getTime()) / 86400000);
+  const week = Math.ceil((days + start.getDay() + 1) / 7);
+  return `${year}-W${week.toString().padStart(2, "0")}`;
+}
+
+async function photoRecapIfDue(): Promise<void> {
+  const now = new Date();
+  if (now.getDay() !== 0) return; // Sundays only
+  if (istHour() < 21) return;
+  const wk = isoWeek(now);
+  if (wk === lastPhotoRecapWeek) return;
+  try {
+    const recent: any = await executeGoogleTool("photos_recent", { max: 10 });
+    if (!recent?.success || !recent.photos?.length) {
+      lastPhotoRecapWeek = wk;
+      return;
+    }
+    const lines = [`Photo recap (${wk}):`, ...recent.photos.slice(0, 5).map((p: any) => `- ${p.filename ?? p.id}`)];
+    await executeGoogleTool("notes_add", { text: lines.join("\n") });
+    lastPhotoRecapWeek = wk;
+    console.log(`[meera-life] photo recap noted (${recent.photos.length} items)`);
+  } catch (e: any) {
+    console.warn("[meera-life] photo recap failed:", e?.message ?? e);
+  }
+}
+
+// ── Receipt auto-file ──────────────────────────────────────────────────
+//
+// Every life tick, scan unread mail tagged invoice/receipt/bill from the
+// last 7 days. For each, label "Receipts/<YYYY-MM>" (created if missing)
+// and archive (remove INBOX). Lightweight — no attachment parsing.
+
+async function receiptAutoFileIfDue(): Promise<void> {
+  try {
+    const inbox: any = await executeGoogleTool("gmail_search", {
+      query: "newer_than:7d (subject:(invoice OR receipt OR bill OR payment) OR from:(billing OR no-reply OR noreply))",
+      max: 15,
+    });
+    if (!inbox?.success || !inbox.emails?.length) return;
+
+    // Get/create label
+    const ym = `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, "0")}`;
+    const labelName = `Receipts/${ym}`;
+    const labelId = await ensureGmailLabel(labelName);
+
+    let filed = 0;
+    for (const e of inbox.emails) {
+      try {
+        // Add custom label, archive (remove INBOX).
+        await googleJson(
+          `https://gmail.googleapis.com/gmail/v1/users/me/messages/${e.id}/modify`,
+          {
+            method: "POST",
+            body: JSON.stringify({ addLabelIds: [labelId], removeLabelIds: ["INBOX"] }),
+          }
+        );
+        filed++;
+      } catch { /* ignore */ }
+    }
+    if (filed) console.log(`[meera-life] filed ${filed} receipts under ${labelName}`);
+  } catch (e: any) {
+    console.warn("[meera-life] receipt filer failed:", e?.message ?? e);
+  }
+}
+
+const labelCache = new Map<string, string>();
+async function ensureGmailLabel(name: string): Promise<string> {
+  if (labelCache.has(name)) return labelCache.get(name)!;
+  const data = await googleJson<{ labels?: { id: string; name: string }[] }>(
+    "https://gmail.googleapis.com/gmail/v1/users/me/labels"
+  );
+  const found = data.labels?.find((l) => l.name === name);
+  if (found) {
+    labelCache.set(name, found.id);
+    return found.id;
+  }
+  const created = await googleJson<{ id: string }>(
+    "https://gmail.googleapis.com/gmail/v1/users/me/labels",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        name,
+        labelListVisibility: "labelShow",
+        messageListVisibility: "show",
+      }),
+    }
+  );
+  labelCache.set(name, created.id);
+  return created.id;
+}
+
 // ── Public API ─────────────────────────────────────────────────────────
 
 let started = false;
@@ -256,6 +537,11 @@ export function startMeeraLife(): void {
       await ensureRoutineForNextDays(2);
       await ensureWeeklyChores();
       await writeDailyJournalIfDue();
+      await autoRescheduleConflicts();
+      await morningTriageIfDue();
+      await birthdayGuardIfDue();
+      await photoRecapIfDue();
+      await receiptAutoFileIfDue();
     } catch (e: any) {
       console.warn("[meera-life] tick error:", e?.message ?? e);
     }
@@ -264,8 +550,13 @@ export function startMeeraLife(): void {
   // Initial run delayed 30s after startup so the bot isn't busy.
   setTimeout(() => { void tick(); }, 30_000);
   setInterval(() => { void tick(); }, intervalHours * 60 * 60 * 1000);
-  // Hourly check just for the journal window so it's caught reliably.
-  setInterval(() => { void writeDailyJournalIfDue(); }, 60 * 60 * 1000);
+  // Hourly checks for time-of-day-gated routines.
+  setInterval(() => {
+    void writeDailyJournalIfDue();
+    void morningTriageIfDue();
+    void birthdayGuardIfDue();
+    void photoRecapIfDue();
+  }, 60 * 60 * 1000);
 
   console.log(`[meera-life] autonomous loop started (every ${intervalHours}h)`);
 }
