@@ -4,15 +4,48 @@
  */
 
 export interface OllamaMessage {
-  role: "system" | "user" | "assistant";
+  role: "system" | "user" | "assistant" | "tool";
   content: string;
   msgId?: number;
+  /** Set on assistant messages that requested tool calls (passed back to model) */
+  tool_calls?: OllamaToolCall[];
+  /** Set on tool-result messages so the model can correlate to its tool_call id */
+  tool_call_id?: string;
+  name?: string;
 }
 
 export interface OllamaConfig {
   host: string;
   model: string;
   apiKey: string;
+}
+
+/** Ollama / OpenAI-style tool declaration */
+export interface OllamaTool {
+  type: "function";
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  };
+}
+
+export interface OllamaToolCall {
+  id?: string;
+  type?: "function";
+  function: { name: string; arguments: any };
+}
+
+export type OllamaToolHandler = (
+  name: string,
+  args: Record<string, unknown>
+) => Promise<Record<string, unknown>> | Record<string, unknown>;
+
+export interface OllamaCallOptions {
+  tools?: OllamaTool[];
+  onToolCall?: OllamaToolHandler;
+  /** Cap tool-call iterations to avoid runaway loops. Default 4. */
+  maxToolIterations?: number;
 }
 
 /**
@@ -23,7 +56,8 @@ export async function callOllamaWithRotation(
   config: OllamaConfig,
   messages: OllamaMessage[],
   extraKeys: string[] = [],
-  communityKeys: string[] = []
+  communityKeys: string[] = [],
+  options: OllamaCallOptions = {}
 ): Promise<string> {
   // Personal keys first, then community pool (shuffled), then default key last
   const keys = [...extraKeys, ...communityKeys, config.apiKey].filter(Boolean);
@@ -38,7 +72,7 @@ export async function callOllamaWithRotation(
 
   for (const key of uniqueKeys) {
     try {
-      return await callOllama({ ...config, apiKey: key }, messages);
+      return await callOllama({ ...config, apiKey: key }, messages, options);
     } catch (err: any) {
       lastError = err;
       if (err.message === "quota_exceeded") {
@@ -71,98 +105,143 @@ export async function callOllamaWithRotation(
 
 export async function callOllama(
   config: OllamaConfig,
-  messages: OllamaMessage[]
+  messages: OllamaMessage[],
+  options: OllamaCallOptions = {}
 ): Promise<string> {
   const url = `${config.host.replace(/\/+$/, "")}/api/chat`;
-  const body = JSON.stringify({
-    model: config.model,
-    messages,
-    stream: false,
-  });
+  const maxToolIters = options.maxToolIterations ?? 4;
+
+  // We mutate a working copy of the message list across tool iterations.
+  const working: any[] = messages.map((m) => ({ ...m }));
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 120_000);
 
   // Up to 2 retries for empty-content responses (cold-start "done_reason: load",
-  // transient safety hits). Total max attempts = 3.
+  // transient safety hits). Total max attempts per turn = 3.
   const MAX_EMPTY_RETRIES = 2;
 
   try {
-    for (let attempt = 0; attempt <= MAX_EMPTY_RETRIES; attempt++) {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${config.apiKey}`,
-        },
-        body,
-        signal: controller.signal,
-      });
+    for (let toolIter = 0; toolIter <= maxToolIters; toolIter++) {
+      const reqBody: Record<string, unknown> = {
+        model: config.model,
+        messages: working,
+        stream: false,
+      };
+      if (options.tools?.length) reqBody.tools = options.tools;
 
-      const text = await res.text();
+      // Inner loop: handle cold-start retries within a single turn.
+      let parsedMsg: any = null;
+      let json: any = null;
+      for (let attempt = 0; attempt <= MAX_EMPTY_RETRIES; attempt++) {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${config.apiKey}`,
+          },
+          body: JSON.stringify(reqBody),
+          signal: controller.signal,
+        });
 
-      if (!res.ok) {
-        const lower = text.toLowerCase();
-        if (lower.includes("unauthorized") || lower.includes("invalid")) {
-          throw new Error("invalid_key");
+        const text = await res.text();
+
+        if (!res.ok) {
+          const lower = text.toLowerCase();
+          if (lower.includes("unauthorized") || lower.includes("invalid")) {
+            throw new Error("invalid_key");
+          }
+          if (res.status === 429 || lower.includes("rate") || lower.includes("quota") || lower.includes("limit")) {
+            throw new Error("quota_exceeded");
+          }
+          throw new Error(`ollama_error: ${res.status} ${text.slice(0, 200)}`);
         }
-        if (res.status === 429 || lower.includes("rate") || lower.includes("quota") || lower.includes("limit")) {
-          throw new Error("quota_exceeded");
+
+        try {
+          json = JSON.parse(text);
+        } catch {
+          throw new Error(`ollama_error: invalid JSON (${text.slice(0, 120)})`);
         }
-        throw new Error(`ollama_error: ${res.status} ${text.slice(0, 200)}`);
+
+        const msg = json?.message ?? {};
+        const content: string = msg.content ?? "";
+        const hasToolCalls = Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0;
+
+        if (hasToolCalls || (content && content.trim())) {
+          parsedMsg = msg;
+          break;
+        }
+
+        // Empty + no tool calls — diagnose & decide whether to retry same key.
+        const doneReason: string | undefined = json?.done_reason;
+        const finishReason: string | undefined = msg?.finish_reason;
+        console.warn(
+          `[Ollama] empty content (attempt ${attempt + 1}/${MAX_EMPTY_RETRIES + 1}) ` +
+            `done_reason=${doneReason ?? "?"} finish=${finishReason ?? "?"} ` +
+            `keys=${Object.keys(msg).join(",")}`
+        );
+        if (doneReason === "load" && attempt < MAX_EMPTY_RETRIES) {
+          await new Promise((r) => setTimeout(r, 500 + attempt * 500));
+          continue;
+        }
+        if (finishReason === "safety" || finishReason === "blocked") {
+          throw new Error("ollama_safety_block");
+        }
+        if (attempt < MAX_EMPTY_RETRIES) {
+          await new Promise((r) => setTimeout(r, 400));
+          continue;
+        }
+        throw new Error("No content in Ollama response");
       }
 
-      let json: any;
-      try {
-        json = JSON.parse(text);
-      } catch {
-        throw new Error(`ollama_error: invalid JSON (${text.slice(0, 120)})`);
+      if (!parsedMsg) throw new Error("No content in Ollama response");
+
+      // ── If the model wants to call tools, run them and loop. ──────
+      const toolCalls: OllamaToolCall[] = parsedMsg.tool_calls ?? [];
+      if (toolCalls.length && options.onToolCall && toolIter < maxToolIters) {
+        // Push assistant turn (with tool_calls) onto the working transcript.
+        working.push({
+          role: "assistant",
+          content: parsedMsg.content ?? "",
+          tool_calls: toolCalls,
+        });
+        for (const tc of toolCalls) {
+          const fnName = tc.function?.name ?? "";
+          let args: Record<string, unknown> = {};
+          try {
+            args =
+              typeof tc.function?.arguments === "string"
+                ? JSON.parse(tc.function.arguments)
+                : tc.function?.arguments ?? {};
+          } catch {
+            args = {};
+          }
+          console.log(`[Ollama] tool_call → ${fnName}(${JSON.stringify(args).slice(0, 160)})`);
+          let result: Record<string, unknown>;
+          try {
+            result = await options.onToolCall(fnName, args);
+          } catch (e: any) {
+            result = { success: false, message: e?.message ?? "tool error" };
+          }
+          working.push({
+            role: "tool",
+            name: fnName,
+            tool_call_id: tc.id ?? fnName,
+            content: JSON.stringify(result).slice(0, 6000),
+          });
+        }
+        continue; // next iteration: model now sees tool results
       }
 
-      const msg = json?.message ?? {};
-      let content: string = msg.content ?? "";
-
-      // Newer Ollama "thinking" models put the answer in `thinking` when there
-      // are no tools. Fall back to it if visible content is empty.
-      if (!content && typeof msg.thinking === "string" && msg.thinking.trim()) {
-        content = msg.thinking;
+      // ── Final answer ──────────────────────────────────────────────
+      const finalContent = (parsedMsg.content ?? "").trim();
+      if (!finalContent) {
+        // Tool-only response with no follow-up text — extremely rare given the loop
+        throw new Error("No content in Ollama response");
       }
-
-      if (content && content.trim()) return content;
-
-      // Empty response — figure out why and decide whether to retry.
-      const doneReason: string | undefined = json?.done_reason;
-      const finishReason: string | undefined = msg?.finish_reason;
-      const hasToolCalls = Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0;
-
-      console.warn(
-        `[Ollama] empty content (attempt ${attempt + 1}/${MAX_EMPTY_RETRIES + 1}) ` +
-        `done_reason=${doneReason ?? "?"} finish=${finishReason ?? "?"} ` +
-        `tool_calls=${hasToolCalls} keys=${Object.keys(msg).join(",")}`
-      );
-
-      // Cold-start: server returned before generation started. Retry same key.
-      if (doneReason === "load" && attempt < MAX_EMPTY_RETRIES) {
-        await new Promise((r) => setTimeout(r, 500 + attempt * 500));
-        continue;
-      }
-      // Safety / other terminal stops: no point retrying same key.
-      if (finishReason === "safety" || finishReason === "blocked") {
-        throw new Error("ollama_safety_block");
-      }
-      // Tool-call without text — rare for our setup since we don't pass tools
-      // to the text path. Treat as no answer; let the caller fallback.
-      if (hasToolCalls) {
-        throw new Error("ollama_tool_only");
-      }
-      // Generic empty — one more retry then give up.
-      if (attempt < MAX_EMPTY_RETRIES) {
-        await new Promise((r) => setTimeout(r, 400));
-        continue;
-      }
-      throw new Error("No content in Ollama response");
+      return finalContent;
     }
-    throw new Error("No content in Ollama response");
+    throw new Error("ollama_tool_loop_exhausted");
   } finally {
     clearTimeout(timeout);
   }

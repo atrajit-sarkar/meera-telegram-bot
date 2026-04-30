@@ -78,6 +78,31 @@ async function ollamaChat(messages: OllamaMessage[], userKeys: string[] = []) {
   return callOllamaWithRotation(ollamaConfig, messages, userKeys, store.getCommunityKeyStrings());
 }
 
+/** Convert Gemini-style tool declarations → Ollama (OpenAI-compatible) tools format. */
+const ollamaTools = toolDeclarations.map((t) => ({
+  type: "function" as const,
+  function: {
+    name: t.name,
+    description: t.description,
+    parameters: t.parameters as Record<string, unknown>,
+  },
+}));
+
+/**
+ * Call Ollama for a USER-FACING REPLY with tools enabled.
+ * Meera can use her Google account, search, weather, etc. via this path.
+ * Internal classifiers / behavior deciders should keep using `ollamaChat()` (no tools).
+ */
+async function ollamaChatWithTools(messages: OllamaMessage[], userKeys: string[] = []) {
+  return callOllamaWithRotation(
+    ollamaConfig,
+    messages,
+    userKeys,
+    store.getCommunityKeyStrings(),
+    { tools: ollamaTools, onToolCall: executeToolCall, maxToolIterations: 4 }
+  );
+}
+
 // ── BOT & SESSIONS ─────────────────────────────────────────────────
 const bot = new Telegraf(BOT_TOKEN);
 const FIREBASE_DB_ID = process.env.FIREBASE_DATABASE_ID || "(default)";
@@ -368,6 +393,31 @@ function shouldSendEmojiOnly(tier: string, userText: string): string | null {
 /** Remove leaked internal metadata from AI replies (prompts, file refs, bracketed tags) */
 function stripInternalArtifacts(text: string): string {
   let cleaned = text;
+
+  // ── CHAIN-OF-THOUGHT LEAKAGE ─────────────────────────────────────
+  // Some Ollama Cloud "thinking" models occasionally spill their reasoning
+  // into the user-facing content (Title-Case headers, then prose paragraphs).
+  // Strip the most common patterns aggressively.
+  // 1) **Bold Title-Case Headers** at line starts (e.g. "**Considering the Parameters**")
+  cleaned = cleaned.replace(/^\s*\*{1,3}\s*([A-Z][A-Za-z0-9'’]*(?:\s+[A-Za-z0-9'’]+){1,8})\s*\*{1,3}\s*$/gm, "");
+  // 2) Markdown headers "## Foo" / "### Foo"
+  cleaned = cleaned.replace(/^\s*#{1,4}\s+.*$/gm, "");
+  // 3) Title-Case sentence-level reasoning headers ending in noun phrases like
+  //    "Considering the Parameters", "Refining the Response", "Generating the Link"
+  cleaned = cleaned.replace(
+    /^\s*(?:Considering|Refining|Resolving|Prioritizing|Generating|Confirming|Reviewing|Sharing|Analyzing|Determining|Drafting|Choosing|Planning|Thinking About|Wrestling With|Focusing On|Zeroing In On)\b[^\n.!?]{0,80}$/gim,
+    ""
+  );
+  // 4) First-person reasoning openers: "I'm currently focused on...", "I'm now revising..."
+  cleaned = cleaned.replace(/^\s*I[' ]?m\s+(?:currently|now|wrestling|focusing|zeroing|considering|drafting|planning|thinking)\b[^\n]{0,400}$/gim, "");
+  // 5) "My current draft / approach / response is..." reasoning narration
+  cleaned = cleaned.replace(/^\s*My\s+(?:current|planned|final|draft|next)\s+(?:draft|response|approach|plan|step)[^\n]{0,400}$/gim, "");
+  // 6) Tool-call narration leaking ("I'll use the calendar_create_event tool to...")
+  cleaned = cleaned.replace(/\b(?:I(?:'|')?ll|I(?:'|')?m\s+going\s+to|let me)\s+(?:use|call|invoke|trigger)\s+(?:the\s+)?[`*]?[a-z_]+_[a-z_]+[`*]?[^.!?\n]*[.!?]?/gi, "");
+  // 7) Bare tool/function names backtick-wrapped (e.g. `calendar_create_event`)
+  cleaned = cleaned.replace(/`[a-z_]+_[a-z_]+`/g, "");
+
+  // ── EXISTING ARTIFACT STRIPS ────────────────────────────────────
   // Remove <attachment: ...> references (Gemini/Stability file IDs leaking)
   cleaned = cleaned.replace(/<attachment:\s*[^>]+>/gi, "");
   // Remove [meera photo: ...] or [generated image: ...] or [video note ...] tags
@@ -624,7 +674,7 @@ function scheduleDelayedReply(
         user,
         mood
       );
-      let reply = await ollamaChat(messages, user.ollamaKeys);
+      let reply = await ollamaChatWithTools(messages, user.ollamaKeys);
       reply = stripInternalArtifacts(reply);
       if (!reply) reply = ["hmm", "haha", "sorry was sleeping 😴"][Math.floor(Math.random() * 3)];
       reply = addDeliberateTypos(reply, mood);
@@ -3958,7 +4008,7 @@ async function handleTextMessage(
           + batchHint + lengthHint + styleHints + emojiHint
           + "\n\n" + text;
         const messages = buildOllamaMessages(userMsg, history, tier, user, mood);
-        let reply = await ollamaChat(messages, user.ollamaKeys);
+        let reply = await ollamaChatWithTools(messages, user.ollamaKeys);
         reply = addDeliberateTypos(reply, mood);
 
         if (isBatched) {
@@ -4046,7 +4096,7 @@ async function handleTextMessage(
         + "\n\n" + text;
       const messages = buildOllamaMessages(userMsg, history, tier, user, mood);
 
-      let reply = await ollamaChat(messages, user.ollamaKeys);
+      let reply = await ollamaChatWithTools(messages, user.ollamaKeys);
 
       // Strip any leaked internal metadata from the reply
       reply = stripInternalArtifacts(reply);
@@ -4137,7 +4187,7 @@ async function handleTextMessage(
               + "\n\n" + text,
             store.getRecentHistory(userId), tier, store.getUser(userId), mood
           );
-          let retryReply = await ollamaChat(retryMessages, store.getUser(userId).ollamaKeys);
+          let retryReply = await ollamaChatWithTools(retryMessages, store.getUser(userId).ollamaKeys);
           retryReply = stripInternalArtifacts(retryReply);
           if (!retryReply) retryReply = "hmm";
           retryReply = addDeliberateTypos(retryReply, mood);
@@ -4396,7 +4446,7 @@ async function handleMediaMessage(
         emojiHint + styleHints;
 
       const messages = buildOllamaMessages(rephrasePrompt, history, tier, user, mood);
-      let reply = await ollamaChat(messages, user.ollamaKeys);
+      let reply = await ollamaChatWithTools(messages, user.ollamaKeys);
 
       // Add deliberate typos
       reply = addDeliberateTypos(reply, mood);
@@ -4756,7 +4806,7 @@ bot.on("poll_answer", async (ctx) => {
     }
 
     // Normal reply — let Ollama generate naturally
-    let reply = await ollamaChat(messages, user.ollamaKeys);
+    let reply = await ollamaChatWithTools(messages, user.ollamaKeys);
     reply = addDeliberateTypos(reply, mood);
     if (!reply || reply.length > 300) { activePolls.delete(pollId); return; }
 
@@ -4824,7 +4874,7 @@ bot.on(message("poll"), async (ctx) => {
         if (await isGeminiBlocked(response, user.ollamaKeys)) {
           // Fallback to text
           const messages = buildOllamaMessages(pollAnswerPrompt, history, tier, user, mood);
-          let reply = await ollamaChat(messages, user.ollamaKeys);
+          let reply = await ollamaChatWithTools(messages, user.ollamaKeys);
           reply = stripInternalArtifacts(reply);
           reply = addDeliberateTypos(reply, mood);
           store.addMessage(userId, "assistant", reply);
@@ -4841,7 +4891,7 @@ bot.on(message("poll"), async (ctx) => {
         sessions.resetSession(userId);
         // Fallback to text
         const messages = buildOllamaMessages(pollAnswerPrompt, history, tier, user, mood);
-        let reply = await ollamaChat(messages, user.ollamaKeys);
+        let reply = await ollamaChatWithTools(messages, user.ollamaKeys);
         reply = stripInternalArtifacts(reply);
         reply = addDeliberateTypos(reply, mood);
         store.addMessage(userId, "assistant", reply);
@@ -4854,7 +4904,7 @@ bot.on(message("poll"), async (ctx) => {
 
       const stopTyping = typingIndicator(ctx, "typing");
       const messages = buildOllamaMessages(pollAnswerPrompt, history, tier, user, mood);
-      let reply = await ollamaChat(messages, user.ollamaKeys);
+      let reply = await ollamaChatWithTools(messages, user.ollamaKeys);
       reply = stripInternalArtifacts(reply);
       reply = addDeliberateTypos(reply, mood);
       store.addMessage(userId, "assistant", reply);
@@ -4959,7 +5009,7 @@ bot.on("message_reaction", async (ctx) => {
         if (await isGeminiBlocked(response, user.ollamaKeys)) {
           // Fallback to text
           const messages = buildOllamaMessages(reactionPrompt, history, tier, user, mood);
-          let reply = await ollamaChat(messages, user.ollamaKeys);
+          let reply = await ollamaChatWithTools(messages, user.ollamaKeys);
           reply = stripInternalArtifacts(reply);
           reply = addDeliberateTypos(reply, mood);
           store.addMessage(userId, "assistant", reply);
@@ -4980,7 +5030,7 @@ bot.on("message_reaction", async (ctx) => {
         console.error("[Reaction] Gemini voice failed, falling back to text:", err);
         sessions.resetSession(userId);
         const messages = buildOllamaMessages(reactionPrompt, history, tier, user, mood);
-        let reply = await ollamaChat(messages, user.ollamaKeys);
+        let reply = await ollamaChatWithTools(messages, user.ollamaKeys);
         reply = stripInternalArtifacts(reply);
         reply = addDeliberateTypos(reply, mood);
         store.addMessage(userId, "assistant", reply);
@@ -4990,7 +5040,7 @@ bot.on("message_reaction", async (ctx) => {
       // Text reply
       await bot.telegram.sendChatAction(chatId, "typing");
       const messages = buildOllamaMessages(reactionPrompt, history, tier, user, mood);
-      let reply = await ollamaChat(messages, user.ollamaKeys);
+      let reply = await ollamaChatWithTools(messages, user.ollamaKeys);
       reply = stripInternalArtifacts(reply);
       reply = addDeliberateTypos(reply, mood);
       store.addMessage(userId, "assistant", reply);
