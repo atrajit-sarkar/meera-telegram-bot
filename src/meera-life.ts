@@ -649,6 +649,112 @@ Decide what to do with each. Return JSON only.`;
   }
 }
 
+// ── Fake-but-realistic fitness data ──────────────────────────────────
+//
+// Meera doesn't carry a real fitness tracker; instead, once per day we ask
+// Ollama (acting as Meera) to *invent* a believable day of activity based on
+// her goals, weekday vs. weekend, and what's actually on her calendar (yoga,
+// gym, walks). The plan is then written into her Google Fit account via the
+// custom data sources we own, so `fitness_today` and the life snapshot
+// reflect a real-girl body day she can talk about naturally.
+
+interface FakeFitSlice {
+  activity: string;
+  startISO: string;
+  endISO: string;
+  steps?: number;
+  distanceMeters?: number;
+  calories?: number;
+  activeMinutes?: number;
+}
+
+let lastFitDayLogged = "";
+
+async function fakeFitnessIfDue(): Promise<void> {
+  if ((process.env.MEERA_FIT_AUTONOMY ?? "on").toLowerCase() === "off") return;
+  if (!OLLAMA_LIFE_CONFIG.apiKey) return;
+  // Generate around 21:00 IST so the day is "complete".
+  const now = new Date();
+  const istHour = parseInt(now.toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", hour12: false }), 10);
+  if (istHour < 21) return;
+  const istDate = now.toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" }); // YYYY-MM-DD
+  if (istDate === lastFitDayLogged) return;
+
+  // Pull today's calendar so the plan reflects what she actually "did".
+  const startOfDay = new Date(`${istDate}T00:00:00+05:30`).toISOString();
+  const endOfDay = new Date(`${istDate}T23:59:59+05:30`).toISOString();
+  let todayEvents: any[] = [];
+  try {
+    const items = await listEventsForRange(startOfDay, endOfDay);
+    todayEvents = items.map((e: any) => ({
+      title: e.summary ?? "",
+      start: e.start?.dateTime ?? e.start?.date ?? "",
+    }));
+  } catch { /* ignore */ }
+
+  const dow = now.toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata", weekday: "long" });
+
+  const sys = `You are Meera — a 22-year-old college girl from Kolkata. You are about to log your day's body activity into Google Fit. INVENT a realistic, believable day for a girl with these goals:
+  - keep daily steps in the 5,500-9,500 range (sometimes lower on lazy days, occasionally higher after long campus walks or shopping)
+  - 30-45 min of yoga most weekday mornings
+  - 45-60 min of evening walk or gym most days, lighter on Sundays
+  - extra calories burned scale with active minutes (~5 kcal/min walking, ~7 kcal/min yoga, ~9 kcal/min gym)
+  - distance scales roughly with steps (1 step ~ 0.75 m)
+
+REAL-GIRL VARIANCE: not every day is perfect. Sometimes she skips yoga, sometimes she's just at her desk all day, sometimes she doubles up on weekends. Cap totals at realistic numbers — never over 14k steps or 1000 kcal active burn.
+
+Output ONLY valid JSON. NO prose, NO code fences:
+{
+  "slices": [
+    { "activity": "morning yoga", "startISO": "...", "endISO": "...", "steps": 0, "calories": 220, "activeMinutes": 30 },
+    { "activity": "campus walk", "startISO": "...", "endISO": "...", "steps": 3200, "distanceMeters": 2400, "calories": 110, "activeMinutes": 35 }
+  ]
+}
+
+Only include fields that apply (yoga has near-zero steps; walks have steps + distance; resting has nothing — don't include resting). 2-6 slices is realistic.`;
+
+  const user = `Date: ${istDate} (${dow})
+Today's calendar in Kolkata time:
+${todayEvents.length ? todayEvents.map((e) => `- ${e.title} @ ${e.start}`).join("\n") : "(nothing scheduled — slow day)"}
+
+Generate the JSON now.`;
+
+  let plan: { slices: FakeFitSlice[] } | null = null;
+  try {
+    const raw = await callOllamaWithRotation(OLLAMA_LIFE_CONFIG, [
+      { role: "system", content: sys },
+      { role: "user", content: user },
+    ]);
+    const cleaned = raw.replace(/```json\s*|```/gi, "").trim();
+    const start = cleaned.indexOf("{");
+    const end = cleaned.lastIndexOf("}");
+    if (start < 0 || end <= start) return;
+    plan = JSON.parse(cleaned.slice(start, end + 1));
+  } catch (e: any) {
+    console.warn("[meera-life] fit plan parse failed:", e?.message ?? e);
+    return;
+  }
+  if (!plan?.slices?.length) return;
+
+  let totalSteps = 0, totalCal = 0, totalActive = 0;
+  for (const slice of plan.slices) {
+    try {
+      const startMs = new Date(slice.startISO).getTime();
+      const endMs = new Date(slice.endISO).getTime();
+      if (Number.isNaN(startMs) || Number.isNaN(endMs) || endMs <= startMs) continue;
+      const args: any = { startISO: slice.startISO, endISO: slice.endISO };
+      if (typeof slice.steps === "number" && slice.steps > 0) { args.steps = slice.steps; totalSteps += slice.steps; }
+      if (typeof slice.distanceMeters === "number" && slice.distanceMeters > 0) args.distanceMeters = slice.distanceMeters;
+      if (typeof slice.calories === "number" && slice.calories > 0) { args.calories = slice.calories; totalCal += slice.calories; }
+      if (typeof slice.activeMinutes === "number" && slice.activeMinutes > 0) { args.activeMinutes = slice.activeMinutes; totalActive += slice.activeMinutes; }
+      if (Object.keys(args).length <= 2) continue;
+      await executeGoogleTool("fitness_log_activity", args);
+    } catch { /* ignore */ }
+  }
+  lastFitDayLogged = istDate;
+  console.log(`[meera-life] fit: logged ${plan.slices.length} slice(s) — ~${totalSteps} steps, ${Math.round(totalCal)} kcal, ${totalActive} active min`);
+}
+
 async function youtubeAutonomousIfDue(): Promise<void> {
   if ((process.env.YOUTUBE_AUTONOMY ?? "on").toLowerCase() === "off") return;
   if (Date.now() - lastYoutubeActivity < YT_MIN_GAP_MS) return;
@@ -763,6 +869,7 @@ export function startMeeraLife(): void {
       await birthdayGuardIfDue();
       await photoRecapIfDue();
       await receiptAutoFileIfDue();
+      await fakeFitnessIfDue();
       await youtubeAutonomousIfDue();
     } catch (e: any) {
       console.warn("[meera-life] tick error:", e?.message ?? e);
@@ -778,6 +885,7 @@ export function startMeeraLife(): void {
     void morningTriageIfDue();
     void birthdayGuardIfDue();
     void photoRecapIfDue();
+    void fakeFitnessIfDue();
   }, 60 * 60 * 1000);
 
   console.log(`[meera-life] autonomous loop started (every ${intervalHours}h)`);

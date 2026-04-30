@@ -46,8 +46,10 @@ export const REQUIRED_SCOPES = [
   "https://www.googleapis.com/auth/youtube",            // rate, subscribe, playlist manage
   "https://www.googleapis.com/auth/youtube.force-ssl",  // commentThreads / comments insert
   "https://www.googleapis.com/auth/youtube.upload",     // videos.insert
-  // Google Fit — read activity (steps, distance, calories) for "real life" context.
+  // Google Fit — read activity for "real life" context, write so Meera can
+  // log her own workouts/walks (her phone "syncs" via the autonomy loop).
   "https://www.googleapis.com/auth/fitness.activity.read",
+  "https://www.googleapis.com/auth/fitness.activity.write",
 ];
 
 // ───────────────────────────────────────────────────────────────────────
@@ -761,6 +763,22 @@ export const googleToolDeclarations: ToolDeclaration[] = [
     description:
       "Read Meera's Google Fit data for today (steps, distance in km, active minutes, calories). Useful to ground 'how active was she today?' replies.",
     parameters: { type: "object", properties: {} },
+  },
+  {
+    name: "fitness_log_activity",
+    description:
+      "Write a fitness data point to Meera's Google Fit (so it shows up in her Fit app like a real workout). Use after she finishes yoga, walks, gym, etc. All metric fields are optional — pass whichever apply. Times default to 'last 30 minutes ending now'.",
+    parameters: {
+      type: "object",
+      properties: {
+        steps:          { type: "number", description: "Step count to add for this slice." },
+        distanceMeters: { type: "number", description: "Distance covered in metres." },
+        calories:       { type: "number", description: "Calories burned (kcal)." },
+        activeMinutes:  { type: "number", description: "Active minutes." },
+        startISO:       { type: "string", description: "ISO start of the slice. Optional — defaults to 30 min ago." },
+        endISO:         { type: "string", description: "ISO end of the slice. Optional — defaults to now." },
+      },
+    },
   },
 
   // ── Account helper ───────────────────────────────────────────────────
@@ -2518,6 +2536,121 @@ async function fitnessToday() {
   };
 }
 
+// ── Writing fit data (custom data sources owned by Meera) ────────────
+
+interface FitDsSpec {
+  field: string;
+  type: "intVal" | "fpVal";
+  dataTypeName: string;
+}
+const MEERA_FIT_DATA_SOURCES: Record<string, FitDsSpec> = {
+  steps:    { field: "steps",    type: "intVal", dataTypeName: "com.google.step_count.delta" },
+  distance: { field: "distance", type: "fpVal",  dataTypeName: "com.google.distance.delta" },
+  calories: { field: "calories", type: "fpVal",  dataTypeName: "com.google.calories.expended" },
+  active:   { field: "duration", type: "intVal", dataTypeName: "com.google.active_minutes" },
+};
+
+const fitDsCache = new Map<string, string>();
+
+async function ensureMeeraFitDataSource(kind: keyof typeof MEERA_FIT_DATA_SOURCES): Promise<string> {
+  if (fitDsCache.has(kind)) return fitDsCache.get(kind)!;
+  const spec = MEERA_FIT_DATA_SOURCES[kind];
+  // List existing.
+  const list = await googleJson<{ dataSource?: { dataStreamId: string; dataStreamName?: string }[] }>(
+    "https://www.googleapis.com/fitness/v1/users/me/dataSources"
+  );
+  const tag = `meera-life-${kind}`;
+  const existing = list.dataSource?.find((d) =>
+    d.dataStreamId.startsWith("raw:") && (d.dataStreamName === tag || d.dataStreamId.includes(tag))
+  );
+  if (existing) {
+    fitDsCache.set(kind, existing.dataStreamId);
+    return existing.dataStreamId;
+  }
+  // Create raw data source.
+  const created = await googleJson<{ dataStreamId: string }>(
+    "https://www.googleapis.com/fitness/v1/users/me/dataSources",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        dataStreamName: tag,
+        type: "raw",
+        application: { name: "MeeraLife", version: "1.0" },
+        dataType: {
+          name: spec.dataTypeName,
+          field: [{ name: spec.field, format: spec.type === "intVal" ? "integer" : "floatPoint" }],
+        },
+      }),
+    }
+  );
+  fitDsCache.set(kind, created.dataStreamId);
+  return created.dataStreamId;
+}
+
+async function writeFitPoint(
+  kind: keyof typeof MEERA_FIT_DATA_SOURCES,
+  startMs: number,
+  endMs: number,
+  value: number
+): Promise<void> {
+  const dsId = await ensureMeeraFitDataSource(kind);
+  const spec = MEERA_FIT_DATA_SOURCES[kind];
+  const startNs = `${startMs}000000`;
+  const endNs = `${endMs}000000`;
+  const body = {
+    dataSourceId: dsId,
+    minStartTimeNs: startNs,
+    maxEndTimeNs: endNs,
+    point: [
+      {
+        startTimeNanos: startNs,
+        endTimeNanos: endNs,
+        dataTypeName: spec.dataTypeName,
+        value: [{ [spec.type]: spec.type === "intVal" ? Math.round(value) : value }],
+      },
+    ],
+  };
+  await googleJson(
+    `https://www.googleapis.com/fitness/v1/users/me/dataSources/${encodeURIComponent(dsId)}/datasets/${startNs}-${endNs}`,
+    { method: "PATCH", body: JSON.stringify(body) }
+  );
+}
+
+async function fitnessLogActivity(args: {
+  steps?: number;
+  distanceMeters?: number;
+  calories?: number;
+  activeMinutes?: number;
+  startISO?: string;
+  endISO?: string;
+}) {
+  const endMs = args.endISO ? new Date(args.endISO).getTime() : Date.now();
+  const defaultStart = endMs - 30 * 60 * 1000;
+  const startMs = args.startISO ? new Date(args.startISO).getTime() : defaultStart;
+  if (Number.isNaN(startMs) || Number.isNaN(endMs) || endMs <= startMs) {
+    return { success: false, message: "Invalid time range." };
+  }
+  const wrote: string[] = [];
+  if (typeof args.steps === "number" && args.steps > 0) {
+    await writeFitPoint("steps", startMs, endMs, args.steps);
+    wrote.push(`${args.steps} steps`);
+  }
+  if (typeof args.distanceMeters === "number" && args.distanceMeters > 0) {
+    await writeFitPoint("distance", startMs, endMs, args.distanceMeters);
+    wrote.push(`${(args.distanceMeters / 1000).toFixed(2)} km`);
+  }
+  if (typeof args.calories === "number" && args.calories > 0) {
+    await writeFitPoint("calories", startMs, endMs, args.calories);
+    wrote.push(`${Math.round(args.calories)} kcal`);
+  }
+  if (typeof args.activeMinutes === "number" && args.activeMinutes > 0) {
+    await writeFitPoint("active", startMs, endMs, args.activeMinutes);
+    wrote.push(`${args.activeMinutes} active min`);
+  }
+  if (!wrote.length) return { success: false, message: "Nothing to log." };
+  return { success: true, message: `Logged: ${wrote.join(", ")}.` };
+}
+
 // ───────────────────────────────────────────────────────────────────────
 // DISPATCH
 // ───────────────────────────────────────────────────────────────────────
@@ -2581,6 +2714,7 @@ const handlers: Record<string, (args: any) => Promise<Record<string, unknown>>> 
   notes_add: notesAdd,
   notes_recent: notesRecent,
   fitness_today: () => fitnessToday(),
+  fitness_log_activity: fitnessLogActivity,
   google_account_info: async () => ({ success: true, ...getAccountInfo() }),
 };
 
@@ -2617,6 +2751,7 @@ interface LifeSnapshot {
   todayEventsCount: number;
   hasMeetSoon: boolean;
   recentVideo: { title: string; channel: string } | null;
+  fitToday: { steps: number; activeMinutes: number; distanceKm: number } | null;
 }
 
 let snapshotCache: LifeSnapshot | null = null;
@@ -2626,13 +2761,14 @@ const SNAPSHOT_TTL_MS = 5 * 60 * 1000;
 async function refreshLifeSnapshot(): Promise<void> {
   if (!isGoogleConfigured()) return;
   try {
-    const [inbox, upcoming, tasks, watched] = await Promise.allSettled([
+    const [inbox, upcoming, tasks, watched, fit] = await Promise.allSettled([
       googleJson<GmailListResponse>(
         "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=1&q=is:unread+in:inbox"
       ),
       calendarUpcoming({ days: 1, max: 5 }),
       tasksList({ max: 10 }),
       youtubeRecentWatched({ max: 1 }).catch(() => ({ videos: [] as any[] })),
+      fitnessToday().catch(() => null),
     ]);
 
     const unreadCount =
@@ -2667,6 +2803,16 @@ async function refreshLifeSnapshot(): Promise<void> {
       if (v?.title) recentVideo = { title: v.title, channel: v.channel ?? "" };
     }
 
+    let fitToday: LifeSnapshot["fitToday"] = null;
+    if (fit.status === "fulfilled" && fit.value && !(fit.value as any).empty) {
+      const f = fit.value as any;
+      fitToday = {
+        steps: Number(f.steps ?? 0),
+        activeMinutes: Number(f.activeMinutes ?? 0),
+        distanceKm: Number(f.distanceKm ?? 0),
+      };
+    }
+
     snapshotCache = {
       generatedAt: Date.now(),
       unreadCount,
@@ -2676,6 +2822,7 @@ async function refreshLifeSnapshot(): Promise<void> {
       todayEventsCount,
       hasMeetSoon,
       recentVideo,
+      fitToday,
     };
   } catch (err: any) {
     console.error("[GoogleTools] snapshot refresh error:", err?.message ?? err);
@@ -2726,6 +2873,13 @@ export function getMeeraLifeSnapshot(): string {
   if (snap.unreadCount > 0) lines.push(`- You have ${snap.unreadCount} unread email${snap.unreadCount === 1 ? "" : "s"} sitting in your Gmail.`);
   if (snap.pendingTasks > 0) lines.push(`- ${snap.pendingTasks} thing${snap.pendingTasks === 1 ? "" : "s"} still on your to-do list.`);
   if (snap.recentVideo) lines.push(`- Last YouTube video you watched: "${snap.recentVideo.title}"${snap.recentVideo.channel ? ` by ${snap.recentVideo.channel}` : ""}.`);
+  if (snap.fitToday && snap.fitToday.steps > 0) {
+    const f = snap.fitToday;
+    const bits = [`${f.steps.toLocaleString()} steps`];
+    if (f.activeMinutes > 0) bits.push(`${f.activeMinutes} active min`);
+    if (f.distanceKm > 0) bits.push(`${f.distanceKm.toFixed(1)} km`);
+    lines.push(`- Today's body: ${bits.join(" · ")}.`);
+  }
 
   if (!lines.length) return "";
   return `\n\nYOUR REAL-LIFE CONTEXT (you just know this — like checking your phone subconsciously):
