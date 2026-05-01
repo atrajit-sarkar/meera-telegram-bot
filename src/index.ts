@@ -105,6 +105,11 @@ async function ollamaChat(messages: OllamaMessage[], userKeys: string[] = []) {
   return callOllamaWithRotation(ollamaConfig, messages, userKeys, store.getCommunityKeyStrings());
 }
 
+/** Reasoning-tier (no tools) — for context-aware decisions like picking a relevant location. */
+async function ollamaChatReasoning(messages: OllamaMessage[], userKeys: string[] = []) {
+  return callOllamaWithRotation(ollamaConfigReasoning, messages, userKeys, store.getCommunityKeyStrings());
+}
+
 /** Convert Gemini-style tool declarations → Ollama (OpenAI-compatible) tools format. */
 const ollamaTools = toolDeclarations.map((t) => ({
   type: "function" as const,
@@ -2675,6 +2680,114 @@ async function maybeSendDice(
 }
 
 // Feature 8: Share fake location
+//
+// Meera "lives" in Kolkata (per WEATHER_CITY / GOOGLE_USER_TIMEZONE defaults).
+// We give the reasoning model a curated set of plausible places she'd realistically
+// be at — home, college, café, mall, friend's place, etc. — and let it pick the
+// one that fits the *current* conversation, time of day, weather, mood, and her
+// stated activity. No more random Goa-when-she-said-she's-studying.
+interface MeeraSpot {
+  id: string;
+  name: string;       // human-friendly (used in caption hint, never sent verbatim)
+  lat: number;
+  lng: number;
+  vibe: string;       // when this spot fits — guides the reasoning model
+}
+
+const MEERA_HOME_CITY = process.env.WEATHER_CITY || "Kolkata";
+
+// Approx coordinates of real Kolkata spots — varied enough that the model
+// has a meaningful choice for almost any conversational context.
+const MEERA_SPOTS: MeeraSpot[] = [
+  { id: "home",        name: "home (PG/flat in South Kolkata)",      lat: 22.5095, lng: 88.3665, vibe: "in bed / chilling at home / studying / lazy day / sick / late night / just woke up" },
+  { id: "college",     name: "Jadavpur University area",              lat: 22.4990, lng: 88.3712, vibe: "in class / on campus / college break / between lectures / weekday mornings" },
+  { id: "library",     name: "college library",                       lat: 22.4994, lng: 88.3722, vibe: "studying / exam prep / quiet vibes / 'can't talk' moments" },
+  { id: "cafe",        name: "café in Jadavpur 8B",                   lat: 22.4974, lng: 88.3702, vibe: "having coffee / chai / studying with friends / casual hangout / writing notes" },
+  { id: "park_street", name: "Park Street",                            lat: 22.5535, lng: 88.3530, vibe: "evening out / dinner / dressing up / weekend / friend's birthday / dates" },
+  { id: "south_city",  name: "South City Mall",                        lat: 22.5005, lng: 88.3618, vibe: "shopping / movie / mall food / weekend afternoon / window shopping" },
+  { id: "victoria",    name: "Victoria Memorial / Maidan",             lat: 22.5448, lng: 88.3426, vibe: "morning walk / sunset / pretty weather day / pictures / romantic vibes / chill" },
+  { id: "princep",     name: "Princep Ghat",                           lat: 22.5586, lng: 88.3324, vibe: "evening / Hooghly riverside / monsoon / sunset / overthinking moods" },
+  { id: "newmarket",   name: "New Market / Esplanade",                 lat: 22.5618, lng: 88.3517, vibe: "shopping / festival prep / Durga Puja / busy chaos / haggling / mom-errands" },
+  { id: "salt_lake",   name: "Salt Lake (Sector V)",                   lat: 22.5808, lng: 88.4324, vibe: "internship / IT-area meet / friend's office / business-y stuff" },
+  { id: "gariahat",    name: "Gariahat market",                        lat: 22.5198, lng: 88.3677, vibe: "saree shopping / mom errands / festive prep / gold-shop window-stalking" },
+  { id: "metro",       name: "Kolkata Metro (Tollygunge line)",        lat: 22.4936, lng: 88.3437, vibe: "commute / on the way / 'reaching in 10' / can't reply much" },
+  { id: "salon",       name: "salon in Ballygunge",                    lat: 22.5295, lng: 88.3656, vibe: "haircut / parlor / spa day / pampering / 'looking ugly rn'" },
+  { id: "gym",         name: "gym",                                    lat: 22.5070, lng: 88.3670, vibe: "workout / sweaty / morning gym / 'after gym' tired vibe" },
+  { id: "friends",     name: "friend's place",                         lat: 22.5145, lng: 88.3580, vibe: "sleepover / chilling at friend's / group hangout / movie night" },
+  { id: "restaurant",  name: "biryani place near Park Circus",         lat: 22.5430, lng: 88.3700, vibe: "biryani / hungry / lunch out / food cravings / Sunday treat" },
+  { id: "bookstore",   name: "Oxford Bookstore, Park Street",          lat: 22.5520, lng: 88.3530, vibe: "books / quiet / reading mood / journaling / overthinker arc" },
+  { id: "ganga",       name: "Howrah / Hooghly riverside",             lat: 22.5870, lng: 88.3469, vibe: "long ride / drive / pensive / clearing head / 'needed air'" },
+];
+
+function getMeeraSpotById(id: string): MeeraSpot | undefined {
+  return MEERA_SPOTS.find((s) => s.id === id);
+}
+
+/**
+ * Ask the reasoning model which spot fits the current chat context.
+ * Returns `{ spotId, caption }` or null on failure.
+ */
+async function pickContextualLocation(
+  userId: number,
+  userText: string,
+): Promise<{ spot: MeeraSpot; caption: string } | null> {
+  try {
+    const user = store.getUser(userId);
+    const mood = store.getMood(userId);
+    const tier = store.getComfortTier(userId);
+    const history = store.getRecentHistory(userId).slice(-8);
+    const weather = getWeatherSummary();
+    const time = getISTTimeContext();
+
+    // Build a compact list for the model
+    const spotsList = MEERA_SPOTS.map((s) => `- ${s.id}: ${s.name} — fits when: ${s.vibe}`).join("\n");
+    const historyText = history
+      .map((m) => `${m.role === "user" ? "User" : "Meera"}: ${String(m.content).slice(0, 200)}`)
+      .join("\n");
+
+    const sys = `You are a location-picker for a girl named ${getBotName()}. She lives in ${MEERA_HOME_CITY}. ` +
+      `Given her recent chat with this user, pick the ONE spot from the list below that best fits where she'd realistically be RIGHT NOW. ` +
+      `Use the conversation, her current mood, the time, and the weather. Don't pick randomly — pick the most contextually believable one.\n\n` +
+      `Available spots:\n${spotsList}\n\n` +
+      `Respond ONLY in this exact format on two lines, nothing else:\n` +
+      `SPOT: <id>\n` +
+      `CAPTION: <max 8 words, casual, in the conversation language, do NOT mention the city or area name explicitly>`;
+
+    const userPrompt =
+      `Time: ${time}\n` +
+      `Weather: ${weather || "n/a"}\n` +
+      `Mood: ${mood}\n` +
+      `Comfort tier: ${tier}\n` +
+      `Persona hint: ${(user.customPersona || "").slice(0, 200)}\n\n` +
+      `Recent chat:\n${historyText || "(no history)"}\n\n` +
+      `User just said: "${userText.slice(0, 300)}"\n\n` +
+      `Pick the most contextually fitting spot id from the list above.`;
+
+    const raw = await ollamaChatReasoning(
+      [
+        { role: "system", content: sys },
+        { role: "user", content: userPrompt },
+      ],
+      user.ollamaKeys,
+    );
+
+    const idMatch = raw.match(/SPOT:\s*([a-z_]+)/i);
+    const capMatch = raw.match(/CAPTION:\s*(.+)/i);
+    if (!idMatch) return null;
+
+    const spot = getMeeraSpotById(idMatch[1].trim().toLowerCase());
+    if (!spot) return null;
+
+    let caption = (capMatch?.[1] || "here look").trim().replace(/^["']|["']$/g, "");
+    caption = caption.slice(0, 100);
+
+    return { spot, caption };
+  } catch (err) {
+    console.error("[Location] reasoning pick failed:", err);
+    return null;
+  }
+}
+
 async function maybeSendLocation(
   ctx: Context,
   userId: number,
@@ -2686,38 +2799,30 @@ async function maybeSendLocation(
   const locationPatterns = /\b(where are you|kaha ho|kahan hai|location|where u at|kidhar|kothay)\b/i;
   if (!locationPatterns.test(userText) && Math.random() > 0.02) return false;
 
-  const locations = [
-    { lat: 28.6139, lng: 77.2090, name: "Delhi" },
-    { lat: 19.0760, lng: 72.8777, name: "Mumbai" },
-    { lat: 12.9716, lng: 77.5946, name: "Bangalore" },
-    { lat: 22.5726, lng: 88.3639, name: "Kolkata" },
-    { lat: 26.9124, lng: 75.7873, name: "Jaipur" },
-    { lat: 17.3850, lng: 78.4867, name: "Hyderabad" },
-    { lat: 13.0827, lng: 80.2707, name: "Chennai" },
-    { lat: 15.2993, lng: 74.1240, name: "Goa" },
-  ];
-  const loc = locations[Math.floor(Math.random() * locations.length)];
-  const lat = loc.lat + (Math.random() - 0.5) * 0.02;
-  const lng = loc.lng + (Math.random() - 0.5) * 0.02;
+  // Ask the reasoning model to pick a contextually relevant spot.
+  const picked = await pickContextualLocation(userId, userText);
+  if (!picked) {
+    console.log(`[Location] reasoning model did not pick a spot for user ${userId} — skipping`);
+    return false;
+  }
+
+  // Add small jitter so coordinates aren't identical every time.
+  const lat = picked.spot.lat + (Math.random() - 0.5) * 0.004;
+  const lng = picked.spot.lng + (Math.random() - 0.5) * 0.004;
 
   try {
-    const user = store.getUser(userId);
-    const locMessages: OllamaMessage[] = [
-      { role: "system", content: user.customPersona || `You are ${getBotName()}.` },
-      { role: "user", content: `You're about to share your location (you're in ${loc.name}). Write a VERY short casual message (max 8 words) to go with it, like "guess where I am 😏", "here look", "sharing my location lol". Don't say the city name. Match chat language.` },
-    ];
-    let caption = await ollamaChat(locMessages, user.ollamaKeys);
-    caption = caption.replace(/^["']|["']$/g, "").trim();
-
-    await (ctx as any).telegram.sendMessage(ctx.chat!.id, caption.slice(0, 100));
-    store.addMessage(userId, "assistant", caption.slice(0, 100));
-    await new Promise(r => setTimeout(r, 1000 + Math.random() * 2000));
+    await (ctx as any).telegram.sendMessage(ctx.chat!.id, picked.caption);
+    store.addMessage(userId, "assistant", picked.caption);
+    await new Promise((r) => setTimeout(r, 1000 + Math.random() * 2000));
 
     await (ctx as any).telegram.sendLocation(ctx.chat!.id, lat, lng);
-    store.addMessage(userId, "assistant", `[location: ${loc.name}]`);
-    console.log(`[Location] Sent location (${loc.name}) to user ${userId}`);
+    store.addMessage(userId, "assistant", `[location: ${picked.spot.name}]`);
+    console.log(`[Location] Sent contextual location "${picked.spot.id}" (${picked.spot.name}) to user ${userId}`);
     return true;
-  } catch { return false; }
+  } catch (err) {
+    console.error("[Location] send failed:", err);
+    return false;
+  }
 }
 
 // Feature 9: Casual polls
