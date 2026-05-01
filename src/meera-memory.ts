@@ -1,7 +1,7 @@
 /**
  * Long-term semantic memory for Meera.
  *
- * Uses Gemini's free `text-embedding-004` model + Firestore for storage.
+ * Uses Gemini's `gemini-embedding-001` model + Firestore for storage.
  * Per-user memories are extracted from conversations and retrieved by cosine
  * similarity when relevant before each reply.
  *
@@ -24,7 +24,7 @@ interface MemoryDoc {
 }
 
 const COLLECTION = "meera_memories";
-const EMBED_MODEL = "text-embedding-004";
+const EMBED_MODEL = "gemini-embedding-001";
 const EMBED_DIM = 768;
 
 async function embed(text: string): Promise<number[] | null> {
@@ -38,6 +38,7 @@ async function embed(text: string): Promise<number[] | null> {
       body: JSON.stringify({
         model: `models/${EMBED_MODEL}`,
         content: { parts: [{ text }] },
+        outputDimensionality: EMBED_DIM,
       }),
     });
     if (!res.ok) return null;
