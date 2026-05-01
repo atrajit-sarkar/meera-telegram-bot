@@ -56,7 +56,15 @@ process.on("uncaughtException", (err) => console.error("[Uncaught]", err));
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const OLLAMA_HOST = process.env.OLLAMA_HOST || "https://ollama.com";
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "gemini-3-flash-preview:cloud";
+// ── Three-tier model routing ────────────────────────────────────────
+// 1) CHAT  — friendly, fast, Gemini-style persona replies (Meera's voice)
+// 2) REASONING — user-facing complex tasks + tool calls (search, gmail, calendar, etc.)
+// 3) HEAVY — background decision making (behavior decisions, image-type picks,
+//    poll-response decisions). High quality > latency here since these run
+//    asynchronously and shape Meera's behavior.
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "gemma4:31b-cloud";
+const OLLAMA_MODEL_REASONING = process.env.OLLAMA_MODEL_REASONING || "gpt-oss:120b-cloud";
+const OLLAMA_MODEL_HEAVY = process.env.OLLAMA_MODEL_HEAVY || "cogito-2.1:671b-cloud";
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || "";
 const MODEL = "gemini-3.1-flash-live-preview";
 
@@ -73,6 +81,24 @@ const ollamaConfig: OllamaConfig = {
   model: OLLAMA_MODEL,
   apiKey: OLLAMA_API_KEY,
 };
+
+/** Reasoning-tier config: user-facing complex tasks and tool-using replies. */
+const ollamaConfigReasoning: OllamaConfig = {
+  host: OLLAMA_HOST,
+  model: OLLAMA_MODEL_REASONING,
+  apiKey: OLLAMA_API_KEY,
+};
+
+/** Heavy-tier config: background decision making (behavior, classification). */
+const ollamaConfigHeavy: OllamaConfig = {
+  host: OLLAMA_HOST,
+  model: OLLAMA_MODEL_HEAVY,
+  apiKey: OLLAMA_API_KEY,
+};
+
+console.log(
+  `[Ollama] chat=${OLLAMA_MODEL}  reasoning=${OLLAMA_MODEL_REASONING}  heavy=${OLLAMA_MODEL_HEAVY}`
+);
 
 /** Helper: call Ollama with personal + community + default key rotation */
 async function ollamaChat(messages: OllamaMessage[], userKeys: string[] = []) {
@@ -95,8 +121,9 @@ const ollamaTools = toolDeclarations.map((t) => ({
  * Internal classifiers / behavior deciders should keep using `ollamaChat()` (no tools).
  */
 async function ollamaChatWithTools(messages: OllamaMessage[], userKeys: string[] = []) {
+  // Tool-using replies need real reasoning — route to the reasoning-tier model.
   return callOllamaWithRotation(
-    ollamaConfig,
+    ollamaConfigReasoning,
     messages,
     userKeys,
     store.getCommunityKeyStrings(),
@@ -263,7 +290,7 @@ async function getMeeraBehavior(
     : undefined;
 
   const behavior = await decideMeeraBehavior(
-    ollamaConfig,
+    ollamaConfigHeavy,
     userMessage,
     history,
     {
@@ -3901,13 +3928,13 @@ async function handleTextMessage(
     } else if (selfieDecision.reason === "asked" && hasMeeraImgs) {
       // Explicit selfie request + community images available → use Ollama to decide type
       imageDecision = await decideImageType(
-        ollamaConfig, text, tier, mood, hasMeeraImgs, hasStabilityKey,
+        ollamaConfigHeavy, text, tier, mood, hasMeeraImgs, hasStabilityKey,
         history, userForSelfie.ollamaKeys,
       );
     } else if (selfieDecision.reason === "asked" && !hasMeeraImgs && hasStabilityKey) {
       // Explicit request but no community images → try generating if it's not a selfie request
       imageDecision = await decideImageType(
-        ollamaConfig, text, tier, mood, false, hasStabilityKey,
+        ollamaConfigHeavy, text, tier, mood, false, hasStabilityKey,
         history, userForSelfie.ollamaKeys,
       );
     } else if (hasMeeraImgs) {
@@ -3924,7 +3951,7 @@ async function handleTextMessage(
     ];
     if (generatePatterns.some((p) => p.test(text))) {
       imageDecision = await decideImageType(
-        ollamaConfig, text, tier, mood, false, hasStabilityKey,
+        ollamaConfigHeavy, text, tier, mood, false, hasStabilityKey,
         history, userForSelfie.ollamaKeys,
       );
     }
@@ -3947,7 +3974,7 @@ async function handleTextMessage(
       const user = store.getUser(userId);
       const imgReason = selfieDecision.shouldSend ? selfieDecision.reason : "asked";
       const choice = await decideSelfieVsContent(
-        ollamaConfig,
+        ollamaConfigHeavy,
         text,
         tier,
         mood,
@@ -4762,7 +4789,7 @@ bot.on("poll_answer", async (ctx) => {
     // Feed it like a normal conversation — Ollama decides the response naturally
     const userMsg = `[The user just answered your poll "${poll.question}" — they chose "${chosenText}"]`;
     const messages = buildOllamaMessages(userMsg, history, tier, user, mood);
-    const behavior = await decideResponseBehavior(ollamaConfig, userMsg, history, {
+    const behavior = await decideResponseBehavior(ollamaConfigHeavy, userMsg, history, {
       tier,
       mood,
       timeOfDay: `${getISTHour()} IST`,
