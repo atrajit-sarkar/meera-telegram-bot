@@ -2703,7 +2703,7 @@ async function maybeShareMusic(
   }
 }
 
-// Tenor GIF reaction: occasionally drop a GIF after a text reply.
+// GIF reaction (Giphy): occasionally drop a GIF after a text reply.
 async function maybeSendGifReaction(
   ctx: Context,
   userId: number,
