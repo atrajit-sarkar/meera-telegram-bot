@@ -1,6 +1,7 @@
 /**
  * Meera's ambient world context — gives her real things going on:
- *   • Indian holidays / festivals (hardcoded high-quality list, no API key needed)
+ *   • Indian holidays / festivals (live from Google's public Indian holidays
+ *     calendar — falls back to a tiny hardcoded set if Google is unreachable)
  *   • Kolkata AQI (free AQICN API — opt-in via WAQI_TOKEN env)
  *   • Indian news headlines (free RSS feeds — no key needed)
  *   • IPL/cricket fixtures (free TheSportsDB — no key, public)
@@ -9,6 +10,8 @@
  * Every fetcher is best-effort: failure → returns empty / silent.
  * All output is short and persona-friendly so it can drop into the system prompt.
  */
+
+import { isGoogleConfigured, googleJson } from "./google-account.js";
 
 const FETCH_TIMEOUT_MS = 5000;
 
@@ -25,45 +28,110 @@ async function timedFetch(url: string, opts: RequestInit = {}): Promise<Response
 }
 
 // ── 1. INDIAN HOLIDAYS / FESTIVALS ──────────────────────────────────
-// Curated for the next ~2 years. No API key. Update yearly.
-// Format: ISO date "YYYY-MM-DD" → { name, vibe }
-type Festival = { name: string; vibe: string; majorDays?: number /* days before to start mentioning */ };
+// Live from Google's public "Holidays in India" calendar.
+// Vibes are matched by name keywords — works for any year.
 
-const FESTIVALS: Record<string, Festival> = {
-  // 2026
-  "2026-01-14": { name: "Makar Sankranti / Pongal", vibe: "kite flying, til ladoo, sun moves north" },
-  "2026-01-26": { name: "Republic Day", vibe: "parade vibes, tricolor everywhere", majorDays: 2 },
-  "2026-02-15": { name: "Vasant Panchami / Saraswati Puja", vibe: "yellow saree day, books-and-pen pujo (huge in Bengal)", majorDays: 3 },
-  "2026-03-04": { name: "Holi", vibe: "colors, gujiya, bhang, total chaos", majorDays: 4 },
-  "2026-03-21": { name: "Eid-ul-Fitr (approx)", vibe: "biryani, sevai, festive evening" },
-  "2026-04-14": { name: "Bengali New Year (Poila Boishakh)", vibe: "panta-ilish, naba barsha, new red-and-white saree", majorDays: 3 },
-  "2026-05-22": { name: "Buddha Purnima", vibe: "calm peaceful day" },
-  "2026-08-15": { name: "Independence Day", vibe: "flag hoisting, patriotic songs", majorDays: 2 },
-  "2026-08-19": { name: "Janmashtami", vibe: "Krishna's birthday, dahi handi" },
-  "2026-08-26": { name: "Raksha Bandhan", vibe: "rakhi day, bhai-behen vibes" },
-  "2026-09-05": { name: "Teachers' Day", vibe: "school memories, college tributes" },
-  "2026-09-14": { name: "Ganesh Chaturthi", vibe: "modaks, Ganpati bappa morya", majorDays: 3 },
-  "2026-10-15": { name: "Mahalaya", vibe: "Bengali pre-Pujo morning, Mahishasura Mardini on radio" },
-  "2026-10-19": { name: "Durga Puja Shashthi", vibe: "Pujo starts! Pandal hopping in Kolkata is INSANE", majorDays: 7 },
-  "2026-10-20": { name: "Maha Saptami", vibe: "Pujo day 2, new clothes, family time" },
-  "2026-10-21": { name: "Maha Ashtami", vibe: "Pujo day 3, anjali, the BIG day" },
-  "2026-10-22": { name: "Maha Navami", vibe: "Pujo day 4, last big celebration" },
-  "2026-10-23": { name: "Vijaya Dashami / Dussehra", vibe: "sindoor khela, Ravan dahan, bittersweet end of Pujo", majorDays: 1 },
-  "2026-10-29": { name: "Karwa Chauth", vibe: "fasting wives, sieve-and-moon ritual" },
-  "2026-11-08": { name: "Diwali / Kali Puja", vibe: "lights, mishti, fireworks (in Bengal it's Kali Pujo)", majorDays: 3 },
-  "2026-11-09": { name: "Bhai Dooj", vibe: "tilak ceremony, brother-sister day" },
-  "2026-11-15": { name: "Children's Day", vibe: "Chacha Nehru, school memories" },
-  "2026-12-25": { name: "Christmas", vibe: "Park Street lights are everything in Kolkata!", majorDays: 5 },
-  "2026-12-31": { name: "New Year's Eve", vibe: "party vibes, countdown, resolutions", majorDays: 2 },
+interface FestivalLive {
+  date: string;     // YYYY-MM-DD
+  name: string;     // from Google
+  vibe: string;     // matched from VIBES table; "" if no match
+  majorDays: number; // how many days before to start mentioning
+}
 
-  // 2027 (rough)
-  "2027-01-01": { name: "New Year", vibe: "fresh start", majorDays: 1 },
-  "2027-01-14": { name: "Makar Sankranti", vibe: "kite flying" },
-  "2027-01-26": { name: "Republic Day", vibe: "parade", majorDays: 2 },
-  "2027-02-04": { name: "Saraswati Puja", vibe: "yellow saree day", majorDays: 3 },
-  "2027-03-22": { name: "Holi", vibe: "colors", majorDays: 4 },
-  "2027-08-15": { name: "Independence Day", vibe: "tricolor", majorDays: 2 },
-};
+/** Keyword → vibe map. Keys are lowercase substrings; first match wins. */
+const VIBES: Array<{ match: RegExp; vibe: string; majorDays?: number }> = [
+  { match: /makar\s*sankranti|pongal|lohri/i, vibe: "kite flying, til ladoo, sun moves north", majorDays: 1 },
+  { match: /republic day/i, vibe: "parade vibes, tricolor everywhere", majorDays: 2 },
+  { match: /vasant\s*panchami|saraswati\s*puja/i, vibe: "yellow saree day, books-and-pen pujo (huge in Bengal)", majorDays: 3 },
+  { match: /maha\s*shivratri|shivratri/i, vibe: "Shiva worship, fasting, late-night jaagran" },
+  { match: /holi/i, vibe: "colors, gujiya, bhang, total chaos", majorDays: 4 },
+  { match: /good friday|easter/i, vibe: "calm long weekend vibes" },
+  { match: /eid\s*ul\s*fitr|eid-ul-fitr|eid$|eid\b/i, vibe: "biryani, sevai, festive evening", majorDays: 1 },
+  { match: /ram\s*navami/i, vibe: "Ram Navami, temple visits" },
+  { match: /mahavir|baisakhi|vaisakhi|tamil new year/i, vibe: "regional new year energy" },
+  { match: /bengali new year|poila boishakh/i, vibe: "panta-ilish, naba barsha, new red-and-white saree", majorDays: 3 },
+  { match: /buddha purnima|vesak/i, vibe: "calm peaceful day" },
+  { match: /eid\s*ul\s*adha|bakrid|bakri eid/i, vibe: "Bakr-Eid, family meals" },
+  { match: /muharram|ashura/i, vibe: "Muharram, somber day" },
+  { match: /raksha bandhan|rakhi/i, vibe: "rakhi day, bhai-behen vibes", majorDays: 2 },
+  { match: /independence day/i, vibe: "flag hoisting, patriotic songs", majorDays: 2 },
+  { match: /janmashtami|krishna janmashtami/i, vibe: "Krishna's birthday, dahi handi" },
+  { match: /onam/i, vibe: "Kerala feast day (you'd see insta posts)" },
+  { match: /ganesh chaturthi|vinayaka chaturthi/i, vibe: "modaks, Ganpati bappa morya", majorDays: 3 },
+  { match: /teacher.?s? day/i, vibe: "school memories, college tributes" },
+  { match: /mahalaya/i, vibe: "Bengali pre-Pujo morning, Mahishasura Mardini on radio" },
+  { match: /durga\s*puja|durga\s*ashtami|durgashtami|maha\s*ashtami|navami|pujo/i, vibe: "PUJO! pandal hopping in Kolkata is INSANE", majorDays: 7 },
+  { match: /dussehra|vijaya dashami|dasara/i, vibe: "sindoor khela, Ravan dahan, bittersweet end of Pujo", majorDays: 1 },
+  { match: /gandhi jayanti/i, vibe: "national holiday, dry day" },
+  { match: /karva chauth|karwa chauth/i, vibe: "fasting wives, sieve-and-moon ritual" },
+  { match: /dhanteras/i, vibe: "buying gold/silver day, Diwali starts" },
+  { match: /naraka chaturdashi|chhoti diwali/i, vibe: "Choti Diwali, lights start" },
+  { match: /diwali|deepavali|kali puja|kali pujo/i, vibe: "lights, mishti, fireworks (in Bengal it's Kali Pujo)", majorDays: 3 },
+  { match: /govardhan|bhai dooj|bhai\s*phonta|bhratri\s*dwitiya/i, vibe: "tilak ceremony, brother-sister day", majorDays: 1 },
+  { match: /chhath/i, vibe: "Chhath Puja, sun-god rituals on river ghats" },
+  { match: /children.?s? day/i, vibe: "Chacha Nehru, school memories" },
+  { match: /guru nanak|guru\s*purab/i, vibe: "Gurpurab, Sikh holiday" },
+  { match: /christmas/i, vibe: "Park Street lights are everything in Kolkata!", majorDays: 5 },
+  { match: /new year/i, vibe: "party vibes, countdown, resolutions", majorDays: 2 },
+];
+
+function vibeForName(name: string): { vibe: string; majorDays: number } {
+  for (const v of VIBES) {
+    if (v.match.test(name)) return { vibe: v.vibe, majorDays: v.majorDays ?? 1 };
+  }
+  return { vibe: "", majorDays: 1 };
+}
+
+/** Tiny offline fallback so context isn't empty when Google is down/not configured. */
+const FALLBACK_FESTIVALS: FestivalLive[] = [
+  { date: "2026-03-04", name: "Holi", vibe: "colors, gujiya, bhang, total chaos", majorDays: 4 },
+  { date: "2026-08-15", name: "Independence Day", vibe: "flag hoisting, patriotic songs", majorDays: 2 },
+  { date: "2026-10-19", name: "Durga Puja begins", vibe: "PUJO! pandal hopping in Kolkata is INSANE", majorDays: 7 },
+  { date: "2026-10-23", name: "Dussehra", vibe: "sindoor khela, Ravan dahan, bittersweet end of Pujo", majorDays: 1 },
+  { date: "2026-11-08", name: "Diwali", vibe: "lights, mishti, fireworks (in Bengal it's Kali Pujo)", majorDays: 3 },
+  { date: "2026-12-25", name: "Christmas", vibe: "Park Street lights are everything in Kolkata!", majorDays: 5 },
+];
+
+interface FestivalCache { ts: number; events: FestivalLive[] }
+let festivalCache: FestivalCache | null = null;
+const FESTIVAL_TTL = 12 * 60 * 60 * 1000; // 12h
+const HOLIDAYS_CAL = "en.indian%23holiday%40group.v.calendar.google.com";
+
+export async function refreshFestivals(): Promise<void> {
+  if (!isGoogleConfigured()) {
+    festivalCache = { ts: Date.now(), events: FALLBACK_FESTIVALS };
+    return;
+  }
+  try {
+    const now = new Date();
+    const start = new Date(now.getTime() - 1 * 86400000);
+    const end = new Date(now.getTime() + 60 * 86400000);
+    const params = new URLSearchParams({
+      timeMin: start.toISOString(),
+      timeMax: end.toISOString(),
+      singleEvents: "true",
+      orderBy: "startTime",
+      maxResults: "60",
+    });
+    const data = await googleJson<{ items?: any[] }>(
+      `https://www.googleapis.com/calendar/v3/calendars/${HOLIDAYS_CAL}/events?${params}`
+    );
+    const items: any[] = data.items ?? [];
+    const events: FestivalLive[] = [];
+    for (const it of items) {
+      const date: string | undefined = it.start?.date ?? (it.start?.dateTime as string)?.slice(0, 10);
+      const name: string | undefined = it.summary;
+      if (!date || !name) continue;
+      const v = vibeForName(name);
+      events.push({ date, name, vibe: v.vibe, majorDays: v.majorDays });
+    }
+    festivalCache = { ts: Date.now(), events };
+    console.log(`[festivals] loaded ${events.length} from Google Indian holidays calendar`);
+  } catch (err) {
+    console.warn("[festivals] google fetch failed, using fallback:", (err as Error).message);
+    festivalCache = { ts: Date.now(), events: FALLBACK_FESTIVALS };
+  }
+}
 
 function todayIST(): string {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(new Date());
@@ -76,22 +144,25 @@ function daysBetween(isoA: string, isoB: string): number {
 }
 
 export function getFestivalContext(): string {
+  if (!festivalCache) return "";
   const today = todayIST();
   const lines: string[] = [];
+  const events = festivalCache.events;
 
-  // Today
-  if (FESTIVALS[today]) {
-    const f = FESTIVALS[today];
-    lines.push(`🎉 TODAY is ${f.name} — ${f.vibe}. Reference it naturally.`);
+  for (const f of events) {
+    if (f.date === today) {
+      const vibe = f.vibe ? ` — ${f.vibe}` : "";
+      lines.push(`🎉 TODAY is ${f.name}${vibe}. Reference it naturally.`);
+    }
   }
 
-  // Upcoming within window
-  const sorted = Object.entries(FESTIVALS).filter(([d]) => d >= today).sort();
-  for (const [date, f] of sorted.slice(0, 4)) {
-    const days = daysBetween(today, date);
-    const window = f.majorDays ?? 1;
-    if (days > 0 && days <= window) {
-      lines.push(`📅 ${f.name} in ${days} day${days === 1 ? "" : "s"} — ${f.vibe}. You're aware, looking forward.`);
+  // Upcoming
+  const upcoming = events.filter(e => e.date > today).slice(0, 8);
+  for (const f of upcoming) {
+    const days = daysBetween(today, f.date);
+    if (days > 0 && days <= f.majorDays) {
+      const vibe = f.vibe ? ` — ${f.vibe}` : "";
+      lines.push(`📅 ${f.name} in ${days} day${days === 1 ? "" : "s"}${vibe}. You're aware, looking forward.`);
     }
   }
 
@@ -269,6 +340,7 @@ export function getMeeraWorldContext(): string {
 export async function refreshAllWorldContext(): Promise<void> {
   // Run in parallel, swallow errors
   await Promise.allSettled([
+    refreshFestivals(),
     refreshAqi(),
     refreshNews(),
     refreshCricket(),

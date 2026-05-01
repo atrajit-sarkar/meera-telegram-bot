@@ -1,21 +1,25 @@
 /**
- * Tenor GIF reactions.
- * Free tier: needs TENOR_API_KEY (free from Google Cloud Console / Tenor v2).
+ * GIF reactions via Giphy.
+ * (Tenor stopped accepting new API clients in Jan 2026.)
+ * Free tier: needs GIPHY_API_KEY (free from developers.giphy.com).
  * If not configured, all calls are no-ops.
  */
 
-const TENOR_BASE = "https://tenor.googleapis.com/v2";
+const GIPHY_BASE = "https://api.giphy.com/v1/gifs";
 
 interface CachedSearch { ts: number; gifs: string[] }
 const cache = new Map<string, CachedSearch>();
 const CACHE_TTL = 30 * 60 * 1000;
 
-export function isTenorConfigured(): boolean {
-  return !!process.env.TENOR_API_KEY;
+export function isGifConfigured(): boolean {
+  return !!process.env.GIPHY_API_KEY;
 }
 
-export async function searchTenorGif(query: string): Promise<string | null> {
-  const key = process.env.TENOR_API_KEY;
+/** Back-compat alias. */
+export const isTenorConfigured = isGifConfigured;
+
+export async function searchGif(query: string): Promise<string | null> {
+  const key = process.env.GIPHY_API_KEY;
   if (!key) return null;
   const q = query.trim().toLowerCase();
   if (!q) return null;
@@ -25,14 +29,14 @@ export async function searchTenorGif(query: string): Promise<string | null> {
   if (cached && Date.now() - cached.ts < CACHE_TTL && cached.gifs.length) {
     pool = cached.gifs;
   } else {
-    const url = `${TENOR_BASE}/search?q=${encodeURIComponent(q)}&key=${encodeURIComponent(key)}&limit=15&media_filter=gif&contentfilter=medium`;
+    const url = `${GIPHY_BASE}/search?q=${encodeURIComponent(q)}&api_key=${encodeURIComponent(key)}&limit=15&rating=pg-13&lang=en`;
     try {
       const res = await fetch(url);
       if (!res.ok) return null;
       const data: any = await res.json();
-      const results: any[] = Array.isArray(data?.results) ? data.results : [];
+      const results: any[] = Array.isArray(data?.data) ? data.data : [];
       const gifs = results
-        .map(r => r?.media_formats?.gif?.url || r?.media_formats?.tinygif?.url)
+        .map(r => r?.images?.original?.url || r?.images?.downsized?.url || r?.images?.fixed_height?.url)
         .filter((u): u is string => !!u);
       if (!gifs.length) return null;
       cache.set(q, { ts: Date.now(), gifs });
@@ -44,6 +48,9 @@ export async function searchTenorGif(query: string): Promise<string | null> {
 
   return pool[Math.floor(Math.random() * pool.length)];
 }
+
+/** Back-compat alias. */
+export const searchTenorGif = searchGif;
 
 /** Pick a search query keyword from message intent. */
 export function inferGifQuery(text: string, mood: string): string | null {
