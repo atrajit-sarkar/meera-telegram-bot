@@ -6,6 +6,15 @@ import ffmpegPath from "ffmpeg-static";
 import { SessionManager } from "./session-manager.js";
 import { toolDeclarations, executeToolCall } from "./tools.js";
 import { startMeeraLife, drainPendingYoutubeShares, requeueYoutubeShares } from "./meera-life.js";
+import { startWorldContextLoop } from "./meera-context.js";
+import { startFriendsLoop } from "./meera-friends.js";
+import { startMoodDriftLoop } from "./meera-mood-drift.js";
+import { maybeExtractMemoriesFromTurn, getMemoryContext } from "./meera-memory.js";
+import { recordMilestoneEvent, getMilestonesContext, addFollowUp } from "./meera-relationship.js";
+import { searchTenorGif, inferGifQuery, isTenorConfigured } from "./meera-gifs.js";
+import { startInitiationLoop } from "./meera-initiation.js";
+import { startStoriesLoop } from "./meera-stories.js";
+import { formatNowPlayingShare } from "./meera-music.js";
 import {
   getBotName,
   buildOllamaMessages,
@@ -108,6 +117,31 @@ async function ollamaChat(messages: OllamaMessage[], userKeys: string[] = []) {
 /** Reasoning-tier (no tools) — for context-aware decisions like picking a relevant location. */
 async function ollamaChatReasoning(messages: OllamaMessage[], userKeys: string[] = []) {
   return callOllamaWithRotation(ollamaConfigReasoning, messages, userKeys, store.getCommunityKeyStrings());
+}
+
+/**
+ * Append per-user dynamic context (long-term memories + relationship milestones)
+ * to the system prompt of an existing message array. Best-effort + non-blocking.
+ */
+async function enrichMessagesForUser(
+  messages: OllamaMessage[],
+  userId: number,
+  userText: string
+): Promise<OllamaMessage[]> {
+  if (!messages.length || messages[0].role !== "system") return messages;
+  try {
+    const [memCtx, mileCtx] = await Promise.all([
+      getMemoryContext(userId, userText).catch(() => ""),
+      getMilestonesContext(userId).catch(() => ""),
+    ]);
+    const extra = (memCtx || "") + (mileCtx || "");
+    if (!extra) return messages;
+    const out = [...messages];
+    out[0] = { ...out[0], content: out[0].content + extra };
+    return out;
+  } catch {
+    return messages;
+  }
 }
 
 /** Convert Gemini-style tool declarations → Ollama (OpenAI-compatible) tools format. */
@@ -2645,6 +2679,56 @@ function shouldSendSilently(): boolean {
   return false;
 }
 
+// Music share: when user asks "what are you listening to" → Meera shares it.
+async function maybeShareMusic(
+  ctx: Context,
+  userId: number,
+  userText: string,
+  mood: string
+): Promise<boolean> {
+  const tier = store.getComfortTier(userId);
+  if (tier === "stranger") return false;
+  const trigger = /\b(what.*listen|kya sun|kaunsa gaana|gaana suna|playlist|song|music|spotify)\b/i;
+  if (!trigger.test(userText)) return false;
+  if (Math.random() > 0.55) return false;
+  try {
+    const share = formatNowPlayingShare(mood);
+    const text = share.url ? `${share.caption}\n${share.url}` : share.caption;
+    await (ctx as any).telegram.sendMessage(ctx.chat!.id, text, { disable_web_page_preview: false });
+    console.log(`[music] shared with ${userId}: ${share.caption}`);
+    return true;
+  } catch (err) {
+    console.warn("[music] share failed:", (err as Error).message);
+    return false;
+  }
+}
+
+// Tenor GIF reaction: occasionally drop a GIF after a text reply.
+async function maybeSendGifReaction(
+  ctx: Context,
+  userId: number,
+  userText: string,
+  mood: string,
+  tier: string
+): Promise<boolean> {
+  if (!isTenorConfigured()) return false;
+  if (tier === "stranger") return false;
+  const baseProb = tier === "close" ? 0.06 : tier === "comfortable" ? 0.04 : 0.02;
+  if (Math.random() > baseProb) return false;
+  const query = inferGifQuery(userText, mood);
+  if (!query) return false;
+  try {
+    const gif = await searchTenorGif(query);
+    if (!gif) return false;
+    await (ctx as any).telegram.sendAnimation(ctx.chat!.id, gif);
+    console.log(`[gif] sent "${query}" to ${userId}`);
+    return true;
+  } catch (err) {
+    console.warn("[gif] failed:", (err as Error).message);
+    return false;
+  }
+}
+
 // Feature 7: Send dice/game emoji
 async function maybeSendDice(
   ctx: Context,
@@ -4141,7 +4225,8 @@ async function handleTextMessage(
           + batchHint + lengthHint + styleHints + emojiHint
           + "\n\n" + text;
         const messages = buildOllamaMessages(userMsg, history, tier, user, mood);
-        let reply = await ollamaChatWithTools(messages, user.ollamaKeys);
+        const enriched = await enrichMessagesForUser(messages, userId, text);
+        let reply = await ollamaChatWithTools(enriched, user.ollamaKeys);
         reply = addDeliberateTypos(reply, mood);
 
         if (isBatched) {
@@ -4228,8 +4313,9 @@ async function handleTextMessage(
         + selfieHint
         + "\n\n" + text;
       const messages = buildOllamaMessages(userMsg, history, tier, user, mood);
+      const enriched = await enrichMessagesForUser(messages, userId, text);
 
-      let reply = await ollamaChatWithTools(messages, user.ollamaKeys);
+      let reply = await ollamaChatWithTools(enriched, user.ollamaKeys);
 
       // Strip any leaked internal metadata from the reply
       reply = stripInternalArtifacts(reply);
@@ -4250,6 +4336,22 @@ async function handleTextMessage(
         store.addMessage(userId, "user", text);
       }
       store.addMessage(userId, "assistant", cleanReply);
+
+      // Long-term memory extraction + milestone tracking (best-effort, fire-and-forget)
+      maybeExtractMemoriesFromTurn(userId, text, cleanReply).catch(() => {});
+      {
+        const istHour = parseInt(new Intl.DateTimeFormat("en-IN", { timeZone: "Asia/Kolkata", hour: "numeric", hour12: false }).format(new Date()), 10);
+        if (store.getMessageCount(userId) <= 2) {
+          recordMilestoneEvent(userId, "first_chat").catch(() => {});
+        }
+        if (istHour >= 23 || istHour <= 3) {
+          recordMilestoneEvent(userId, "late_night").catch(() => {});
+        }
+        // Detect promise of follow-up in Meera's reply
+        if (/\b(tomorrow|kal|tell you later|baad mein|will tell|btau)\b/i.test(cleanReply)) {
+          addFollowUp(userId, text.slice(0, 100)).catch(() => {});
+        }
+      }
 
       // Simulate typing delay (scaled by AI-decided multiplier)
       const delay = typingDelay(reply) * todMultiplier;
@@ -4300,6 +4402,8 @@ async function handleTextMessage(
       // Features 7, 9, 8: Supplemental actions after reply (async, delayed)
       setTimeout(async () => {
         try {
+          if (await maybeShareMusic(ctx, userId, text, mood)) return;
+          if (await maybeSendGifReaction(ctx, userId, text, mood, tier)) return;
           if (await maybeSendDice(ctx, userId, text)) return;
           if (await maybeSendPoll(ctx, userId, text)) return;
           await maybeSendLocation(ctx, userId, text);
@@ -4697,6 +4801,8 @@ bot.on(message("photo"), async (ctx) => {
 
 // Voice messages
 bot.on(message("voice"), async (ctx) => {
+  const userId = ctx.from?.id;
+  if (userId) recordMilestoneEvent(userId, "voice_note").catch(() => {});
   const raw = await downloadFileBuffer(ctx.message.voice.file_id);
   const pcmBase64 = await convertToPcm16(raw);
   console.log("[Bot] Converted voice to PCM16 16kHz, size:", Math.round(Buffer.byteLength(pcmBase64, "base64") / 1024), "KB");
@@ -5415,6 +5521,19 @@ bot.launch({ allowedUpdates: ["message", "callback_query", "poll_answer", "messa
 
   // Kick off Meera's autonomous life loop (calendar routine, weekly chores, daily journal).
   startMeeraLife();
+
+  // Ambient world context: holidays, AQI, news, cricket, movies (background refresh).
+  startWorldContextLoop();
+  // Friends narrative loop (Riya, Ananya, Aarav...).
+  startFriendsLoop();
+  // Mood random-walk + cycle simulation.
+  startMoodDriftLoop();
+  // Proactive initiation messages (gated by MEERA_INITIATE_ENABLED).
+  startInitiationLoop({ bot, store, ollamaConfig });
+  // Channel "stories" (gated by MEERA_STORY_CHANNEL_ID).
+  startStoriesLoop({ bot, ollamaConfig });
+
+  console.log(`[ambient] world/friends/mood/initiation/stories loops started`);
 
   // Register commands so Telegram shows autocomplete suggestions when user types /
   await bot.telegram.setMyCommands([

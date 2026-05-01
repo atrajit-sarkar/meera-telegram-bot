@@ -7,6 +7,10 @@ import type { OllamaMessage } from "./ollama-service.js";
 import { defaultUserData, type UserData } from "./user-store.js";
 import { getMeeraLifeSnapshot, warmGoogleSnapshot } from "./google-tools.js";
 import { isGoogleConfigured, getAccountInfo } from "./google-account.js";
+import { getMeeraWorldContext } from "./meera-context.js";
+import { getFriendsContextSync } from "./meera-friends.js";
+import { getMusicContext } from "./meera-music.js";
+import { getMoodDriftContext } from "./meera-mood-drift.js";
 
 const BOT_NAME = process.env.BOT_NAME || "Meera";
 
@@ -274,6 +278,7 @@ export function buildSystemPrompt(tier: string, user: UserData, mood?: string): 
     if (ctx.length) prompt += "\n\n" + ctx.join(" ");
     prompt += getISTContext();
     prompt += getGoogleLifeContext();
+    prompt += getMeeraAmbientContext(mood);
     return prompt;
   }
 
@@ -308,7 +313,21 @@ export function buildSystemPrompt(tier: string, user: UserData, mood?: string): 
   if (ctx.length) prompt += "\n\n" + ctx.join(" ");
   prompt += getISTContext();
   prompt += getGoogleLifeContext();
+  prompt += getMeeraAmbientContext(mood);
   return prompt;
+}
+
+/**
+ * Synchronous ambient context: world events, friends, music, inner state.
+ * Async-loaded sources (memory, milestones) are appended at call site.
+ */
+function getMeeraAmbientContext(mood?: string): string {
+  let out = "";
+  out += getMeeraWorldContext();
+  out += getFriendsContextSync();
+  out += getMusicContext(mood ?? "chill");
+  out += getMoodDriftContext();
+  return out;
 }
 
 // ── ANTI-REPETITION GUARDRAILS ──────────────────────────────────────

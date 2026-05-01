@@ -307,6 +307,18 @@ export class UserStore {
     return this.getUser(userId).totalMessages;
   }
 
+  /**
+   * Snapshot of all users currently in memory (each entry includes userId).
+   * Useful for proactive / initiation loops that iterate over the user base.
+   */
+  getAllUsersSnapshot(): Array<UserData & { userId: number }> {
+    const out: Array<UserData & { userId: number }> = [];
+    for (const [userId, data] of this.users.entries()) {
+      out.push({ ...data, userId });
+    }
+    return out;
+  }
+
   // ── FSM state for multi-step commands (in-memory only) ──
   getFsmState(userId: number): string | undefined {
     return this.fsmState.get(userId);
