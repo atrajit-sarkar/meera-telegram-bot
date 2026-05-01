@@ -63,6 +63,9 @@ export class DpManager {
   private currentBio = "";
   private currentDesc = "";
 
+  /** Debug fast-cycle mode — toggled via DEBUG_DP_FAST=true in .env. */
+  private readonly fastDebug = process.env.DEBUG_DP_FAST === "true";
+
   constructor(opts: DpManagerOptions) {
     this.telegram = opts.telegram;
     this.botToken = opts.botToken;
@@ -72,31 +75,42 @@ export class DpManager {
     this.getCommunityKeys = opts.getCommunityKeys;
     this.geminiApiKey = opts.geminiApiKey;
 
-    // First change: random 20–90 min after startup (a bit sooner so it actually fires)
-    this.nextChangeDelay = this.randomDelay(20 * 60_000, 90 * 60_000);
+    if (this.fastDebug) {
+      // Debug mode — fire DP / name / bio / desc every ~30s so you can watch it work.
+      const FAST = 30_000;
+      this.nextChangeDelay = FAST;
+      this.nextNameDelay = FAST;
+      this.nextBioDelay = FAST;
+      this.nextDescDelay = FAST;
+      console.log("[DpManager] ⚡ DEBUG_DP_FAST=true — cycling DP/name/bio/desc every ~30s");
+    } else {
+      // First change: random 20–90 min after startup (a bit sooner so it actually fires)
+      this.nextChangeDelay = this.randomDelay(20 * 60_000, 90 * 60_000);
+      // First-time delays are kept short so the bot actually does *something* visible
+      // soon after startup. Subsequent intervals (set in tick()) follow the real-girl cadence.
+      this.nextNameDelay = this.randomDelay(45 * 60_000, 3 * 3600_000);
+      this.nextBioDelay = this.randomDelay(20 * 60_000, 90 * 60_000);
+      this.nextDescDelay = this.randomDelay(2 * 3600_000, 6 * 3600_000);
+    }
     this.lastDpChange = Date.now();
-
-    // First-time delays are kept short so the bot actually does *something* visible
-    // soon after startup. Subsequent intervals (set in tick()) follow the real-girl cadence.
-    this.nextNameDelay = this.randomDelay(45 * 60_000, 3 * 3600_000);
-    this.nextBioDelay = this.randomDelay(20 * 60_000, 90 * 60_000);
-    this.nextDescDelay = this.randomDelay(2 * 3600_000, 6 * 3600_000);
     this.lastNameChange = Date.now();
     this.lastBioChange = Date.now();
     this.lastDescChange = Date.now();
   }
 
-  /** Start the periodic check (every 10 minutes) */
+  /** Start the periodic check (every 10 minutes — or every 15s in fast-debug) */
   start(): void {
     if (this.timer) return;
+    const tickMs = this.fastDebug ? 15_000 : 10 * 60_000;
     console.log(
-      `[DpManager] Started — first DP in ~${Math.round(this.nextChangeDelay / 60_000)}min, ` +
-      `bio in ~${Math.round(this.nextBioDelay / 60_000)}min, ` +
-      `name in ~${Math.round(this.nextNameDelay / 60_000)}min, ` +
-      `desc in ~${Math.round(this.nextDescDelay / 60_000)}min`,
+      `[DpManager] Started — first DP in ~${Math.round(this.nextChangeDelay / 1000)}s, ` +
+      `bio in ~${Math.round(this.nextBioDelay / 1000)}s, ` +
+      `name in ~${Math.round(this.nextNameDelay / 1000)}s, ` +
+      `desc in ~${Math.round(this.nextDescDelay / 1000)}s` +
+      (this.fastDebug ? " [DEBUG_DP_FAST]" : ""),
     );
-    this.timer = setInterval(() => this.tick().catch((e) => console.error("[DpManager] tick error:", e)), 10 * 60_000);
-    // Run a tick immediately so we don't have to wait 10min for the first check
+    this.timer = setInterval(() => this.tick().catch((e) => console.error("[DpManager] tick error:", e)), tickMs);
+    // Run a tick immediately so we don't have to wait for the first scheduled check
     setTimeout(() => this.tick().catch((e) => console.error("[DpManager] initial tick error:", e)), 5_000);
     // Initialize self-DP description in the background so the bot can talk about
     // its own profile picture from the very first message — without waiting for
@@ -169,12 +183,21 @@ export class DpManager {
         } catch (err) {
           console.error("[DpManager] Failed to change DP:", err);
         }
-        this.nextChangeDelay = this.realGirlDelay();
+        this.nextChangeDelay = this.fastDebug ? 30_000 : this.realGirlDelay();
         this.lastDpChange = now;
-        console.log(`[DpManager] Next DP change in ~${Math.round(this.nextChangeDelay / 3600_000)}h`);
+        console.log(
+          this.fastDebug
+            ? `[DpManager] Next DP change in ~30s [DEBUG]`
+            : `[DpManager] Next DP change in ~${Math.round(this.nextChangeDelay / 3600_000)}h`,
+        );
       }
     } else {
-      console.log(`[DpManager] Tick — next DP change in ~${Math.round((this.nextChangeDelay - dpElapsed) / 60_000)}min`);
+      const remaining = this.nextChangeDelay - dpElapsed;
+      console.log(
+        this.fastDebug
+          ? `[DpManager] Tick — next DP change in ~${Math.round(remaining / 1000)}s`
+          : `[DpManager] Tick — next DP change in ~${Math.round(remaining / 60_000)}min`,
+      );
     }
 
     // ── Name change check (less frequent)
@@ -185,10 +208,14 @@ export class DpManager {
       } catch (err) {
         console.error("[DpManager] Failed to change name:", err);
       }
-      // Name changes are rare: 12–36h
-      this.nextNameDelay = this.randomDelay(12 * 3600_000, 36 * 3600_000);
+      // Name changes are rare: 12–36h (or 30s in debug)
+      this.nextNameDelay = this.fastDebug ? 30_000 : this.randomDelay(12 * 3600_000, 36 * 3600_000);
       this.lastNameChange = now;
-      console.log(`[DpManager] Next name change in ~${Math.round(this.nextNameDelay / 3600_000)}h`);
+      console.log(
+        this.fastDebug
+          ? `[DpManager] Next name change in ~30s [DEBUG]`
+          : `[DpManager] Next name change in ~${Math.round(this.nextNameDelay / 3600_000)}h`,
+      );
     }
 
     // ── Bio change check (more frequent than name, less than DP)
@@ -199,13 +226,17 @@ export class DpManager {
       } catch (err) {
         console.error("[DpManager] Failed to change bio:", err);
       }
-      // Bio changes: 6–18h
-      this.nextBioDelay = this.randomDelay(6 * 3600_000, 18 * 3600_000);
+      // Bio changes: 6–18h (or 30s in debug)
+      this.nextBioDelay = this.fastDebug ? 30_000 : this.randomDelay(6 * 3600_000, 18 * 3600_000);
       this.lastBioChange = now;
-      console.log(`[DpManager] Next bio change in ~${Math.round(this.nextBioDelay / 3600_000)}h`);
+      console.log(
+        this.fastDebug
+          ? `[DpManager] Next bio change in ~30s [DEBUG]`
+          : `[DpManager] Next bio change in ~${Math.round(this.nextBioDelay / 3600_000)}h`,
+      );
     }
 
-    // ── Description change check (rare — every 24-48h)
+    // ── Description change check (rare — every 24-48h, or 30s in debug)
     const descElapsed = now - this.lastDescChange;
     if (descElapsed >= this.nextDescDelay) {
       try {
@@ -213,9 +244,13 @@ export class DpManager {
       } catch (err) {
         console.error("[DpManager] Failed to change description:", err);
       }
-      this.nextDescDelay = this.randomDelay(24 * 3600_000, 48 * 3600_000);
+      this.nextDescDelay = this.fastDebug ? 30_000 : this.randomDelay(24 * 3600_000, 48 * 3600_000);
       this.lastDescChange = now;
-      console.log(`[DpManager] Next description change in ~${Math.round(this.nextDescDelay / 3600_000)}h`);
+      console.log(
+        this.fastDebug
+          ? `[DpManager] Next description change in ~30s [DEBUG]`
+          : `[DpManager] Next description change in ~${Math.round(this.nextDescDelay / 3600_000)}h`,
+      );
     }
   }
 
